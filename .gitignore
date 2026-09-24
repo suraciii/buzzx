@@ -1,0 +1,12 @@
+# Python: the documentation gates and their tests are Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local
+.DS_Store
+*.log
+
+# Rust: added when the first workspace lands.
+# /target
+# Cargo.lock

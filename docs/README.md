@@ -1,0 +1,16 @@
+# buzzx documentation
+
+Product documentation. It states what the product must satisfy and how a user
+works with it.
+
+- [tui-use.md](tui-use.md) is the TUI manual: the keys, the modes, and the
+  states a user sees.
+- [configuration.md](configuration.md) is the configuration reference:
+  identity, relay, the auth tag, the config file, environment variables, and
+  exit codes.
+- [buzz-revisions.md](buzz-revisions.md) records the pinned Buzz crate
+  revision and what it provides.
+
+The design documents, which state the boundaries and the contracts to
+preserve, live in [../design/](../design/). The product contract, which states
+why `buzzx` exists, lives in [../core.md](../core.md).
