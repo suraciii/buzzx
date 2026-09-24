@@ -31,8 +31,11 @@ boundaries; the underlying message remains unchanged.
 
 The top line contains the current channel and the connection state. The middle
 area contains the focused timeline row and its surrounding rows. The composer
-and a one-line status/mode hint remain at the bottom. Descriptions, connection
-details, and help are overlays so they do not consume permanent space.
+and a one-line status/mode hint remain at the bottom. When another identity is
+composing in the open channel, one typing line sits between the timeline and
+the composer in every mode and takes no row when nobody is. Descriptions,
+connection details, and help are overlays so they do not consume permanent
+space.
 
 ## Unified keys
 

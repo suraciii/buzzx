@@ -142,6 +142,29 @@ are fetched by reference, not by channel:
 Ids are chunked at 100. Auxiliary events are never in the channel REQ, so a
 wave of reactions cannot dilute the history window.
 
+Typing indicators are ephemeral, so they are subscribed per channel and never
+fetched by reference:
+
+```json
+["REQ", "y:<uuid>", {"kinds": [20002], "#h": ["<uuid>"]}]
+```
+
+One REQ per member channel, because the relay indexes live fan-out by a single
+`#h` value: a filter that names several channels falls back to a global
+subscription and receives no channel event at all, ephemeral or stored. The
+filter carries no `since` and no `limit` because nothing is stored: both would
+only describe a history that does not exist. The channel set comes from the
+membership roster, so the feed is replaced whenever the channel list reloads —
+including after every reconnect — and an empty roster closes it. One REQ per
+channel is affordable because the relay advertises 1024 subscriptions per
+connection: a timeline REQ is one more, and the count stays inside a
+membership the roster can plausibly hold.
+
+The typing feed is the only subscription whose channel list is the identity's
+whole membership; a timeline REQ carries one channel. That is what the channel
+list's activity marker reads, and it is why the marker is right for a channel
+the user is not looking at.
+
 The global subscription covers what is not channel-scoped and what the
 identity must see: read-marker confirmations, member notifications, and the
 presence snapshot. It is filtered with `#p` set to the identity's own pubkey,
@@ -159,7 +182,7 @@ The pump answers these frames:
 
 | Frame | Action |
 |---|---|
-| `EVENT` | Decode. Timeline kinds become rows; aux kinds become overlays. |
+| `EVENT` | Decode. Timeline kinds become rows; aux kinds become overlays; a typing indicator into the line above the composer. |
 | `EOSE` | End the channel's loading state. |
 | `NOTICE` | Show as status. |
 | `CLOSED` | Report and stop that subscription. A `restricted:` reason means membership was lost. |
@@ -184,6 +207,16 @@ Consequences of ephemerality:
   and drops it. The publisher sends at most one indicator per 3 seconds per
   channel.
 
+`buzzx` consumes typing indicators and does not publish them. One indicator
+carries the channel in its `h` tag; any thread tags on it are ignored, so the
+state is per channel and not per thread. The consumer holds an entry for 8
+seconds, refreshing the deadline on every repeat, and renders the whole set as
+one line. An entry also ends before its deadline: the author's own message in
+that channel ends it, a disconnect drops every entry, and a closed channel
+drops its own. Indicators from the identity itself are ignored, whichever
+client published them. Nothing about typing is persisted, so a restart starts
+with none.
+
 ## Rate limits
 
 The relay's default limits for a human identity:
@@ -199,7 +232,8 @@ about 50 events per window is admitted before throttling.
 
 `buzzx` stays under these by design:
 
-- Typing is throttled to one publish per 3 seconds per channel.
+- Typing is consumed, never published: one REQ per channel set, no publish
+  budget at all.
 - Presence heartbeat is one publish per 60 seconds, only while the TUI is
   focused.
 - Auxiliary backfill chunks are 100 ids and run once per channel open.

@@ -225,6 +225,9 @@ pub struct App {
     pub quit: bool,
     pub exit_code: i32,
     profiles: HashMap<String, String>,
+    /// Live typing indicators, per channel: pubkey -> the second the entry
+    /// expires. Ephemeral state, rebuilt from the current connection only.
+    typing: HashMap<Uuid, HashMap<String, u64>>,
     seen_aux: HashSet<String>,
     reaction_of: HashMap<String, (String, String)>,
     my_reaction: HashMap<(String, String), String>,
@@ -250,6 +253,7 @@ impl App {
             quit: false,
             exit_code: 0,
             profiles: HashMap::new(),
+            typing: HashMap::new(),
             seen_aux: HashSet::new(),
             reaction_of: HashMap::new(),
             my_reaction: HashMap::new(),
@@ -261,6 +265,39 @@ impl App {
 
     pub fn take_outbox(&mut self) -> Vec<SessionCommand> {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Drop typing entries whose 8-second TTL has passed. Reads filter on the
+    /// same deadline, so a missed tick delays the cleanup, never the expiry.
+    pub fn expire_typing(&mut self, now: u64) {
+        self.typing.retain(|_, entries| {
+            entries.retain(|_, expires_at| *expires_at > now);
+            !entries.is_empty()
+        });
+    }
+
+    /// The identities composing in one channel right now, by display name.
+    /// Sorted and deduplicated so the line does not reshuffle between frames.
+    pub fn typing_names(&self, channel: Uuid, now: u64) -> Vec<String> {
+        let Some(entries) = self.typing.get(&channel) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter(|(_, expires_at)| **expires_at > now)
+            .map(|(pubkey, _)| author_name(&self.profiles, &self.me, pubkey))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Whether anyone is composing in one channel. The channel list asks this
+    /// for every entry it draws.
+    pub fn is_typing(&self, channel: Uuid, now: u64) -> bool {
+        self.typing
+            .get(&channel)
+            .is_some_and(|entries| entries.values().any(|expires_at| *expires_at > now))
     }
 
     fn entry_mut(&mut self, id: &Uuid) -> Option<&mut ChannelEntry> {
@@ -339,6 +376,9 @@ impl App {
             }
             ChatEvent::Disconnected(reason) => {
                 self.conn = ConnState::Reconnecting;
+                // Typing state lives on the connection that carried it: the
+                // session is over, so every entry is stale.
+                self.typing.clear();
                 self.status = format!("reconnecting: {reason}");
             }
             ChatEvent::Channels(channels) => {
@@ -362,9 +402,29 @@ impl App {
             ChatEvent::Timeline { channel, event } => {
                 self.apply_timeline(channel, event, now);
             }
+            ChatEvent::Typing { channel, pubkey } => {
+                // The identity's own typing is never shown: it already knows.
+                // Another client of the same identity (the desktop app) is a
+                // member too, and its indicators land here as well.
+                if pubkey != self.me {
+                    // A name beats a shortened key, so an author first seen
+                    // typing gets resolved like one first seen posting. Only a
+                    // new entry asks: a refresh of a live one asks nothing.
+                    let fresh = self
+                        .typing
+                        .entry(channel)
+                        .or_default()
+                        .insert(pubkey.clone(), now.saturating_add(content::TYPING_TTL_SECS))
+                        .is_none();
+                    if fresh && !self.profiles.contains_key(&pubkey) {
+                        self.outbox.push(SessionCommand::LoadProfiles(vec![pubkey]));
+                    }
+                }
+            }
             ChatEvent::Overlay(event) => self.apply_overlay(event),
             ChatEvent::ChannelGone { channel, reason } => {
                 self.channels.retain(|c| c.id != channel);
+                self.typing.remove(&channel);
                 if self.selected >= self.channels.len() {
                     self.selected = self.channels.len().saturating_sub(1);
                 }
@@ -449,9 +509,9 @@ impl App {
         let id = event.id.to_hex();
         let me = self.me.clone();
         let profiles = self.profiles.clone();
-        let author = author_name(&profiles, &me, &event.pubkey.to_hex());
-        let known_author =
-            profiles.contains_key(&event.pubkey.to_hex()) || event.pubkey.to_hex() == me;
+        let author_key = event.pubkey.to_hex();
+        let author = author_name(&profiles, &me, &author_key);
+        let known_author = profiles.contains_key(&author_key) || author_key == me;
         let selected = self.selected_entry().map(|e| e.id) == Some(channel);
         let was_at_bottom = selected && self.at_bottom();
         let Some(entry) = self.entry_mut(&channel) else {
@@ -467,9 +527,14 @@ impl App {
         if was_at_bottom {
             self.focus = entry.rows.len() - 1;
         }
+        // The message itself is the end of that author's indicator: typing is
+        // a pre-message signal, so it never outlives the message it announced.
+        if let Some(entries) = self.typing.get_mut(&channel) {
+            entries.remove(&author_key);
+        }
         if !known_author {
-            let author = event.pubkey.to_hex();
-            self.outbox.push(SessionCommand::LoadProfiles(vec![author]));
+            self.outbox
+                .push(SessionCommand::LoadProfiles(vec![author_key]));
         }
     }
 
@@ -1248,6 +1313,142 @@ mod tests {
         );
         app.apply(ChatEvent::Timeline { channel: id, event }, 1);
         assert_eq!(app.channels[0].rows.len(), 1);
+    }
+
+    #[test]
+    fn a_typing_indicator_names_its_channel_and_expires_after_its_ttl() {
+        let mut app = app();
+        let (one, two) = (channel(1), channel(2));
+        app.channels = vec![one.clone(), two.clone()];
+        app.apply(
+            ChatEvent::Profiles(vec![("agent-a".into(), "Agent A".into())]),
+            0,
+        );
+
+        app.apply(
+            ChatEvent::Typing {
+                channel: one.id,
+                pubkey: "agent-a".into(),
+            },
+            100,
+        );
+        assert_eq!(app.typing_names(one.id, 100), vec!["Agent A".to_owned()]);
+        assert!(app.is_typing(one.id, 100));
+        assert!(!app.is_typing(two.id, 100), "another channel stays quiet");
+
+        // The publisher refreshes every 3 seconds and the deadline moves with
+        // each one: 8 seconds after the last, the entry is gone.
+        app.apply(
+            ChatEvent::Typing {
+                channel: one.id,
+                pubkey: "agent-a".into(),
+            },
+            103,
+        );
+        assert!(app.is_typing(one.id, 110), "a refreshed entry stays live");
+        assert!(!app.is_typing(one.id, 111), "three refreshes, then expiry");
+
+        app.expire_typing(111);
+        assert!(app.typing_names(one.id, 111).is_empty());
+        assert!(app.typing_names(channel(9).id, 0).is_empty());
+    }
+
+    #[test]
+    fn a_message_ends_its_authors_indicator() {
+        let mut app = app();
+        let id = channel(1).id;
+        app.channels = vec![channel(1)];
+        let agent = keys();
+        let agent_key = agent.public_key().to_hex();
+        app.apply(
+            ChatEvent::Profiles(vec![(agent_key.clone(), "Agent A".into())]),
+            0,
+        );
+        app.apply(
+            ChatEvent::Typing {
+                channel: id,
+                pubkey: agent_key,
+            },
+            100,
+        );
+        assert!(app.is_typing(id, 100));
+
+        let event = message_event(&agent, id, "the answer", 101);
+        app.apply(ChatEvent::Timeline { channel: id, event }, 101);
+        assert!(
+            !app.is_typing(id, 101),
+            "the message replaced the indicator"
+        );
+    }
+
+    #[test]
+    fn the_identities_own_typing_is_never_shown() {
+        let mut app = app();
+        let id = channel(1).id;
+        app.channels = vec![channel(1)];
+        // Another client of the same identity is still the identity.
+        let me = app.me.clone();
+        app.apply(
+            ChatEvent::Typing {
+                channel: id,
+                pubkey: me,
+            },
+            100,
+        );
+        assert!(!app.is_typing(id, 100));
+        assert!(app.typing_names(id, 100).is_empty());
+    }
+
+    #[test]
+    fn a_closed_channel_and_a_disconnect_drop_their_indicators() {
+        let mut app = app();
+        let (one, two) = (channel(1), channel(2));
+        app.channels = vec![one.clone(), two.clone()];
+        for (channel_id, pubkey) in [(one.id, "agent-a"), (two.id, "agent-b")] {
+            app.apply(
+                ChatEvent::Typing {
+                    channel: channel_id,
+                    pubkey: pubkey.into(),
+                },
+                100,
+            );
+        }
+
+        app.apply(
+            ChatEvent::ChannelGone {
+                channel: one.id,
+                reason: "restricted".into(),
+            },
+            101,
+        );
+        assert!(!app.is_typing(one.id, 101), "a closed channel keeps none");
+        assert!(
+            app.is_typing(two.id, 101),
+            "the other channel keeps its own"
+        );
+
+        app.apply(ChatEvent::Disconnected("socket closed".into()), 102);
+        assert!(!app.is_typing(two.id, 102), "nothing survives the session");
+    }
+
+    #[test]
+    fn a_typist_with_no_profile_is_asked_for_one_once() {
+        let mut app = app();
+        let id = channel(1).id;
+        app.channels = vec![channel(1)];
+        let indicator = || ChatEvent::Typing {
+            channel: id,
+            pubkey: "agent-a".into(),
+        };
+        app.apply(indicator(), 100);
+        let asked = app.take_outbox();
+        assert!(
+            matches!(asked.as_slice(), [SessionCommand::LoadProfiles(keys)] if keys == &vec!["agent-a".to_owned()]),
+            "an unknown author is resolved: {asked:?}"
+        );
+        // A refresh of the live entry asks once, not once per indicator.
+        app.apply(indicator(), 103);
+        assert!(app.take_outbox().is_empty());
     }
 
     #[test]

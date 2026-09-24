@@ -12,6 +12,13 @@ pub const AUX_KINDS: [u32; 4] = [7, 40003, 5, 9005];
 pub const MEMBERSHIP_KIND: u32 = 39002;
 pub const CHANNEL_METADATA_KIND: u32 = 39000;
 pub const PROFILE_KIND: u32 = 0;
+/// The ephemeral typing indicator. The relay never stores it; it exists only
+/// on the live connection, so a missed one is a missed one.
+pub const TYPING_KIND: u32 = 20002;
+/// How long one typing indicator stands before it expires. The publisher
+/// refreshes every 3 seconds; the consumer waits out three refreshes so one
+/// dropped frame does not blink the indicator off.
+pub const TYPING_TTL_SECS: u64 = 8;
 
 /// The default reaction emoji, sent when the composer has no emoji body.
 pub const DEFAULT_REACTION: &str = "\u{1f44d}";

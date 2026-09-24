@@ -243,11 +243,17 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
         let mut started = Some(session.started);
 
         loop {
+            // One clock reading per frame: the expiry below and every event
+            // applied in this pass see the same `now`.
+            let now = now_secs();
             // 1. Drain every queued event before drawing, so a burst renders
             //    once.
             while let Ok(event) = events_rx.try_recv() {
-                app.apply(event, now_secs());
+                app.apply(event, now);
             }
+            // Ephemeral state has no terminating event, so the frame tick is
+            // what retires a typing indicator nobody refreshed.
+            app.expire_typing(now);
             // The first connection decides whether the session can run at
             // all: unreachable is 2, an auth refusal is 3.
             if let Some(receiver) = started.as_mut() {
@@ -269,7 +275,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             // 2. Draw, then read back the frame size: the keys map against
             //    the layout the user is looking at, resize included.
             let frame = terminal
-                .draw(|frame| ui::draw(frame, &app, now_secs()))
+                .draw(|frame| ui::draw(frame, &app, now))
                 .map_err(|e| e.to_string())?;
             let layout = layout::mode(frame.area.width, frame.area.height);
 
@@ -291,7 +297,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
                     }
                     app::Mode::Composer => keys::map_composer(key),
                 };
-                app.handle(action, now_secs());
+                app.handle(action, now);
             }
 
             if app.quit {
