@@ -300,6 +300,12 @@ impl PumpState {
     }
 
     async fn resubscribe_all(&mut self, conn: &mut NostrWsConnection) {
+        // A subscription id belongs to the socket that opened it. The socket
+        // that just died took all of them with it, so this connection starts
+        // from nothing: the REQs below are first REQs, not duplicates, and
+        // `subscribe_timeline`'s own guard no longer sees an id that no live
+        // subscription has.
+        self.sub_ids.clear();
         let channels = self.timeline_channels.clone();
         for channel in channels {
             self.subscribe_timeline(conn, channel).await;
