@@ -89,7 +89,7 @@ ChannelEntry {
     id:       channel UUID
     name:     display name
     rows:     Vec<Row>        // append only; overlays mutate rows in place
-    unread:   usize
+    unread:   usize           // present, not yet populated; read markers are a later phase
 }
 ```
 

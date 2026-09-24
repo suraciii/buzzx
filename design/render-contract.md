@@ -66,7 +66,7 @@ Row {
     reactions:  Vec<(String, u32)>
     pending:    bool          // optimistic local send, replaced on relay OK
 }
-```text literal
+```
 
 `author` is resolved from kind 0 profiles, falling back to a shortened pubkey.
 The TUI requests profiles for the authors it has seen, in chunks, and keeps
@@ -174,6 +174,13 @@ the same unread.
 This phase is after the first. The first phase shows unread from observed
 events only and never claims it is cross-device.
 
+The first phase's observed-only unread is therefore near-zero on a cold start:
+with no marker read and no events yet observed, the client has nothing to
+count. That is the honest reading, and it is why the first-phase channel list
+carries no unread column at all — a number that is only right for channels
+you happened to watch is worse than no number. When read markers land, the
+column appears.
+
 ## Mentions
 
 A mention is a `p` tag whose value is the identity's own pubkey. Stream
@@ -185,7 +192,7 @@ surface. Highlighting is the whole behavior.
 
 ## Optimistic sends
 
-When the operator sends a message, `buzzx` appends a `pending` row before the
+When the user sends a message, `buzzx` appends a `pending` row before the
 network call. The row carries a local id. On the relay's OK the row is
 replaced with the real event. On failure the row is removed and the composer
 content is restored.
@@ -199,4 +206,4 @@ Rows render in relay order: the order events arrived, with history first and
 live appended. `buzzx` does not sort. Sorting a timeline by timestamp across
 two channels' worth of live traffic reorders messages that were already
 correct, and it hides the case where the relay returns them differently than
-the operator expects.
+the user expects.

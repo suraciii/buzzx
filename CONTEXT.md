@@ -85,6 +85,18 @@ download is authorized by an event in the query.
 This client. It reads a Buzz relay, renders a channel, and sends events as the
 identity.
 
+**terminal user**:
+The person `buzzx` is built for. Someone who already uses Buzz - on the desktop
+app or a phone - and who spends their working hours in a terminal. This is the
+primary user. The automation caller is secondary. Do not call this person the
+"operator": `buzzx` operates nothing, and the word frames the product as a tool
+for running a relay rather than a client for a person.
+
+**automation caller**:
+A script or an agent that uses `buzzx` for an operation it cannot do without a
+held session - watching a channel. Anything a one-shot `buzz` invocation can
+answer is not buzzx's job.
+
 **row**:
 One rendered timeline entry. A row is built from one event. Kinds that overlay
 other events never produce a row of their own.

@@ -6,53 +6,82 @@ is implemented.
 
 ## The problem
 
-A Buzz relay is headless by design. A workstation can run the relay, the
-agents, and the automation. What a workstation could not run, until now, is a
-client for a human.
+Buzz users read and write channels in three places: a Tauri desktop app, a
+Flutter mobile app, and the `buzz` CLI. Two of them need a graphical session or
+a phone. The third is scriptable: it answers one question per invocation and
+returns JSON, and it does not hold a subscription open, so it cannot show a
+channel as it changes.
 
-The existing clients do not fit a terminal-only workstation:
+Buzz users who live in a terminal therefore have no client of their own. They
+can run `buzz` for one-off reads and writes, but they cannot sit in a terminal
+and have a conversation. A headless or terminal-only workstation is the sharpest
+case of this, and it is not the only one: an SSH session, a container, a plain
+console all lack an interactive client.
+
+`buzzx` is that client. It is to Buzz what the mobile app is — a client for
+people, not a tool for relays.
+
+The existing clients do not do this job:
 
 - The desktop app is a Tauri application. It needs a graphical session and a
   native window.
 - The mobile app is Flutter. It needs a phone.
-- The `buzz` CLI is scriptable. It answers one question per invocation and
-  returns JSON. It does not keep a subscription open, so it cannot show a
-  channel as it changes.
-
-The result is a workstation that participates fully in automation but gives
-its operator nothing to type into.
+- The `buzz` CLI is scriptable, and that is its whole shape: one invocation,
+  one answer, no session.
 
 ## The product
 
-`buzzx` is a terminal client for one human identity on one Buzz relay.
+`buzzx` is a terminal client for Buzz users. It gives one human identity full
+channel chat — read, send, reply, react, edit, delete — from a terminal, over
+the relay it is already a member of.
+
+Where the desktop app and the mobile app are Buzz's clients for people with a
+display, `buzzx` is Buzz's client for people in a terminal. Same product,
+fourth surface. It does not replace any of them, and it is not a tool for
+operating a relay.
 
 `buzzx tui` opens a session with three regions:
 
-1. A channel list on the left. It shows the channels the identity belongs to
-   and the unread count for each.
+1. A channel list on the left. It shows the channels the identity belongs to.
 2. A timeline on the right. It shows the messages of the selected channel.
 3. A composer at the bottom. It sends, replies, reacts, edits, and deletes.
 
-The session is live. A message that arrives appears without a refresh. A
-message that the operator sends appears at once.
+The channel list carries no unread count in the first phase. Unread is
+computed from a read marker (kind 30078) plus events observed while a channel
+is not selected, and that combination is not available before both halves
+exist. Claiming it before then shows a number the client cannot know.
 
-The non-interactive subcommands expose the same operations. They print JSON
-and set an exit code. They share the transport, the identity handling, and the
-event construction with the TUI. `buzzx channels list` and the channel list
-inside `buzzx tui` read the same code.
+The session is live. A message that arrives appears without a refresh. A
+message that the user sends appears at once.
+
+The non-interactive subcommands expose the operations that need a held
+session. They print JSON and set an exit code. They share the transport, the
+identity handling, and the event construction with the TUI. `buzzx watch`
+streams live channel events, which the one-shot `buzz` CLI cannot do by
+construction.
+
+What `buzzx` does *not* re-implement is the one-shot query surface. `buzz`
+already answers `channels list` and `messages search` as single invocations,
+and a second implementation of the same query would only be a second thing to
+drift. Where `buzz` and `buzzx` can both do a job, `buzz` is the canonical
+answer and `buzzx` points at it.
 
 ## Users
 
-**The terminal operator.** A person who works on a headless server, over SSH,
-or in a container. They need channel chat without leaving the session they
-work in. The TUI is the whole product for them.
+**The terminal user**, primary. A person who already uses Buzz — on the desktop
+app, on a phone — and who spends their working hours in a terminal. Over SSH,
+in a container, on a console. They want the same channels they already have,
+from where they already are. The TUI is the whole product for them.
 
-**The automation caller.** A script or an agent that must send a message,
-read a thread, or react to a request. The machine-readable subcommands and the
-exit codes are the whole product for them.
+**The automation caller**, secondary. A script or an agent that must watch a
+channel, or send a message as part of a longer job. For watching, `buzzx
+watch` is the surface. For a one-shot question — list channels, search
+messages, read one thread — `buzz` already answers it, and `buzzx` sends the
+caller there rather than growing a second copy.
 
-The two users share one code path. This is deliberate. A divergence between
-what the TUI can do and what a script can do is a defect, not a convenience.
+The terminal user is the one whose workflow gets designed first. `buzzx` is a
+client for people before it is an interface for programs, and when the two
+disagree the person wins.
 
 ## Boundaries
 
@@ -64,6 +93,11 @@ what the TUI can do and what a script can do is a defect, not a convenience.
 - **It is not an agent harness.** It does not run agents, schedule tasks, or
   approve work. Agents connect to the relay directly; `buzzx` sees their
   messages the same way it sees everyone else's.
+- **It is not the agent owner's observation console.** The private
+  telemetry-and-control plane between an agent and its owner is a separate
+  protocol surface, deliberately encrypted and never stored by the relay. It
+  belongs to desktop, and buzzx does not adopt it. See
+  [design/decisions/0003-owner-plane-out-of-scope.md](design/decisions/0003-owner-plane-out-of-scope.md).
 - **It is not a second identity store.** The identity is one Nostr keypair.
   `buzzx` reads it from the environment or a local file. It does not mint,
   rotate, or recover keys.
@@ -90,7 +124,7 @@ These terms have one meaning across all documents.
 
 ## First phase
 
-The first phase is the terminal operator's path, end to end:
+The first phase is the terminal user's path, end to end:
 
 1. The identity resolves, and the relay is reachable.
 2. The channel list fills from the identity's membership.

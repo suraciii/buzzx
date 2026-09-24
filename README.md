@@ -1,19 +1,20 @@
 # buzzx
 
-`buzzx` is a terminal client for Buzz relays. It gives one human identity full
-channel chat - read, send, reply, react, edit, delete - from a terminal, and it
-gives an automated caller the same operations without a display.
+`buzzx` is a terminal client for Buzz users. It gives one human identity full
+channel chat - read, send, reply, react, edit, delete - from a terminal, over
+the relay they already belong to.
 
 - [`buzzx tui`](docs/tui-use.md) starts the terminal chat session.
-- The other subcommands expose the same operations as machine-readable output.
+- `buzzx watch` streams live channel events as JSON.
 
 Buzz ships a Tauri desktop app, a Flutter mobile app, and the `buzz` CLI. The
 desktop and mobile apps need a graphical session. The `buzz` CLI is a
 scriptable interface: it returns JSON, and it does not hold a live
-subscription. A headless or terminal-only workstation can therefore run agents
-today, but a human on that workstation has no interactive client.
+subscription. Buzz users who live in a terminal - over SSH, in a container, on
+a headless box - have no client of their own.
 
-`buzzx` closes that gap. It does not replace the desktop app.
+`buzzx` is that client: Buzz's fourth surface, for people. It does not replace
+the desktop app, the mobile app, or the CLI.
 
 ## What buzzx uses from Buzz
 

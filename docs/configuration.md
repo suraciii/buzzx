@@ -61,7 +61,9 @@ example `["auth","<owner>","<conditions>","<sig>"]`. Second, the `--auth-tag`
 flag with the same JSON. Third, the `auth_tag` field of the config file.
 
 When set, the tag is attached to every signed event and sent as an
-`x-auth-tag` header on HTTP requests. When it is absent, `buzzx` signs as the
+`x-auth-tag` header on HTTP requests. The event tag is authoritative: the relay
+resolves the attestation as event-tag-or-header, and the git path cannot carry a
+standalone header at all. When it is absent, `buzzx` signs as the
 identity alone, which is what a human identity needs.
 
 `buzzx` verifies the tag against the identity's own pubkey at startup and
@@ -80,7 +82,7 @@ auth_tag = "[\"auth\",\"<owner>\",\"<conditions>\",\"<sig>\"]"
 ```
 
 There is no `default_channel` and no keybinding configuration in the first
-phase. Both are settings that a single-operator tool does not need, and a
+phase. Both are settings that a single-user tool does not need, and a
 config file that carries them invites a second source of truth for behavior
 that the keys already define.
 

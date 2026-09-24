@@ -32,7 +32,7 @@ Concretely:
 
 ## Consequences
 
-- A reaction count is correct for what the operator watches. It is not correct
+- A reaction count is correct for what the user watches. It is not correct
   for the channel's full history, and it is never presented as such. This is a
   stated limitation, not a defect.
 - The memory held by a session is the events it has seen. A long session with

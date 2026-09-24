@@ -16,7 +16,7 @@ The relay defaults to `http://localhost:3000`. See
 
 ```text diagram
 +-----------+---------------------------------------------+
-| channels  | #general                          New up 3   |
+| channels  | #general                                     |
 |           |                                             |
 | 1 general | alice         2m                            |
 | 2 random  | the migration is on main                    |
@@ -32,9 +32,12 @@ The relay defaults to `http://localhost:3000`. See
 ```
 
 Three regions. The channel list on the left shows the identity's channels, the
-active one highlighted, and the unread count when it is not zero. The timeline
-on the right shows the selected channel's messages. The composer at the bottom
-is the text input.
+active one highlighted. The timeline on the right shows the selected channel's
+messages. The composer at the bottom is the text input.
+
+Unread state is not shown in the first phase. It needs a read marker on the
+relay (kind 30078) plus the events observed while a channel is not selected,
+and neither exists yet. When both do, each row gains a count.
 
 ## Keys
 
@@ -50,7 +53,7 @@ In navigation mode:
 - `PgUp` and `PgDn` scroll ten messages.
 - `i`, `Tab`, or `Enter` opens the composer for a new message. Enter also
   sets the reply target to the message nearest the bottom of the timeline,
-  which is the one the operator is looking at.
+  which is the one you are looking at.
 - `r` reacts with the default thumbs-up emoji to the message nearest the
   bottom.
 - `e` edits the identity's own message nearest the bottom.
@@ -69,7 +72,8 @@ In composer mode:
 
 The composer has no external editor integration in the first phase. A long
 message is typed in an editor and sent with
-`buzzx messages send --channel <uuid> --file <path>`.
+`buzz messages send --channel <uuid> --file <path>`, which is the same relay
+write the composer performs.
 
 ## What the timeline shows
 
@@ -87,10 +91,9 @@ the status line shows the relay's reason.
 
 ## Status line
 
-The bottom line shows four things: the connection state, the relay's answer to
-the last write, the current channel's unread count, and the mode. The
-connection state is one of `connecting`, `connected`, `reconnecting`, or
-`failed`.
+The bottom line shows three things: the connection state, the relay's answer to
+the last write, and the mode. The connection state is one of `connecting`,
+`connected`, `reconnecting`, or `failed`.
 
 ## What `buzzx tui` does not do
 
@@ -98,12 +101,14 @@ connection state is one of `connecting`, `connected`, `reconnecting`, or
   lines.
 - It does not join huddles. Voice needs the relay's separate audio WebSocket,
   which is out of scope for the first phase.
-- It does not search. Use `buzzx messages search`.
+- It does not search. Use the `buzz` CLI.
 - It does not show DMs in the channel list. DMs arrive and render, but the
-  list is channel membership. A DM shows as an unread count only.
+  list is channel membership. Since DMs do not appear there, an unread DM is
+  not visible until you switch to it, which is one of the things a
+  later phase fixes.
 - It does not configure the relay, manage members, or moderate. Use the
-  `buzzx channels` subcommands or the desktop app.
-- It does not show the operator's own read state on other devices. Read
+  `buzz` CLI or the desktop app.
+- It does not show your own read state on other devices. Read
   markers sync through the relay; the display of that state is a later phase.
 
 ## Terminal requirements

@@ -41,6 +41,12 @@ attached to every signed event and sent as an `x-auth-tag` header on HTTP
 requests. This is the same contract the `buzz` CLI uses, so an agent identity
 that works with `buzz` works with `buzzx`.
 
+The event tag is the channel that cannot fail. The relay resolves the
+attestation as `event_tag.or(header)`, so the tag on the signed event wins
+wherever both are present, and it is the only form the git smart-HTTP path can
+carry — a credential helper cannot pass a standalone header. The header is a
+convenience for HTTP clients, never a second source of truth.
+
 `buzzx` installs the `ring` rustls crypto provider at startup, before any TLS
 use. Without it a multi-crate build that unifies `ring` and `aws-lc-rs`
 panics inside rustls. This is a required call, not a guard.
@@ -158,7 +164,7 @@ The pump answers these frames:
 | `NOTICE` | Show as status. |
 | `CLOSED` | Report and stop that subscription. A `restricted:` reason means membership was lost. |
 | `AUTH` (late) | Stash and re-authenticate, if the relay re-challenges. |
-| `OK` | Report publish result. A `false` with a reason is shown to the operator. |
+| `OK` | Report publish result. A `false` with a reason is shown to the user. |
 
 ## Ephemeral events
 
@@ -198,8 +204,8 @@ about 50 events per window is admitted before throttling.
   focused.
 - Auxiliary backfill chunks are 100 ids and run once per channel open.
 
-A relay that returns `rate-limited:` is shown to the operator with the
-relay's own retry hint. `buzzx` does not back off silently; the operator needs
+A relay that returns `rate-limited:` is shown to the user with the
+relay's own retry hint. `buzzx` does not back off silently; the user needs
 to know the message was not sent.
 
 ## Failure handling
