@@ -4,7 +4,13 @@
 # `just check` before every push.
 
 # Run every local gate
-check: docs-check size-check
+check: rust-check docs-check size-check
+
+# Format check, lint, and unit tests
+rust-check:
+    cargo fmt --check
+    cargo clippy --all-targets -- -D warnings
+    cargo test
 
 # Run the documentation gate and its own tests
 docs-check:

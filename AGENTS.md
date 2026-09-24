@@ -69,11 +69,19 @@ These apply when code exists:
 Before you hand work to a reviewer:
 
 ```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 python3 scripts/check-docs.py
 python3 scripts/check-file-sizes.py
 python3 -m unittest discover -s tests -p '*_test.py'
 ```
 
-`just check` runs all three. The documents state the intended contract. The
+`just check` runs all six. The documents state the intended contract. The
 commands prove the repository still matches it. A plan, a draft, or a summary
 in a message is not evidence.
+
+A change that touches the session, the transport, or the render contract also
+needs one live-relay run of the terminal loop - connect, send, reply, react,
+edit, delete, quit - because the unit tests cannot see the relay
+canonicalize an event id or re-challenge a connection.

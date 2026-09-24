@@ -35,6 +35,13 @@ Three regions. The channel list on the left shows the identity's channels, the
 active one highlighted. The timeline on the right shows the selected channel's
 messages. The composer at the bottom is the text input.
 
+The session always exposes one focused row in the timeline. Scrolling moves the
+focus with the viewport and keeps the focused row visible. Actions that target a
+row use this focus, so a reply, reaction, edit, or delete never acts on an
+unrelated message at the bottom of the timeline. When a channel opens, focus is
+the newest loaded row. If there are no rows, `Enter` opens a new-message
+composer without a reply target.
+
 Unread state is not shown in the first phase. It needs a read marker on the
 relay (kind 30078) plus the events observed while a channel is not selected,
 and neither exists yet. When both do, each row gains a count.
@@ -51,13 +58,13 @@ In navigation mode:
 - `g` or `Home` scrolls to the oldest loaded message.
 - `G` or `End` scrolls to the newest message.
 - `PgUp` and `PgDn` scroll ten messages.
-- `i`, `Tab`, or `Enter` opens the composer for a new message. Enter also
-  sets the reply target to the message nearest the bottom of the timeline,
-  which is the one you are looking at.
-- `r` reacts with the default thumbs-up emoji to the message nearest the
-  bottom.
-- `e` edits the identity's own message nearest the bottom.
-- `d` deletes the identity's own message nearest the bottom.
+- `i` or `Tab` opens the composer for a new message.
+- `Enter` opens the composer with the focused row as the reply target. The
+  reply target is shown in the composer header and can be cleared with `Esc`
+  before sending.
+- `r` reacts with the default thumbs-up emoji to the focused row.
+- `e` edits the identity's own focused row.
+- `d` deletes the identity's own focused row.
 - `?` toggles the key help.
 - `q` quits.
 

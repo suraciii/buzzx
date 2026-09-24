@@ -62,7 +62,11 @@ inventing a new contract.
 
 ## Status
 
-`buzzx` is new. The documents describe the intended contract, and no code
-exists yet. The first phase is a working Rust workspace plus the gates in this
-repository. See [core.md](core.md) for the boundaries and
-[eng/context-management.md](eng/context-management.md) for the document rules.
+The first phase is implemented: a Rust workspace with the modules in
+[design/architecture.md](design/architecture.md), the subcommands `tui`,
+`watch`, and `init`, unit tests for the pure layers and the state machine,
+and a live-loop acceptance that sends, replies, reacts, edits, and deletes
+against a real relay. See [core.md](core.md) for the boundaries,
+[docs/buzz-revisions.md](docs/buzz-revisions.md) for the pinned Buzz
+revision, and [eng/context-management.md](eng/context-management.md) for the
+document rules.

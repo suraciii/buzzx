@@ -7,6 +7,5 @@ __pycache__/
 .DS_Store
 *.log
 
-# Rust: added when the first workspace lands.
-# /target
-# Cargo.lock
+# Rust
+/target

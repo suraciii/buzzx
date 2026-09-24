@@ -2,15 +2,14 @@
 
 Pinned Buzz crate revisions used by `buzzx`.
 
-## buzz-core, buzz-sdk, buzz-ws-client
+## buzz-core, buzz-sdk, buzz-ws-client: 93114c9c65138397de39729fde0a816eb9f314ab
 
 `buzzx` depends on three Buzz crates through a pinned git revision. This
 document records what each crate provides and why `buzzx` needs it. A bump is
 a deliberate change: check the upstream diff, then update this document and
 `Cargo.toml` in the same commit.
 
-No revision is pinned yet, because there is no `Cargo.toml` yet. When the first
-workspace lands, this document names the revision in its heading.
+The pinned revision is `93114c9c65138397de39729fde0a816eb9f314ab`.
 
 ### What each crate provides
 
@@ -47,3 +46,9 @@ These were read out of the Buzz repository and hold until Buzz changes:
 
 `buzzx` pins `nostr = "0.44.x"` because the Buzz crates do. A buzz version
 that moves to a different nostr major bumps this pin.
+
+The relay canonicalizes a submitted event and may store it under a different
+id than the client signed. `POST /events` answers with
+`{"accepted":true,"event_id":"<stored id>","message":""}`, and that stored id
+is the address a later edit, deletion, or reply must target. `buzzx` takes
+the id from the response, never from the locally signed event.

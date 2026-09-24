@@ -1,0 +1,30 @@
+[package]
+name = "buzzx"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal client for Buzz channel chat"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+ratatui = "0.30"
+crossterm = "0.29"
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }
+nostr = { version = "0.44", features = ["nip44", "nip98"] }
+buzz-core = { git = "https://github.com/block/buzz", rev = "93114c9c65138397de39729fde0a816eb9f314ab" }
+buzz-sdk = { git = "https://github.com/block/buzz", rev = "93114c9c65138397de39729fde0a816eb9f314ab" }
+buzz-ws-client = { git = "https://github.com/block/buzz", rev = "93114c9c65138397de39729fde0a816eb9f314ab" }
+base64 = "0.22"
+sha2 = "0.11"
+hex = "0.4"
+rand = "0.10"
+dirs = "6"
+
+[profile.release]
+lto = "thin"

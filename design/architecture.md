@@ -44,6 +44,7 @@ parts that cannot be unit tested, and both are thin.
 | Module | Owns | Must not do |
 |---|---|---|
 | `main.rs` | Raw mode, alternate screen, the loop that polls input and drains events | Hold relay state or decide behavior |
+| `config.rs` | Identity, relay URL, and auth-tag resolution; the config file | Open a connection or sign |
 | `app.rs` | Channel list, per-channel rows, composer, selection, scroll offset, quit | Sign, send, parse frames, or draw |
 | `ui.rs` | Layout and drawing | Mutate `app.rs` state or call the network |
 | `keys.rs` | `KeyEvent` to `Action` | Read terminal state |
