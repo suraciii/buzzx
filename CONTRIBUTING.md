@@ -2,35 +2,26 @@
 
 ## Setup
 
-`buzzx` has no Rust code yet. The repository currently holds the product
-contract, the design documents, and the documentation gates. Python 3 runs the
-gates, and nothing else is required.
-
-```bash
-python3 scripts/check-docs.py
-python3 scripts/check-file-sizes.py
-python3 -m unittest discover -s tests -p '*_test.py'
-```
-
-When the first Rust workspace lands, this section gains the toolchain line,
-`Cargo.toml` at the root, and the cargo commands. Until then, a cargo command
-in a contributing guide would be a documented failure.
+`buzzx` is Rust, and the gates are Python. Install the Rust toolchain that CI
+pins ([eng/ci.md](eng/ci.md)) with the `clippy` and `rustfmt` components, plus
+[just](https://github.com/casey/just) for the verification recipes.
 
 ## Run
 
-Nothing runs yet. The gates run, and that is the whole executable surface
-today. `docs/tui-use.md` describes the intended CLI and TUI behaviour.
+`buzzx tui` opens the client. `buzzx login`, `buzzx whoami`, and `buzzx
+logout` manage the identity. [docs/configuration.md](docs/configuration.md)
+holds the commands and the config file. [docs/tui-use.md](docs/tui-use.md) is
+the terminal interface.
 
 ## Local verification
 
 ```bash
-python3 scripts/check-docs.py
-python3 scripts/check-file-sizes.py
-python3 -m unittest discover -s tests -p '*_test.py'
+just check
 ```
 
-`just check` runs all three. The documentation gate runs in CI, so a commit
-that fails it does not land.
+The recipes are the contract a commit must satisfy. CI runs the same recipes
+on every pull request and on every push to `main`, so a commit that fails one
+does not land.
 
 ## Documentation changes
 
@@ -50,7 +41,7 @@ The short version:
 
 A change lands when:
 
-- Both gate scripts pass and the gate tests pass.
+- Every recipe in `just check` passes.
 - The contracts in `design/` still describe the code, when there is code.
 - A new term goes into [CONTEXT.md](CONTEXT.md).
 - A durable decision goes into `design/decisions/` as its own document.
