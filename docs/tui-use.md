@@ -157,8 +157,10 @@ Indicators are ephemeral: they are never part of the history, they are not
 counted as unread, and they do not survive a restart. One expires 8 seconds
 after the last repeat from its author, and it ends immediately when that
 author's message arrives, when the connection drops (the status line shows
-`reconnecting`), or when the channel closes. Another client signed in with the
-same identity does not show up as a typist in your session.
+`reconnecting`), or when the channel closes or leaves your channel list. If the
+relay refuses a channel's typing feed, the status line says so and the rest of
+the client keeps working. Another client signed in with the same identity does
+not show up as a typist in your session.
 
 Two limits are worth knowing. Typing is shown per channel, not per thread, so a
 reply in progress looks the same as a new message in progress. And the line

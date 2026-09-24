@@ -788,6 +788,7 @@ mod tests {
             crate::session::ChatEvent::Typing {
                 channel: active,
                 pubkey: "agent-a".into(),
+                at: 130,
             },
             130,
         );
@@ -818,22 +819,33 @@ mod tests {
             crate::session::ChatEvent::Typing {
                 channel: id,
                 pubkey: "agent-a".into(),
+                at: 130,
             },
             130,
         );
+        let draft = "draft-in-composer";
+        let nav = frame_text(&app, 24, 6);
+        assert!(nav.contains("@agent-a typing…"), "{nav}");
+        assert!(
+            !nav.contains(draft),
+            "the composer is closed, so the typing line takes the row and the \
+             composer takes none: {nav}"
+        );
+
         app.mode = Mode::Composer;
-        app.composer.set_text("hi");
+        app.composer.set_text(draft);
 
         let narrow = frame_text(&app, 40, 10);
         assert!(narrow.contains("@agent-a typing…"), "{narrow}");
         assert!(narrow.contains("enter send"), "the composer keeps its hint");
+        assert!(narrow.contains(draft), "{narrow}");
 
         // 24x6 is the floor: header, one timeline row, typing, composer, and
         // status must all fit at once.
         let minimal = frame_text(&app, 24, 6);
         assert!(minimal.contains("@agent-a typing…"), "{minimal}");
         assert!(
-            minimal.contains("> hi"),
+            minimal.contains(&format!("> {draft}")),
             "the composer prompt survives: {minimal}"
         );
         assert!(
@@ -857,6 +869,7 @@ mod tests {
             crate::session::ChatEvent::Typing {
                 channel: second,
                 pubkey: "agent-b".into(),
+                at: 130,
             },
             130,
         );

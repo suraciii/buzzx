@@ -163,7 +163,10 @@ membership the roster can plausibly hold.
 The typing feed is the only subscription whose channel list is the identity's
 whole membership; a timeline REQ carries one channel. That is what the channel
 list's activity marker reads, and it is why the marker is right for a channel
-the user is not looking at.
+the user is not looking at. A `CLOSED` on a typing REQ ends that channel's feed
+for the rest of the connection: the client drops the channel's indicators,
+says why when the channel itself is still open, and tries again only when the
+roster reloads, which is the only thing that can change the answer.
 
 The global subscription covers what is not channel-scoped and what the
 identity must see: read-marker confirmations, member notifications, and the

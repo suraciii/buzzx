@@ -206,6 +206,15 @@ enum PendingOp {
     },
 }
 
+/// One identity composing in one channel. `since` is the event time of the
+/// last indicator, so a message can be compared against the claim it ends;
+/// `expires_at` is this machine's clock, because believing a claim is local.
+#[derive(Debug, Clone, Copy)]
+struct TypingEntry {
+    since: u64,
+    expires_at: u64,
+}
+
 pub struct App {
     pub me: String,
     pub relay_label: String,
@@ -227,7 +236,7 @@ pub struct App {
     profiles: HashMap<String, String>,
     /// Live typing indicators, per channel: pubkey -> the second the entry
     /// expires. Ephemeral state, rebuilt from the current connection only.
-    typing: HashMap<Uuid, HashMap<String, u64>>,
+    typing: HashMap<Uuid, HashMap<String, TypingEntry>>,
     seen_aux: HashSet<String>,
     reaction_of: HashMap<String, (String, String)>,
     my_reaction: HashMap<(String, String), String>,
@@ -271,7 +280,7 @@ impl App {
     /// same deadline, so a missed tick delays the cleanup, never the expiry.
     pub fn expire_typing(&mut self, now: u64) {
         self.typing.retain(|_, entries| {
-            entries.retain(|_, expires_at| *expires_at > now);
+            entries.retain(|_, entry| entry.expires_at > now);
             !entries.is_empty()
         });
     }
@@ -284,7 +293,7 @@ impl App {
         };
         let mut names: Vec<String> = entries
             .iter()
-            .filter(|(_, expires_at)| **expires_at > now)
+            .filter(|(_, entry)| entry.expires_at > now)
             .map(|(pubkey, _)| author_name(&self.profiles, &self.me, pubkey))
             .collect();
         names.sort();
@@ -297,7 +306,19 @@ impl App {
     pub fn is_typing(&self, channel: Uuid, now: u64) -> bool {
         self.typing
             .get(&channel)
-            .is_some_and(|entries| entries.values().any(|expires_at| *expires_at > now))
+            .is_some_and(|entries| entries.values().any(|entry| entry.expires_at > now))
+    }
+
+    /// One message from this author ends the signal it announced. Only a
+    /// message that is not older than the claim counts: a timeline replays up
+    /// to 30 seconds of history on a new subscription, and an author who sent
+    /// something before starting to compose is still composing.
+    fn end_typing(&mut self, channel: Uuid, pubkey: &str, at: u64) {
+        if let Some(entries) = self.typing.get_mut(&channel)
+            && entries.get(pubkey).is_some_and(|entry| at >= entry.since)
+        {
+            entries.remove(pubkey);
+        }
     }
 
     fn entry_mut(&mut self, id: &Uuid) -> Option<&mut ChannelEntry> {
@@ -383,6 +404,11 @@ impl App {
             }
             ChatEvent::Channels(channels) => {
                 self.merge_channels(channels);
+                // Typing state follows the roster: a channel that is no longer
+                // a member channel keeps no indicator, or it would show one if
+                // the same id came back inside the TTL.
+                let ids: Vec<Uuid> = self.channels.iter().map(|c| c.id).collect();
+                self.typing.retain(|channel, _| ids.contains(channel));
                 if !self.opened_once && !self.channels.is_empty() {
                     self.opened_once = true;
                     self.selected = 0;
@@ -402,7 +428,11 @@ impl App {
             ChatEvent::Timeline { channel, event } => {
                 self.apply_timeline(channel, event, now);
             }
-            ChatEvent::Typing { channel, pubkey } => {
+            ChatEvent::Typing {
+                channel,
+                pubkey,
+                at,
+            } => {
                 // The identity's own typing is never shown: it already knows.
                 // Another client of the same identity (the desktop app) is a
                 // member too, and its indicators land here as well.
@@ -414,11 +444,26 @@ impl App {
                         .typing
                         .entry(channel)
                         .or_default()
-                        .insert(pubkey.clone(), now.saturating_add(content::TYPING_TTL_SECS))
+                        .insert(
+                            pubkey.clone(),
+                            TypingEntry {
+                                since: at,
+                                expires_at: now.saturating_add(content::TYPING_TTL_SECS),
+                            },
+                        )
                         .is_none();
                     if fresh && !self.profiles.contains_key(&pubkey) {
                         self.outbox.push(SessionCommand::LoadProfiles(vec![pubkey]));
                     }
+                }
+            }
+            ChatEvent::TypingClosed { channel, reason } => {
+                self.typing.remove(&channel);
+                // A channel that is gone has already said why it is quiet;
+                // this status is for a feed that was refused while the channel
+                // itself is still open.
+                if self.channels.iter().any(|c| c.id == channel) {
+                    self.status = format!("typing feed closed: {reason}");
                 }
             }
             ChatEvent::Overlay(event) => self.apply_overlay(event),
@@ -496,8 +541,19 @@ impl App {
             .filter(|r| !r.pending)
             .map(|r| r.event_id.clone())
             .collect();
+        let fetched: Vec<(String, u64)> = rows
+            .iter()
+            .filter(|r| !r.pending)
+            .map(|r| (r.pubkey.clone(), r.created_at))
+            .collect();
         entry.rows = rows;
         entry.loading = false;
+        // History can land after the indicator it belongs to - the channel is
+        // opened over HTTP while the live feed is already running - so the
+        // fetched rows end indicators on the same rule as live ones.
+        for (pubkey, at) in fetched {
+            self.end_typing(channel, &pubkey, at);
+        }
         if self.selected_entry().map(|e| e.id) == Some(channel) {
             self.set_focus(usize::MAX);
         }
@@ -529,9 +585,8 @@ impl App {
         }
         // The message itself is the end of that author's indicator: typing is
         // a pre-message signal, so it never outlives the message it announced.
-        if let Some(entries) = self.typing.get_mut(&channel) {
-            entries.remove(&author_key);
-        }
+        // A replay of an older message leaves a live claim standing.
+        self.end_typing(channel, &author_key, event.created_at.as_secs());
         if !known_author {
             self.outbox
                 .push(SessionCommand::LoadProfiles(vec![author_key]));
@@ -1174,6 +1229,13 @@ mod tests {
         App::new(&keys(), "http://relay.test")
     }
 
+    fn channel_info(id: u32) -> ChannelInfo {
+        ChannelInfo {
+            id: Uuid::from_u64_pair(id as u64, 0),
+            name: format!("c{id}"),
+        }
+    }
+
     fn channel(id: u32) -> ChannelEntry {
         ChannelEntry {
             id: Uuid::from_u64_pair(id as u64, 0),
@@ -1329,6 +1391,7 @@ mod tests {
             ChatEvent::Typing {
                 channel: one.id,
                 pubkey: "agent-a".into(),
+                at: 100,
             },
             100,
         );
@@ -1342,6 +1405,7 @@ mod tests {
             ChatEvent::Typing {
                 channel: one.id,
                 pubkey: "agent-a".into(),
+                at: 100,
             },
             103,
         );
@@ -1368,6 +1432,7 @@ mod tests {
             ChatEvent::Typing {
                 channel: id,
                 pubkey: agent_key,
+                at: 100,
             },
             100,
         );
@@ -1392,6 +1457,7 @@ mod tests {
             ChatEvent::Typing {
                 channel: id,
                 pubkey: me,
+                at: 100,
             },
             100,
         );
@@ -1409,6 +1475,7 @@ mod tests {
                 ChatEvent::Typing {
                     channel: channel_id,
                     pubkey: pubkey.into(),
+                    at: 100,
                 },
                 100,
             );
@@ -1432,23 +1499,177 @@ mod tests {
     }
 
     #[test]
-    fn a_typist_with_no_profile_is_asked_for_one_once() {
+    fn an_unknown_typist_shows_a_short_key_until_the_profile_lands() {
         let mut app = app();
         let id = channel(1).id;
         app.channels = vec![channel(1)];
-        let indicator = || ChatEvent::Typing {
-            channel: id,
-            pubkey: "agent-a".into(),
-        };
-        app.apply(indicator(), 100);
-        let asked = app.take_outbox();
-        assert!(
-            matches!(asked.as_slice(), [SessionCommand::LoadProfiles(keys)] if keys == &vec!["agent-a".to_owned()]),
-            "an unknown author is resolved: {asked:?}"
+        let agent = keys();
+        let key = agent.public_key().to_hex();
+        app.apply(
+            ChatEvent::Typing {
+                channel: id,
+                pubkey: key.clone(),
+                at: 100,
+            },
+            100,
         );
-        // A refresh of the live entry asks once, not once per indicator.
-        app.apply(indicator(), 103);
-        assert!(app.take_outbox().is_empty());
+        let short = app.typing_names(id, 100);
+        assert_eq!(short.len(), 1);
+        assert_ne!(short[0], key, "a key is shortened, never shown whole");
+
+        app.apply(ChatEvent::Profiles(vec![(key, "Agent A".into())]), 101);
+        assert_eq!(
+            app.typing_names(id, 101),
+            vec!["Agent A".to_owned()],
+            "the resolved name replaces the key without another indicator"
+        );
+    }
+
+    #[test]
+    fn a_message_ends_the_indicator_only_when_it_is_not_older() {
+        let mut app = app();
+        let id = channel(1).id;
+        app.channels = vec![channel(1)];
+        let agent = keys();
+        let key = agent.public_key().to_hex();
+        app.apply(
+            ChatEvent::Profiles(vec![(key.clone(), "Agent A".into())]),
+            0,
+        );
+        let claim = |at| ChatEvent::Typing {
+            channel: id,
+            pubkey: key.clone(),
+            at,
+        };
+
+        // A message the author sent before starting to compose is not the end
+        // of anything: the timeline replays 30 seconds of history, and the
+        // author is still composing.
+        app.apply(claim(100), 100);
+        let old = message_event(&agent, id, "before", 99);
+        app.apply(
+            ChatEvent::Timeline {
+                channel: id,
+                event: old,
+            },
+            101,
+        );
+        assert!(app.is_typing(id, 101), "an older message changes nothing");
+
+        // The message that answers the claim does end it.
+        let answer = message_event(&agent, id, "the answer", 102);
+        app.apply(
+            ChatEvent::Timeline {
+                channel: id,
+                event: answer,
+            },
+            102,
+        );
+        assert!(!app.is_typing(id, 102));
+    }
+
+    #[test]
+    fn history_that_lands_after_an_indicator_ends_it() {
+        let mut app = app();
+        let id = channel(1).id;
+        app.channels = vec![channel(1)];
+        let agent = keys();
+        let key = agent.public_key().to_hex();
+        app.apply(
+            ChatEvent::Profiles(vec![(key.clone(), "Agent A".into())]),
+            0,
+        );
+        // The channel is opened over HTTP while the live feed is already
+        // running: the indicator can land first, its author's message second.
+        app.apply(
+            ChatEvent::Typing {
+                channel: id,
+                pubkey: key.clone(),
+                at: 100,
+            },
+            100,
+        );
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![message_event(&agent, id, "the answer", 101)],
+            },
+            101,
+        );
+        assert!(
+            !app.is_typing(id, 101),
+            "the fetched message is the end of the signal"
+        );
+    }
+
+    #[test]
+    fn a_channel_that_leaves_the_roster_keeps_no_indicator() {
+        let mut app = app();
+        let (one, two) = (channel(1), channel(2));
+        app.channels = vec![one.clone(), two.clone()];
+        for id in [one.id, two.id] {
+            app.apply(
+                ChatEvent::Typing {
+                    channel: id,
+                    pubkey: "agent-a".into(),
+                    at: 100,
+                },
+                100,
+            );
+        }
+        app.apply(ChatEvent::Channels(vec![channel_info(1)]), 101);
+        assert!(app.is_typing(one.id, 101), "a member channel keeps its own");
+        assert!(
+            !app.is_typing(two.id, 101),
+            "a channel the roster dropped keeps nothing, even if it returns"
+        );
+    }
+
+    #[test]
+    fn a_refused_typing_feed_clears_its_channel_and_explains_itself() {
+        let mut app = app();
+        let (one, two) = (channel(1), channel(2));
+        app.channels = vec![one.clone(), two.clone()];
+        app.apply(
+            ChatEvent::Typing {
+                channel: one.id,
+                pubkey: "agent-a".into(),
+                at: 100,
+            },
+            100,
+        );
+        app.apply(
+            ChatEvent::TypingClosed {
+                channel: one.id,
+                reason: "restricted: not a member".into(),
+            },
+            101,
+        );
+        assert!(!app.is_typing(one.id, 101));
+        assert!(
+            app.status.contains("restricted: not a member"),
+            "the open channel says why nobody is typing: {}",
+            app.status
+        );
+
+        // A closed channel already said why it is quiet; the typing feed on
+        // top of it is not a second message.
+        app.apply(
+            ChatEvent::ChannelGone {
+                channel: two.id,
+                reason: "restricted".into(),
+            },
+            102,
+        );
+        let after_gone = app.status.clone();
+        app.apply(
+            ChatEvent::TypingClosed {
+                channel: two.id,
+                reason: "restricted".into(),
+            },
+            102,
+        );
+        assert_eq!(app.status, after_gone);
     }
 
     #[test]
