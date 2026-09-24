@@ -64,7 +64,15 @@ remove `target` first: the registry and git paths still avoid the downloads.
 
 ## Enforcement
 
-GitHub reports the jobs as `CI / Docs` and `CI / Rust`. `main` is not
-protected, so a red run on `main` is a signal after the fact, and a run on a
-pull request is a signal before the merge. Whether the checks must pass is a
-repository setting, not a workflow fact.
+GitHub reports the jobs as `CI / Docs` and `CI / Rust`. The repository
+ruleset `main` covers the default branch, so the checks decide whether a
+change lands. The ruleset requires a pull request and the two checks from
+the GitHub Actions app, refuses a branch delete and a force push, and names
+no bypass actor. A direct push to `main` fails, and the merge button stays
+disabled until both checks report success on the pull request head.
+
+Two settings stay deliberately open, and both match a repository with one
+maintainer. The ruleset does not require the head to be up to date with
+`main`, so a merge needs no rebase once the checks pass. It also requires no
+approving review, because an author cannot approve their own pull request:
+the pull request is the gate, and the checks are the evidence.
