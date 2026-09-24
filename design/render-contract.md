@@ -160,15 +160,20 @@ its own line between the timeline and the composer, and it costs that line only
 while someone is composing.
 
 `content.rs` owns the two constants: `TYPING_KIND` is 20002 and
-`TYPING_TTL_SECS` is 8. `app.rs` owns the state — per channel, one expiry per
-pubkey — and the lifetime rules:
+`TYPING_TTL_SECS` is 8. `app.rs` owns the state — per channel, one entry per
+pubkey holding two times: the event time of the author's last claim, and the
+client's own deadline for believing it — and the lifetime rules:
 
 | Event | Effect |
 |---|---|
-| An indicator for a channel | Set, or refresh, that pubkey's deadline to `now + 8` |
-| The same pubkey's message in that channel | Drop the entry; the message is the end of the signal |
+| An indicator for a channel | Record the claim's event time and set that pubkey's deadline to `now + 8` |
+| A message from that pubkey that is not older than its claim | Drop the entry; the message is the end of the signal |
+| A message older than the claim | Keep it; the timeline replays up to 30 seconds on a new subscription, and an author who posted before composing is still composing |
+| History that lands after an indicator | The same rule, row by row: the channel is opened over HTTP while the live feed is already running |
 | `Disconnected` | Drop every entry: the state lived on that connection |
 | `ChannelGone` | Drop that channel's entries |
+| A roster reload that no longer lists a channel | Drop that channel's entries, so a returning id starts clean |
+| `CLOSED` on a channel's typing feed | Drop that channel's entries; the status line carries the relay's reason when the channel itself is still open |
 | An indicator from the identity's own pubkey | Ignore; another client of the same identity is still the identity |
 | An indicator from a pubkey with no known profile | Ask the relay for the profile, once per new entry |
 

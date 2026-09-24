@@ -44,7 +44,26 @@ pub enum SubControl {
 enum SubKind {
     Timeline(Uuid),
     Aux(#[allow(dead_code)] Uuid),
-    Typing,
+    Typing(Uuid),
+}
+
+/// What a `CLOSED` from the relay ended, for a subscription this client
+/// opened. Everything about a subscription id is per connection, so the id is
+/// removed either way; the caller decides what the user is told.
+enum Closed {
+    Timeline(Uuid),
+    Typing(Uuid),
+}
+
+fn close_subscription(state: &mut PumpState, sub_id: &str) -> Option<Closed> {
+    match state.sub_ids.remove(sub_id)? {
+        SubKind::Timeline(channel) => {
+            state.timeline_channels.retain(|c| c != &channel);
+            Some(Closed::Timeline(channel))
+        }
+        SubKind::Typing(channel) => Some(Closed::Typing(channel)),
+        SubKind::Aux(_) => None,
+    }
 }
 
 fn timeline_filter(channel: &Uuid, since: u64) -> serde_json::Value {
@@ -276,7 +295,7 @@ impl PumpState {
         for channel in channels {
             let sub_id = format!("y:{channel}");
             Self::req_raw(conn, &sub_id, &typing_filter(&channel)).await;
-            self.sub_ids.insert(sub_id, SubKind::Typing);
+            self.sub_ids.insert(sub_id, SubKind::Typing(channel));
         }
     }
 
@@ -363,12 +382,13 @@ async fn handle_message(
             Some(SubKind::Aux(_)) => {
                 let _ = events.send(ChatEvent::Overlay(*event)).await;
             }
-            Some(SubKind::Typing) => {
+            Some(SubKind::Typing(_)) => {
                 if let Some(channel) = typing_channel(&event) {
                     let _ = events
                         .send(ChatEvent::Typing {
                             channel,
                             pubkey: event.pubkey.to_hex(),
+                            at: event.created_at.as_secs(),
                         })
                         .await;
                 }
@@ -379,9 +399,8 @@ async fn handle_message(
         RelayMessage::Closed {
             subscription_id,
             message,
-        } => {
-            if let Some(SubKind::Timeline(channel)) = state.sub_ids.remove(&subscription_id) {
-                state.timeline_channels.retain(|c| c != &channel);
+        } => match close_subscription(state, &subscription_id) {
+            Some(Closed::Timeline(channel)) => {
                 let _ = events
                     .send(ChatEvent::ChannelGone {
                         channel,
@@ -389,7 +408,16 @@ async fn handle_message(
                     })
                     .await;
             }
-        }
+            Some(Closed::Typing(channel)) => {
+                let _ = events
+                    .send(ChatEvent::TypingClosed {
+                        channel,
+                        reason: message,
+                    })
+                    .await;
+            }
+            None => {}
+        },
         RelayMessage::Notice { message } => {
             let _ = events.send(ChatEvent::Status(message)).await;
         }
@@ -441,6 +469,38 @@ mod tests {
         for tags in [vec![], vec![vec!["h"]], vec![vec!["h", "not-a-uuid"]]] {
             assert_eq!(typing_channel(&indicator(tags)), None);
         }
+    }
+
+    #[test]
+    fn a_closed_typing_feed_is_told_apart_from_a_closed_timeline() {
+        let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut state = PumpState::default();
+        state
+            .sub_ids
+            .insert(format!("y:{one}"), SubKind::Typing(one));
+        state
+            .sub_ids
+            .insert(format!("t:{two}"), SubKind::Timeline(two));
+        state.timeline_channels.push(two);
+        state
+            .sub_ids
+            .insert("a:03de0a1b".to_owned(), SubKind::Aux(Uuid::new_v4()));
+
+        assert!(
+            matches!(close_subscription(&mut state, &format!("y:{one}")), Some(Closed::Typing(channel)) if channel == one),
+            "a refused feed is its own event, not a channel that went away"
+        );
+        assert!(matches!(
+            close_subscription(&mut state, &format!("t:{two}")),
+            Some(Closed::Timeline(channel)) if channel == two
+        ));
+        assert_eq!(state.timeline_channels, Vec::<Uuid>::new());
+        assert!(close_subscription(&mut state, "a:03de0a1b").is_none());
+        assert!(close_subscription(&mut state, "y:never-opened").is_none());
+        assert!(
+            state.sub_ids.is_empty(),
+            "a closed subscription is forgotten"
+        );
     }
 
     #[test]

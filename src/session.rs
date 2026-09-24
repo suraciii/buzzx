@@ -57,10 +57,19 @@ pub enum ChatEvent {
     /// One live auxiliary event: a reaction, edit, or deletion.
     Overlay(Event),
     /// One identity is composing in one channel. Ephemeral: it arrives on the
-    /// live connection only and is never part of the timeline.
+    /// live connection only and is never part of the timeline. `at` is the
+    /// indicator's own event time, which is what a later message is compared
+    /// against.
     Typing {
         channel: Uuid,
         pubkey: String,
+        at: u64,
+    },
+    /// The relay closed the typing feed of one channel. The channel itself may
+    /// still be open; only its indicators stopped.
+    TypingClosed {
+        channel: Uuid,
+        reason: String,
     },
     /// The relay closed a channel subscription: membership was lost.
     ChannelGone {
