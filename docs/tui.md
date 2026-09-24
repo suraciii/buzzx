@@ -74,7 +74,7 @@ message with the appropriate layout without restarting the session.
 
 1. A 40×10 terminal can select a channel, scroll, send a new message, reply,
    and quit.
-2. A 24×6 terminal starts, displays the size message, and recovers
+2. A terminal below 24×6 starts, displays the size message, and recovers
    automatically after resize; focus, draft, and reply target survive.
 3. A 79-column terminal has no horizontal overflow and wraps long URLs and
    words.
