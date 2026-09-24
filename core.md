@@ -136,5 +136,9 @@ The first phase is the terminal user's path, end to end:
 A message that another client sends appears in the timeline during the same
 session. This is what makes it a chat client and not a pager.
 
-Typing indicators, presence, read markers, and media come later. They are
-real, and they are not required to prove the product.
+A typing indicator (kind 20002) from another identity appears as one line
+between the timeline and the composer, and expires on its own. buzzx consumes
+indicators; it does not publish its own yet.
+
+Presence, read markers, and media come later. They are real, and they are not
+required to prove the product.

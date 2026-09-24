@@ -37,7 +37,7 @@ focused row, the draft, and the reply target survive a resize.
 |           | bob           1m                            |
 |           | @tyler can you look                         |
 |           | +2 reactions                                |
-|           |                                             |
+|           | Agent A typing...                           |
 |           +---------------------------------------------+
 |           | reply to bob - enter to send, esc to clear  |
 +-----------+---------------------------------------------+
@@ -46,7 +46,10 @@ focused row, the draft, and the reply target survive a resize.
 
 The channel list on the left shows the identity's channels, the active one
 highlighted. The timeline on the right shows the selected channel's messages.
-The composer at the bottom is the text input.
+The composer at the bottom is the text input. The typing line appears above the
+composer while another identity is composing, and takes no row when nobody is.
+The diagram's `...` is the client's single-character ellipsis; the line itself
+is documented under [typing indicators](#typing-indicators).
 
 ### Narrow and minimal
 
@@ -129,6 +132,40 @@ A pending send renders dimmed with a `...` marker until the relay answers. If
 the relay refuses the send, the row disappears, the composer text returns, and
 the status line shows the relay's reason.
 
+## Typing indicators
+
+When another identity is composing in the selected channel, one dim line
+appears between the timeline and the composer. It shows a display name per
+identity, at most two, then `+N` for the rest:
+
+```text literal
+Agent A typing…
+Agent A, Agent B are typing…
+Agent A, Agent B +2 are typing…
+```
+
+The wide layout writes the names as they are. The one-column layouts use the
+compact `@` form, `@Agent A typing…`. When nobody is composing, the line is
+gone and the timeline gets the row back.
+
+Channels where someone is composing carry a `…` after the name in the channel
+list, and the picker shows the same marker, so activity in a channel you are
+not reading is still visible. The marker is not an unread count and it does not
+reorder the list.
+
+Indicators are ephemeral: they are never part of the history, they are not
+counted as unread, and they do not survive a restart. One expires 8 seconds
+after the last repeat from its author, and it ends immediately when that
+author's message arrives, when the connection drops (the status line shows
+`reconnecting`), or when the channel closes. Another client signed in with the
+same identity does not show up as a typist in your session.
+
+Two limits are worth knowing. Typing is shown per channel, not per thread, so a
+reply in progress looks the same as a new message in progress. And the line
+reports typing only: whether an agent has accepted a request, is running a
+tool, or has failed needs its own status event from the agent's runtime, which
+does not exist yet.
+
 ## Status line
 
 The bottom line shows three things: the connection state, the relay's answer to
@@ -150,6 +187,9 @@ the last write, and the mode. The connection state is one of `connecting`,
   `buzz` CLI or the desktop app.
 - It does not show your own read state on other devices. Read
   markers sync through the relay; the display of that state is a later phase.
+- It does not publish a typing indicator of its own. The line above the
+  composer shows other identities composing; publishing your own is a later
+  phase, and the event contract on the relay already accepts it.
 
 ## Terminal requirements
 

@@ -51,6 +51,17 @@ event ids it has sent, so it can tell the two apart.
 | 40099 | System rows (member joined, channel created). Shown if they arrive. |
 | 39005 | Thread summary. Used for a reply count badge. Never a row. |
 
+### Ephemeral kinds
+
+| Kind | Behavior |
+|---|---|
+| 20002 | Typing indicator. Never a row: it becomes the line above the composer and a `…` marker in the channel list. |
+
+An ephemeral event is never stored and never replayed, so it is subscribed on
+the live connection only and it is state, not history. Its rules are in
+[relay-transport.md](relay-transport.md#ephemeral-events); the section below
+covers what it renders as.
+
 ## Row shape
 
 ```text literal
@@ -141,6 +152,43 @@ calculate this; it only needs to render the result.
 A deletion removes the row with the target id. Deletions are not reversible
 in the client. `buzzx` can delete only its own messages, and it shows a
 distinct key for that.
+
+## Typing indicators
+
+A typing indicator is the only thing buzzx renders that is not a row. It has
+its own line between the timeline and the composer, and it costs that line only
+while someone is composing.
+
+`content.rs` owns the two constants: `TYPING_KIND` is 20002 and
+`TYPING_TTL_SECS` is 8. `app.rs` owns the state — per channel, one expiry per
+pubkey — and the lifetime rules:
+
+| Event | Effect |
+|---|---|
+| An indicator for a channel | Set, or refresh, that pubkey's deadline to `now + 8` |
+| The same pubkey's message in that channel | Drop the entry; the message is the end of the signal |
+| `Disconnected` | Drop every entry: the state lived on that connection |
+| `ChannelGone` | Drop that channel's entries |
+| An indicator from the identity's own pubkey | Ignore; another client of the same identity is still the identity |
+| An indicator from a pubkey with no known profile | Ask the relay for the profile, once per new entry |
+
+Expiry is a read-time filter as well as a tick: a name is shown only while its
+deadline is in the future, so a stalled frame loop cannot show a stale one.
+
+The line renders the entries of the selected channel only, sorted by display
+name so it does not reshuffle between frames. One name is
+`<name> typing…`, two are `<a>, <b> are typing…`, and more add ` +N` after the
+second name. The wide layout writes the display names; the one-column layouts
+prefix each with `@`. The channel list and the channel picker append a single
+`…` to any channel that has an entry, which is the whole reason the state is
+kept for channels that are not on screen. A long channel name is clipped to
+keep that marker on the row: it is one column of signal and it must not be
+what the terminal cuts off.
+
+Typing state never becomes a row, a count, or an unread mark, and it does not
+change the order or the selection of anything. Thread tags on an indicator are
+ignored: buzzx shows typing at channel granularity, so a reply in progress
+shows the same as a top-level message in progress.
 
 ## Unread state
 

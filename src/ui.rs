@@ -179,6 +179,57 @@ fn cursor_window(line: &str, cursor: usize, width: usize) -> String {
     line.chars().skip(start).take(width).collect()
 }
 
+/// The typing line for the open channel: one merged sentence for everyone
+/// composing there. Empty when nobody is, so the row costs no space then.
+///
+/// The wide layout spends its width on the display names; the one-column
+/// layouts use the compact `@name` form.
+fn typing_line(names: &[String], compact: bool) -> String {
+    let shown: Vec<String> = names
+        .iter()
+        .take(2)
+        .map(|name| {
+            if compact {
+                format!("@{name}")
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    let extra = names.len().saturating_sub(shown.len());
+    let mut who = shown.join(", ");
+    if extra > 0 {
+        who.push_str(&format!(" +{extra}"));
+    }
+    match names.len() {
+        0 => String::new(),
+        1 => format!("{who} typing…"),
+        _ => format!("{who} are typing…"),
+    }
+}
+
+/// The typing line for the channel on screen.
+fn typing_text(app: &App, now: u64, compact: bool) -> String {
+    let names = app
+        .channels
+        .get(app.selected)
+        .map(|entry| app.typing_names(entry.id, now))
+        .unwrap_or_default();
+    typing_line(&names, compact)
+}
+
+/// One dim line between the timeline and the composer. It draws nothing when
+/// it has nothing to say.
+fn draw_typing(frame: &mut Frame, text: &str, area: Rect) {
+    if text.is_empty() || area.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(text.to_owned(), pending_style())),
+        area,
+    );
+}
+
 /// Draw the whole interface for one frame.
 pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     let area = frame.area();
@@ -190,7 +241,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
         LayoutMode::Minimal => draw_minimal(frame, app, now, area),
     }
     if app.picker.is_some() {
-        draw_picker(frame, app, area);
+        draw_picker(frame, app, now, area);
     }
     if app.help {
         draw_help(frame, area, mode);
@@ -203,52 +254,61 @@ fn draw_wide(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
     let main = Layout::horizontal([Constraint::Length(22), Constraint::Min(40)]).split(outer[0]);
 
-    draw_channel_list(frame, app, main[0]);
+    draw_channel_list(frame, app, now, main[0]);
+    let typing = typing_text(app, now, false);
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(u16::from(!typing.is_empty())),
         Constraint::Length(3),
     ])
     .split(main[1]);
     draw_header(frame, app, column[0], false);
     draw_timeline(frame, app, column[1], now, false);
-    draw_composer(frame, app, column[2], false);
+    draw_typing(frame, &typing, column[2]);
+    draw_composer(frame, app, column[3], false);
     draw_status(frame, app, outer[1], true);
 }
 
 /// One column: header, timeline, composer, status hint. The channel list is
 /// behind `c`.
 fn draw_narrow(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let typing = typing_text(app, now, true);
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
+        Constraint::Length(u16::from(!typing.is_empty())),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
     .split(area);
     draw_header(frame, app, column[0], true);
     draw_timeline(frame, app, column[1], now, false);
-    draw_composer(frame, app, column[2], true);
-    draw_status(frame, app, column[3], false);
+    draw_typing(frame, &typing, column[2]);
+    draw_composer(frame, app, column[3], true);
+    draw_status(frame, app, column[4], false);
 }
 
 /// One column with compact rows. The composer takes a single line, and only
 /// while it is being used.
 fn draw_minimal(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let composer_rows = u16::from(app.mode == Mode::Composer);
+    let typing = typing_text(app, now, true);
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(u16::from(!typing.is_empty())),
         Constraint::Length(composer_rows),
         Constraint::Length(1),
     ])
     .split(area);
     draw_header(frame, app, column[0], true);
     draw_timeline(frame, app, column[1], now, true);
+    draw_typing(frame, &typing, column[2]);
     if composer_rows == 1 {
-        draw_composer_line(frame, app, column[2]);
+        draw_composer_line(frame, app, column[3]);
     }
-    draw_status(frame, app, column[3], false);
+    draw_status(frame, app, column[4], false);
 }
 
 /// The channel and its loading state; the compact modes add the connection
@@ -270,14 +330,38 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
     frame.render_widget(Paragraph::new(text), area);
 }
 
-fn draw_channel_list(frame: &mut Frame, app: &App, area: Rect) {
+/// One channel list line, `number name` plus the activity marker. The marker
+/// is reserved first and the name is clipped to the columns that remain: a
+/// name that runs long must not push the marker off the row, because a clipped
+/// marker is a silent one.
+fn channel_item(number: usize, name: &str, active: bool, width: usize) -> Line<'static> {
+    let marker = if active { " …" } else { "" };
+    let prefix = format!("{number} ");
+    let budget = width.saturating_sub(prefix.chars().count() + marker.chars().count());
+    let name: String = name.chars().take(budget).collect();
+    Line::raw(format!("{prefix}{name}{marker}"))
+}
+
+/// The columns a list row has: the area minus its borders and the two the
+/// highlight symbol takes.
+fn list_row_width(area: Rect) -> usize {
+    area.width.saturating_sub(4) as usize
+}
+
+fn draw_channel_list(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let width = list_row_width(area);
     let items: Vec<ListItem> = app
         .channels
         .iter()
         .enumerate()
         .map(|(index, channel)| {
             let number = (index + 1).min(9);
-            ListItem::new(Line::raw(format!("{number} {}", channel.name)))
+            ListItem::new(channel_item(
+                number,
+                &channel.name,
+                app.is_typing(channel.id, now),
+                width,
+            ))
         })
         .collect();
     let list = List::new(items)
@@ -472,12 +556,20 @@ fn draw_size_message(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
 }
 
-fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_picker(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let width = list_row_width(area);
     let items: Vec<ListItem> = app
         .channels
         .iter()
         .enumerate()
-        .map(|(index, channel)| ListItem::new(Line::raw(format!("{} {}", index + 1, channel.name))))
+        .map(|(index, channel)| {
+            ListItem::new(channel_item(
+                index + 1,
+                &channel.name,
+                app.is_typing(channel.id, now),
+                width,
+            ))
+        })
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -643,6 +735,136 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn a_long_channel_name_gives_up_columns_instead_of_the_activity_marker() {
+        // 18 columns is the sidebar's row width at 80x12.
+        let plain = channel_item(5, "buzzx-tui-build", false, 18).to_string();
+        assert_eq!(plain, "5 buzzx-tui-build");
+        let active = channel_item(5, "buzzx-tui-build", true, 18).to_string();
+        assert!(active.ends_with('…'), "{active:?} keeps the marker");
+        assert_eq!(active.chars().count(), 18, "{active:?} fills the row");
+        let short = channel_item(1, "dm", true, 18).to_string();
+        assert_eq!(short, "1 dm …");
+    }
+
+    #[test]
+    fn the_typing_line_merges_names_and_counts_the_rest() {
+        let names = |list: &[&str]| -> Vec<String> { list.iter().map(|n| n.to_string()).collect() };
+        assert_eq!(typing_line(&names(&[]), false), "");
+        assert_eq!(typing_line(&names(&["Ada"]), false), "Ada typing…");
+        assert_eq!(typing_line(&names(&["Ada"]), true), "@Ada typing…");
+        assert_eq!(
+            typing_line(&names(&["Ada", "Bo"]), true),
+            "@Ada, @Bo are typing…"
+        );
+        assert_eq!(
+            typing_line(&names(&["Ada", "Bo", "Cy", "Di"]), true),
+            "@Ada, @Bo +2 are typing…"
+        );
+        assert_eq!(
+            typing_line(&names(&["Ada", "Bo", "Cy"]), false),
+            "Ada, Bo +1 are typing…"
+        );
+    }
+
+    #[test]
+    fn the_typing_line_sits_above_the_composer_and_the_list_marks_activity() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        let active = app.channels[0].id;
+        app.channels.push(crate::app::ChannelEntry {
+            id: uuid::Uuid::new_v4(),
+            name: "quiet".to_owned(),
+            rows: Vec::new(),
+            seen: Default::default(),
+            loading: false,
+        });
+        app.apply(
+            crate::session::ChatEvent::Profiles(vec![("agent-a".into(), "Agent A".into())]),
+            130,
+        );
+        app.apply(
+            crate::session::ChatEvent::Typing {
+                channel: active,
+                pubkey: "agent-a".into(),
+            },
+            130,
+        );
+
+        let text = frame_text(&app, 80, 12);
+        let typing_row = text
+            .lines()
+            .find(|line| line.contains("typing"))
+            .expect("the typing line renders");
+        assert!(
+            typing_row.contains("Agent A typing"),
+            "the wide layout spells the display name out: {typing_row:?}"
+        );
+        assert!(text.contains("i compose"), "the composer keeps its hint");
+        assert!(text.contains("1 general …"), "{text}");
+        assert!(!text.contains("2 quiet …"), "a quiet channel stays plain");
+    }
+
+    #[test]
+    fn one_column_layouts_show_typing_without_losing_the_composer() {
+        let mut app = chat_app(vec![message_row(0, "hello world")]);
+        let id = app.channels[0].id;
+        app.apply(
+            crate::session::ChatEvent::Profiles(vec![("agent-a".into(), "agent-a".into())]),
+            130,
+        );
+        app.apply(
+            crate::session::ChatEvent::Typing {
+                channel: id,
+                pubkey: "agent-a".into(),
+            },
+            130,
+        );
+        app.mode = Mode::Composer;
+        app.composer.set_text("hi");
+
+        let narrow = frame_text(&app, 40, 10);
+        assert!(narrow.contains("@agent-a typing…"), "{narrow}");
+        assert!(narrow.contains("enter send"), "the composer keeps its hint");
+
+        // 24x6 is the floor: header, one timeline row, typing, composer, and
+        // status must all fit at once.
+        let minimal = frame_text(&app, 24, 6);
+        assert!(minimal.contains("@agent-a typing…"), "{minimal}");
+        assert!(
+            minimal.contains("> hi"),
+            "the composer prompt survives: {minimal}"
+        );
+        assert!(
+            minimal.contains("hello world"),
+            "the focused row survives: {minimal}"
+        );
+    }
+
+    #[test]
+    fn the_picker_marks_the_channels_someone_is_composing_in() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        let second = uuid::Uuid::new_v4();
+        app.channels.push(crate::app::ChannelEntry {
+            id: second,
+            name: "second".to_owned(),
+            rows: Vec::new(),
+            seen: Default::default(),
+            loading: false,
+        });
+        app.apply(
+            crate::session::ChatEvent::Typing {
+                channel: second,
+                pubkey: "agent-b".into(),
+            },
+            130,
+        );
+        app.picker = Some(0);
+
+        let text = frame_text(&app, 40, 10);
+        assert!(text.contains("2 second …"), "{text}");
+        assert!(!text.contains("1 general …"), "{text}");
     }
 
     #[test]

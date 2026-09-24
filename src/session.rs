@@ -56,6 +56,12 @@ pub enum ChatEvent {
     },
     /// One live auxiliary event: a reaction, edit, or deletion.
     Overlay(Event),
+    /// One identity is composing in one channel. Ephemeral: it arrives on the
+    /// live connection only and is never part of the timeline.
+    Typing {
+        channel: Uuid,
+        pubkey: String,
+    },
     /// The relay closed a channel subscription: membership was lost.
     ChannelGone {
         channel: Uuid,
@@ -199,7 +205,7 @@ async fn run_command_pump(
     while let Some(command) = commands.recv().await {
         match command {
             SessionCommand::LoadChannels => {
-                load_channels(&transport, &me, &events).await;
+                load_channels(&transport, &me, &subs, &events).await;
             }
             SessionCommand::OpenChannel(channel) => {
                 open_channel(&transport, channel, &subs, &events).await;
@@ -361,7 +367,12 @@ fn tag_value(event: &Event, name: &str) -> Option<String> {
     })
 }
 
-async fn load_channels(transport: &HttpTransport, me: &str, events: &mpsc::Sender<ChatEvent>) {
+async fn load_channels(
+    transport: &HttpTransport,
+    me: &str,
+    subs: &mpsc::Sender<SubControl>,
+    events: &mpsc::Sender<ChatEvent>,
+) {
     // Membership first: kind 39002 names the channels the identity belongs
     // to. Metadata for those ids second.
     let membership = serde_json::json!({
@@ -385,6 +396,9 @@ async fn load_channels(transport: &HttpTransport, me: &str, events: &mpsc::Sende
         }
     }
     if ids.is_empty() {
+        // No membership means no channel to watch for typing either; the
+        // empty list replaces whatever the previous connection subscribed to.
+        let _ = subs.send(SubControl::Typing(Vec::new())).await;
         let _ = events.send(ChatEvent::Channels(Vec::new())).await;
         return;
     }
@@ -408,6 +422,11 @@ async fn load_channels(transport: &HttpTransport, me: &str, events: &mpsc::Sende
         channels.push(ChannelInfo { id, name });
     }
     channels.sort_by_key(|c| c.name.to_lowercase());
+    // Every member channel, not just the open one: the channel list shows an
+    // activity marker per channel, and an indicator that arrives while the
+    // user is elsewhere is exactly what the marker is for.
+    let ids: Vec<Uuid> = channels.iter().map(|c| c.id).collect();
+    let _ = subs.send(SubControl::Typing(ids)).await;
     let _ = events.send(ChatEvent::Channels(channels)).await;
 }
 

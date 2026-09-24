@@ -34,12 +34,17 @@ pub enum SubControl {
     /// The overlay feed for one channel's loaded ids, replacing the previous
     /// feed for that channel.
     Aux { channel: Uuid, ids: Vec<String> },
+    /// The typing feed for every channel the identity belongs to, replacing
+    /// the previous feed. The list is per-connection state: an empty list
+    /// closes the feed.
+    Typing(Vec<Uuid>),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum SubKind {
     Timeline(Uuid),
     Aux(#[allow(dead_code)] Uuid),
+    Typing,
 }
 
 fn timeline_filter(channel: &Uuid, since: u64) -> serde_json::Value {
@@ -56,6 +61,32 @@ fn aux_filter(ids: &[String]) -> serde_json::Value {
         "kinds": crate::content::AUX_KINDS,
         "#e": ids,
         "limit": 1000,
+    })
+}
+
+/// Typing is ephemeral, so the filter carries no `since` and no `limit`: there
+/// is nothing stored to page through, and a time window could only drop a live
+/// indicator. Kind and channel are the whole query.
+///
+/// One `#h` value, never several: the relay registers live fan-out per single
+/// channel and falls back to a global subscription for a filter that names more
+/// than one, which receives no channel event at all.
+fn typing_filter(channel: &Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [crate::content::TYPING_KIND],
+        "#h": [channel.to_string()],
+    })
+}
+
+/// The channel a typing indicator names. An indicator without a usable `h`
+/// tag cannot be placed on screen, so the pump drops it.
+fn typing_channel(event: &nostr::Event) -> Option<Uuid> {
+    event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.first().map(String::as_str) == Some("h"))
+            .then(|| parts.get(1))
+            .flatten()
+            .and_then(|id| Uuid::parse_str(id).ok())
     })
 }
 
@@ -167,6 +198,7 @@ struct PumpState {
     sub_ids: HashMap<String, SubKind>,
     timeline_channels: Vec<Uuid>,
     aux_ids: HashMap<Uuid, Vec<String>>,
+    typing_channels: Vec<Uuid>,
 }
 
 impl PumpState {
@@ -224,6 +256,30 @@ impl PumpState {
         }
     }
 
+    /// Replace the typing feed with one covering exactly these channels. Every
+    /// subscription is replaced rather than added to: the channel list is the
+    /// authority on membership, and a stale channel would keep its indicators
+    /// alive after the identity left it. One REQ per channel, because the relay
+    /// indexes live fan-out by a single `#h` value.
+    async fn subscribe_typing(&mut self, conn: &mut NostrWsConnection, channels: Vec<Uuid>) {
+        for sub in self
+            .sub_ids
+            .keys()
+            .filter(|k| k.starts_with("y:"))
+            .cloned()
+            .collect::<Vec<String>>()
+        {
+            Self::close(conn, &sub).await;
+        }
+        self.sub_ids.retain(|k, _| !k.starts_with("y:"));
+        self.typing_channels = channels.clone();
+        for channel in channels {
+            let sub_id = format!("y:{channel}");
+            Self::req_raw(conn, &sub_id, &typing_filter(&channel)).await;
+            self.sub_ids.insert(sub_id, SubKind::Typing);
+        }
+    }
+
     async fn resubscribe_all(&mut self, conn: &mut NostrWsConnection) {
         let channels = self.timeline_channels.clone();
         for channel in channels {
@@ -232,6 +288,10 @@ impl PumpState {
         let aux = self.aux_ids.clone();
         for (channel, ids) in aux {
             self.subscribe_aux(conn, channel, ids).await;
+        }
+        if !self.typing_channels.is_empty() {
+            let typing = self.typing_channels.clone();
+            self.subscribe_typing(conn, typing).await;
         }
     }
 }
@@ -260,6 +320,7 @@ async fn apply_control(conn: &mut NostrWsConnection, state: &mut PumpState, cont
     match control {
         SubControl::Timeline(channel) => state.subscribe_timeline(conn, channel).await,
         SubControl::Aux { channel, ids } => state.subscribe_aux(conn, channel, ids).await,
+        SubControl::Typing(channels) => state.subscribe_typing(conn, channels).await,
     }
 }
 
@@ -302,6 +363,16 @@ async fn handle_message(
             Some(SubKind::Aux(_)) => {
                 let _ = events.send(ChatEvent::Overlay(*event)).await;
             }
+            Some(SubKind::Typing) => {
+                if let Some(channel) = typing_channel(&event) {
+                    let _ = events
+                        .send(ChatEvent::Typing {
+                            channel,
+                            pubkey: event.pubkey.to_hex(),
+                        })
+                        .await;
+                }
+            }
             None => {}
         },
         RelayMessage::Eose { .. } => {}
@@ -341,4 +412,45 @@ async fn handle_message(
         RelayMessage::Count { .. } => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indicator(tags: Vec<Vec<&str>>) -> nostr::Event {
+        let keys = Keys::generate();
+        let tags: Vec<Tag> = tags
+            .into_iter()
+            .map(|parts| Tag::parse(parts).expect("a tag"))
+            .collect();
+        nostr::EventBuilder::new(nostr::Kind::Custom(crate::content::TYPING_KIND as u16), "")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .expect("a signed event")
+    }
+
+    #[test]
+    fn an_indicator_is_routed_by_its_h_tag_or_not_at_all() {
+        let channel = Uuid::new_v4();
+        let event = indicator(vec![vec!["h", &channel.to_string()]]);
+        assert_eq!(typing_channel(&event), Some(channel));
+
+        // No `h`, an `h` with no value, and an `h` that is not a channel are
+        // all indicators without a channel: there is nowhere to show them.
+        for tags in [vec![], vec![vec!["h"]], vec![vec!["h", "not-a-uuid"]]] {
+            assert_eq!(typing_channel(&indicator(tags)), None);
+        }
+    }
+
+    #[test]
+    fn the_typing_filter_names_one_channel_and_no_time_window() {
+        let channel = Uuid::new_v4();
+        let filter = typing_filter(&channel);
+        assert_eq!(filter["kinds"], serde_json::json!([20002]));
+        assert_eq!(filter["#h"], serde_json::json!([channel.to_string()]));
+        // Ephemeral: nothing is stored, so a window could only hide a live one.
+        assert!(filter.get("since").is_none());
+        assert!(filter.get("limit").is_none());
+    }
 }
