@@ -169,7 +169,7 @@ pub fn read_line_hidden() -> Result<String, StartupError> {
     outcome.map(|_| String::from_utf8_lossy(&buffer).trim().to_string())
 }
 
-fn read_line_visible(prompt: &str) -> Result<String, StartupError> {
+pub(crate) fn read_line_visible(prompt: &str) -> Result<String, StartupError> {
     print!("{prompt}");
     let _ = io::stdout().flush();
     let mut line = String::new();

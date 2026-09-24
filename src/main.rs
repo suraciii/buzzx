@@ -1,6 +1,7 @@
 //! Terminal setup, the event loop, and teardown. The loop shape is fixed in
 //! design/architecture.md: drain events, draw, poll a key, apply, repeat.
 
+mod account;
 mod app;
 mod config;
 mod content;
@@ -77,6 +78,16 @@ enum Command {
         #[arg(long)]
         auth_tag: Option<String>,
     },
+    /// Show the effective identity and relay and where each came from.
+    /// Local only: no relay connection, no secrets.
+    Whoami,
+    /// Remove the saved private key and auth tag from the config file.
+    /// The relay preference is kept.
+    Logout {
+        /// Confirm without a prompt. Required when stdin is not a terminal.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() {
@@ -110,6 +121,16 @@ fn main() {
                 e.code
             }
         },
+        Command::Whoami => account::run_whoami(
+            cli.private_key.as_deref(),
+            cli.relay.as_deref(),
+            cli.auth_tag.as_deref(),
+        ),
+        Command::Logout { yes } => account::run_logout(account::LogoutCli {
+            yes,
+            flag_key: cli.private_key.clone(),
+            env_key: std::env::var("BUZZ_PRIVATE_KEY").is_ok(),
+        }),
         Command::Watch { channel } => match Uuid::parse_str(&channel) {
             Err(_) => {
                 eprintln!("buzzx: channel must be a UUID");

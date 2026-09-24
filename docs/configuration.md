@@ -139,6 +139,39 @@ No output of a successful or failed login contains the key: not stdout,
 not stderr, not an error message. Identity in messages is the npub short
 form, the first 8 and last 4 characters.
 
+## Whoami
+
+`buzzx whoami` answers one question: what identity would a session use
+right now? It resolves locally, with the same precedence every subcommand
+uses, and prints the identity, the relay, and the source each won from:
+`flag`, `env`, `file`, or, for the relay, `default`. When no identity
+resolves, it exits with code 3 and names the sources it checked.
+
+It never contacts the relay, so it works offline, over SSH, and in
+containers. Its output carries no secret: no private key, no auth tag, not
+even on the failure paths.
+
+## Logout
+
+`buzzx logout` removes the `private_key` and `auth_tag` fields from the
+config file and leaves the `relay_url` preference in place. It is entirely
+local: it sends nothing to the relay, and it has no Mobile authorization to
+revoke, because no remote-signing session exists yet.
+
+Before writing, logout shows the identity and relay it is about to clear.
+On a terminal it asks; any answer but `y` or `yes` cancels with code 1 and
+the file is untouched. Without a terminal it must be passed `--yes`, or it
+exits code 1 without touching the file. The write is the same atomic
+replace login uses, so a failed write leaves the previous file intact.
+
+An identity override in effect - `--private-key` or `BUZZ_PRIVATE_KEY` -
+cannot be removed by logout, so logout refuses with code 1 and says so,
+rather than report a logged-out state that is not real. Remove the override
+first.
+
+With no local login material in the file, logout succeeds and says so. It
+is idempotent: running it twice changes nothing the second time.
+
 ## Environment reference
 
 `buzzx` reads these variables and no others. Config that changes behavior

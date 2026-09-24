@@ -63,6 +63,55 @@ pub struct ConfigFile {
     pub auth_tag: Option<String>,
 }
 
+/// Where the identity key came from. `remote` does not exist yet: no
+/// remote-signing session is implemented, so no source can be it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Flag,
+    Env,
+    File,
+}
+
+/// Where the relay URL came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaySource {
+    Flag,
+    Env,
+    File,
+    Default,
+}
+
+/// The winning sources of one resolution. `whoami` reports them; nothing
+/// else reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sources {
+    pub key: KeySource,
+    pub relay: RelaySource,
+}
+
+impl KeySource {
+    /// The label `whoami` prints.
+    pub fn label(self) -> &'static str {
+        match self {
+            KeySource::Flag => "flag",
+            KeySource::Env => "env",
+            KeySource::File => "file",
+        }
+    }
+}
+
+impl RelaySource {
+    /// The label `whoami` prints.
+    pub fn label(self) -> &'static str {
+        match self {
+            RelaySource::Flag => "flag",
+            RelaySource::Env => "env",
+            RelaySource::File => "file",
+            RelaySource::Default => "default",
+        }
+    }
+}
+
 /// Everything a session needs to start: one identity, one relay.
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -70,6 +119,7 @@ pub struct Resolved {
     /// HTTP base URL, no trailing slash. The WebSocket form is derived on use.
     pub http_url: String,
     pub auth_tag: Option<String>,
+    pub sources: Sources,
 }
 
 /// Turn any of the four accepted relay schemes into the HTTP base and the
@@ -126,24 +176,35 @@ pub fn resolve_from(
     env_auth_tag: Option<&str>,
     file: ConfigFile,
 ) -> Result<Resolved, StartupError> {
-    let key_src = flag_key
-        .map(str::to_owned)
-        .or_else(|| env_key.map(str::to_owned))
-        .or_else(|| file.private_key.clone())
-        .ok_or_else(|| {
-            StartupError::auth(
-                "no identity: set BUZZ_PRIVATE_KEY, pass --private-key, or set private_key in the config file",
-            )
-        })?;
-    let keys = Keys::parse(&key_src)
-        .map_err(|e| StartupError::auth(format!("invalid private key: {e}")))?;
+    let (key_text, key_source) = match flag_key {
+        Some(key) => (key.to_owned(), KeySource::Flag),
+        None => match env_key {
+            Some(key) => (key.to_owned(), KeySource::Env),
+            None => match file.private_key.clone() {
+                Some(key) => (key, KeySource::File),
+                None => {
+                    return Err(StartupError::auth(
+                        "no identity: set BUZZ_PRIVATE_KEY, pass --private-key, or set private_key in the config file",
+                    ));
+                }
+            },
+        },
+    };
+    let keys = Keys::parse(&key_text).map_err(|_| {
+        StartupError::auth("invalid private key: expected 64 hex characters or nsec1...")
+    })?;
 
-    let relay_src = flag_relay
-        .map(str::to_owned)
-        .or_else(|| env_relay.map(str::to_owned))
-        .or_else(|| file.relay_url.clone())
-        .unwrap_or_else(|| "http://localhost:3000".to_owned());
-    let (http_url, _ws_url) = split_relay_url(&relay_src)?;
+    let (relay_text, relay_source) = match flag_relay {
+        Some(relay) => (relay.to_owned(), RelaySource::Flag),
+        None => match env_relay {
+            Some(relay) => (relay.to_owned(), RelaySource::Env),
+            None => match file.relay_url.clone() {
+                Some(relay) => (relay, RelaySource::File),
+                None => ("http://localhost:3000".to_owned(), RelaySource::Default),
+            },
+        },
+    };
+    let (http_url, _ws_url) = split_relay_url(&relay_text)?;
 
     let auth_tag = flag_auth_tag
         .map(str::to_owned)
@@ -161,6 +222,10 @@ pub fn resolve_from(
         keys,
         http_url,
         auth_tag,
+        sources: Sources {
+            key: key_source,
+            relay: relay_source,
+        },
     })
 }
 
@@ -259,10 +324,10 @@ pub fn init_at(
     Ok(path.to_path_buf())
 }
 
-/// Write the config file for `buzzx login`. Unlike `init_at` this replaces an
-/// existing file, so the write is atomic: the new file is created 0600 next to
-/// the target and renamed over it. A failure at any step leaves the previous
-/// file untouched.
+/// Write the config file for `buzzx login`. Unlike `init_at` this replaces
+/// an existing file, so the write is atomic: the new file is created 0600
+/// next to the target and renamed over it. A failure at any step leaves the
+/// previous file untouched.
 pub fn replace_at(
     path: &Path,
     relay: &str,
@@ -272,8 +337,24 @@ pub fn replace_at(
     let (http_url, _) = split_relay_url(relay)?;
     Keys::parse(private_key)
         .map_err(|e| StartupError::auth(format!("invalid private key: {e}")))?;
-    ensure_parent(path)?;
+    write_atomic(path, &render_body(&http_url, private_key, auth_tag))
+}
 
+/// Write the config file for `buzzx logout`: the private key and auth tag
+/// are gone, the relay preference survives exactly as the user wrote it.
+/// The same atomic-write contract as `replace_at` holds.
+pub fn clear_login_at(path: &Path, relay_url: Option<&str>) -> Result<PathBuf, StartupError> {
+    let body = match relay_url {
+        Some(relay) => format!("relay_url = {relay:?}\n"),
+        None => String::new(),
+    };
+    write_atomic(path, &body)
+}
+
+/// Create the replacement 0600 beside the target and rename it over. A
+/// failure at any step leaves the previous file untouched.
+fn write_atomic(path: &Path, body: &str) -> Result<PathBuf, StartupError> {
+    ensure_parent(path)?;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let write = || -> Result<(), StartupError> {
         let mut file = fs::OpenOptions::new()
@@ -283,7 +364,7 @@ pub fn replace_at(
             .mode(0o600)
             .open(&tmp)
             .map_err(|e| StartupError::other(format!("cannot write {}: {e}", tmp.display())))?;
-        file.write_all(render_body(&http_url, private_key, auth_tag).as_bytes())
+        file.write_all(body.as_bytes())
             .map_err(|e| StartupError::other(format!("cannot write {}: {e}", tmp.display())))?;
         file.sync_all()
             .map_err(|e| StartupError::other(format!("cannot write {}: {e}", tmp.display())))?;
@@ -408,6 +489,71 @@ mod tests {
             init_at(&path, "http://other", &key, None).is_err(),
             "second init must not clobber"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sources_report_where_identity_and_relay_won_from() {
+        let file = ConfigFile {
+            private_key: Some(fixed_key()),
+            relay_url: Some("http://file".into()),
+            auth_tag: None,
+        };
+        let r = resolve_from(
+            Some(&fixed_key()),
+            None,
+            None,
+            None,
+            Some("http://env"),
+            None,
+            file,
+        )
+        .unwrap();
+        assert_eq!(r.sources.key, KeySource::Flag);
+        assert_eq!(r.sources.relay, RelaySource::Env);
+
+        let r = resolve_from(
+            None,
+            None,
+            None,
+            Some(&fixed_key()),
+            None,
+            None,
+            ConfigFile::default(),
+        )
+        .unwrap();
+        assert_eq!(r.sources.relay, RelaySource::Default);
+        assert_eq!(RelaySource::Default.label(), "default");
+        assert_eq!(KeySource::File.label(), "file");
+    }
+
+    #[test]
+    fn clear_login_removes_credentials_and_keeps_the_relay() {
+        let dir = std::env::temp_dir().join(format!("buzzx-logout-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        init_at(&path, "https://relay.example", &fixed_key(), None).expect("init writes");
+
+        clear_login_at(&path, Some("https://relay.example")).expect("clear writes");
+
+        let after = read_config_file(&path).unwrap();
+        assert_eq!(after.private_key, None);
+        assert_eq!(after.auth_tag, None);
+        assert_eq!(after.relay_url.as_deref(), Some("https://relay.example"));
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "config stays user-only");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_login_without_a_relay_writes_an_empty_file() {
+        let dir = std::env::temp_dir().join(format!("buzzx-logout-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        init_at(&path, "https://relay.example", &fixed_key(), None).expect("init writes");
+
+        clear_login_at(&path, None).expect("clear writes");
+
+        let after = read_config_file(&path).unwrap();
+        assert_eq!(after.relay_url, None);
         let _ = fs::remove_dir_all(&dir);
     }
 }
