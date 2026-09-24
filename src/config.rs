@@ -3,10 +3,12 @@
 //! config file, and nothing is ever prompted for.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use nostr::Keys;
+use nostr::nips::nip19::ToBech32;
 use serde::Deserialize;
 
 /// Exit code for a bad input, before any network call.
@@ -26,21 +28,21 @@ pub struct StartupError {
 }
 
 impl StartupError {
-    fn usage(message: impl Into<String>) -> Self {
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
         Self {
             code: EXIT_USAGE,
             message: message.into(),
         }
     }
 
-    fn auth(message: impl Into<String>) -> Self {
+    pub(crate) fn auth(message: impl Into<String>) -> Self {
         Self {
             code: EXIT_AUTH,
             message: message.into(),
         }
     }
 
-    fn other(message: impl Into<String>) -> Self {
+    pub(crate) fn other(message: impl Into<String>) -> Self {
         Self {
             code: EXIT_OTHER,
             message: message.into(),
@@ -90,16 +92,14 @@ pub fn split_relay_url(raw: &str) -> Result<(String, String), StartupError> {
     Ok((http, ws))
 }
 
-fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     if let Ok(custom) = std::env::var("BUZZX_CONFIG") {
         return PathBuf::from(custom);
     }
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("buzzx").join("config.toml")
 }
-
-/// Refuse a config file that other users can read. It holds a private key.
-fn read_config_file(path: &Path) -> Result<ConfigFile, StartupError> {
+pub(crate) fn read_config_file(path: &Path) -> Result<ConfigFile, StartupError> {
     let meta = fs::metadata(path)
         .map_err(|e| StartupError::usage(format!("cannot read config {}: {e}", path.display())))?;
     if meta.permissions().mode() & 0o077 != 0 {
@@ -197,6 +197,43 @@ pub fn init(
     init_at(&config_path(), relay, private_key, auth_tag)
 }
 
+fn render_body(http_url: &str, private_key: &str, auth_tag: Option<&str>) -> String {
+    let mut body = format!("relay_url = {http_url:?}\nprivate_key = {private_key:?}\n");
+    if let Some(tag) = auth_tag {
+        body.push_str(&format!("auth_tag = {tag:?}\n"));
+    }
+    body
+}
+
+fn ensure_parent(path: &Path) -> Result<(), StartupError> {
+    if let Some(parent) = path.parent() {
+        // Only a directory buzzx just created is chmodded; an existing
+        // ~/.config belongs to the user, not to this tool.
+        let created = !parent.exists();
+        fs::create_dir_all(parent)
+            .map_err(|e| StartupError::other(format!("cannot create {}: {e}", parent.display())))?;
+        if created {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                StartupError::other(format!("cannot chmod {}: {e}", parent.display()))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// The npub with the middle elided: enough to recognize an identity, not
+/// enough to copy one. Error and status messages show only this form.
+pub fn npub_short(keys: &Keys) -> String {
+    let npub = keys.public_key().to_bech32().unwrap_or_default();
+    let chars: Vec<char> = npub.chars().collect();
+    if chars.len() < 13 {
+        return npub;
+    }
+    let head: String = chars[..8].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}...{tail}")
+}
+
 /// Write a config file with tight permissions. Refuses to clobber.
 pub fn init_at(
     path: &Path,
@@ -214,27 +251,55 @@ pub fn init_at(
     Keys::parse(private_key)
         .map_err(|e| StartupError::auth(format!("invalid private key: {e}")))?;
 
-    let mut body = format!("relay_url = {http_url:?}\nprivate_key = {private_key:?}\n");
-    if let Some(tag) = auth_tag {
-        body.push_str(&format!("auth_tag = {tag:?}\n"));
-    }
-
-    if let Some(parent) = path.parent() {
-        // Only a directory buzzx just created is chmodded; an existing
-        // ~/.config belongs to the user, not to this tool.
-        let created = !parent.exists();
-        fs::create_dir_all(parent)
-            .map_err(|e| StartupError::other(format!("cannot create {}: {e}", parent.display())))?;
-        if created {
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
-                StartupError::other(format!("cannot chmod {}: {e}", parent.display()))
-            })?;
-        }
-    }
-    fs::write(path, body)
+    ensure_parent(path)?;
+    fs::write(path, render_body(&http_url, private_key, auth_tag))
         .map_err(|e| StartupError::other(format!("cannot write {}: {e}", path.display())))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|e| StartupError::other(format!("cannot chmod {}: {e}", path.display())))?;
+    Ok(path.to_path_buf())
+}
+
+/// Write the config file for `buzzx login`. Unlike `init_at` this replaces an
+/// existing file, so the write is atomic: the new file is created 0600 next to
+/// the target and renamed over it. A failure at any step leaves the previous
+/// file untouched.
+pub fn replace_at(
+    path: &Path,
+    relay: &str,
+    private_key: &str,
+    auth_tag: Option<&str>,
+) -> Result<PathBuf, StartupError> {
+    let (http_url, _) = split_relay_url(relay)?;
+    Keys::parse(private_key)
+        .map_err(|e| StartupError::auth(format!("invalid private key: {e}")))?;
+    ensure_parent(path)?;
+
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let write = || -> Result<(), StartupError> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| StartupError::other(format!("cannot write {}: {e}", tmp.display())))?;
+        file.write_all(render_body(&http_url, private_key, auth_tag).as_bytes())
+            .map_err(|e| StartupError::other(format!("cannot write {}: {e}", tmp.display())))?;
+        file.sync_all()
+            .map_err(|e| StartupError::other(format!("cannot write {}: {e}", tmp.display())))?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(StartupError::other(format!(
+            "cannot replace {}: {e}",
+            path.display()
+        )));
+    }
     Ok(path.to_path_buf())
 }
 

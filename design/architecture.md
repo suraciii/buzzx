@@ -9,8 +9,9 @@ way dependencies point. [relay-transport.md](relay-transport.md) and
 ```text diagram
  main.rs            terminal setup, event loop, teardown
    |
- app.rs             state machine: channels, rows, composer, key handling
+   +-----> login.rs      key input, wizard, relay verification, config write
    |
+   app.rs             state machine: channels, rows, composer, key handling
    +-----> ui.rs          ratatui widgets (render only)
    |
    +-----> keys.rs        KeyEvent -> Action (pure)
@@ -49,6 +50,7 @@ parts that cannot be unit tested, and both are thin.
 | `ui.rs` | Layout and drawing | Mutate `app.rs` state or call the network |
 | `keys.rs` | `KeyEvent` to `Action` | Read terminal state |
 | `content.rs` | `Event` to `Row`, thread refs, reaction merging | Fetch or send |
+| `login.rs` | The login flow: key input from flag, file, stdin, environment, or wizard; one-shot relay verification; the atomic config write | Hold session state, render the TUI, or stay in the process after the config is written |
 | `session.rs` | The two channels between UI and transport, and command dispatch | Render or decide UI state |
 | `http.rs` | NIP-98 signing, request building, response parsing | Hold UI state |
 | `sub.rs` | The WebSocket connection, REQ lifecycle, frame decoding | Decide what a row means |

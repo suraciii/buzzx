@@ -6,11 +6,13 @@ mod config;
 mod content;
 mod http;
 mod keys;
+mod login;
 mod session;
 mod sub;
 mod ui;
 
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
@@ -52,6 +54,17 @@ enum Command {
         /// Channel UUID to watch.
         channel: String,
     },
+    /// Log in: verify an identity against the relay and save it as the
+    /// config file. Interactive when no key source is given.
+    Login {
+        /// Read the key from this file. The file must be readable by the
+        /// current user alone (0600).
+        #[arg(long)]
+        private_key_file: Option<PathBuf>,
+        /// Read the key from stdin. Hidden when stdin is a terminal.
+        #[arg(long)]
+        private_key_stdin: bool,
+    },
     /// Write the identity and relay to the config file.
     Init {
         /// Relay base URL.
@@ -73,6 +86,16 @@ fn main() {
 
     let cli = Cli::parse();
     let code: i32 = match cli.command {
+        Command::Login {
+            private_key_file,
+            private_key_stdin,
+        } => login::run(login::LoginCli {
+            flag_key: cli.private_key.clone(),
+            flag_relay: cli.relay.clone(),
+            flag_auth_tag: cli.auth_tag.clone(),
+            key_file: private_key_file,
+            key_stdin: private_key_stdin,
+        }),
         Command::Init {
             relay,
             private_key,

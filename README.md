@@ -4,8 +4,9 @@
 channel chat - read, send, reply, react, edit, delete - from a terminal, over
 the relay they already belong to.
 
+- [`buzzx login`](docs/configuration.md#login) verifies an identity against
+  the relay and saves it as the config file.
 - [`buzzx tui`](docs/tui-use.md) starts the terminal chat session.
-- `buzzx watch` streams live channel events as JSON.
 
 Buzz ships a Tauri desktop app, a Flutter mobile app, and the `buzz` CLI. The
 desktop and mobile apps need a graphical session. The `buzz` CLI is a
@@ -63,10 +64,10 @@ inventing a new contract.
 ## Status
 
 The first phase is implemented: a Rust workspace with the modules in
-[design/architecture.md](design/architecture.md), the subcommands `tui`,
-`watch`, and `init`, unit tests for the pure layers and the state machine,
-and a live-loop acceptance that sends, replies, reacts, edits, and deletes
-against a real relay. See [core.md](core.md) for the boundaries,
+[design/architecture.md](design/architecture.md), the subcommands `login`,
+`tui`, `watch`, and `init`, unit tests for the pure layers and the state
+machine, and a live-loop acceptance that sends, replies, reacts, edits, and
+deletes against a real relay. See [core.md](core.md) for the boundaries,
 [docs/buzz-revisions.md](docs/buzz-revisions.md) for the pinned Buzz
 revision, and [eng/context-management.md](eng/context-management.md) for the
 document rules.

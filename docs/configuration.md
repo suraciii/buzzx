@@ -89,6 +89,56 @@ that the keys already define.
 `buzzx init --relay <url> --private-key <nsec>` writes the file, creates the
 directory with mode 0700, and sets the file to 0600.
 
+## Login
+
+`buzzx login` is the interactive way to produce the config file. It takes a
+key, verifies the identity against the relay the way a session will use it -
+one NIP-42 WebSocket connection - and only then writes the file. A relay
+that cannot be reached is code 2; a relay that refuses the identity is
+code 3; an invalid key, a key file with loose permissions, or empty stdin
+is code 3 before any network call.
+
+The key comes from one of five places, in this order:
+
+1. `--private-key <nsec|hex>`, the same flag the other subcommands use.
+   `buzzx` warns that a key on the command line stays in shell history and
+   process listings.
+2. `--private-key-file <path>`. The file must exist, be a regular file, and
+   be readable by the current user alone (0600). Anything looser is
+   refused.
+3. `--private-key-stdin`. On a terminal the input is hidden and the paste
+   buffer is drained afterwards; on a pipe the first non-empty line is the
+   key. This flag cannot be combined with the other two.
+4. The `BUZZ_PRIVATE_KEY` environment variable.
+5. An interactive wizard, when stdin is a terminal. The wizard offers the
+   key entry, the key file, and the scan entry; the scan entry answers that
+   scan login is not available yet, because no mobile remote-signing
+   protocol is confirmed, and it does not improvise one. See
+   [decision 0004](../design/decisions/0004-login-without-qr.md).
+
+Without a terminal and without any key source, `buzzx login` exits with
+code 1 and names the sources it accepts.
+
+The relay written by login follows the same precedence the session uses:
+`--relay`, then `BUZZ_RELAY_URL`, then the existing file, then the default.
+The wizard prompts for it with that default.
+
+An existing config file is never replaced silently. Login shows the current
+identity and relay next to the new ones and asks before overwriting; an
+empty answer keeps the current login. Without a terminal there is no way to
+answer, so login refuses with code 1 and leaves the file untouched. The
+replacement itself is atomic: the new file is written 0600 beside the old
+one and renamed over it, so a failed write cannot destroy the previous
+login.
+
+A login that inherits an `auth_tag` from the environment or the existing
+file verifies it against the new identity and refuses with code 3 when it
+does not verify, the same fail-fast contract `resolve` applies.
+
+No output of a successful or failed login contains the key: not stdout,
+not stderr, not an error message. Identity in messages is the npub short
+form, the first 8 and last 4 characters.
+
 ## Environment reference
 
 `buzzx` reads these variables and no others. Config that changes behavior

@@ -6,8 +6,8 @@ works with it.
 - [tui-use.md](tui-use.md) is the TUI manual: the keys, the modes, and the
   states a user sees.
 - [configuration.md](configuration.md) is the configuration reference:
-  identity, relay, the auth tag, the config file, environment variables, and
-  exit codes.
+  identity, relay, the auth tag, the config file, login, environment
+  variables, and exit codes.
 - [buzz-revisions.md](buzz-revisions.md) records the pinned Buzz crate
   revision and what it provides.
 
