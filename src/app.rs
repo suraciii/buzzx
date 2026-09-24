@@ -216,6 +216,9 @@ pub struct App {
     pub focus: usize,
     pub mode: Mode,
     pub help: bool,
+    /// The channel picker's cursor while it is open. Compact layouts open it
+    /// with `c`; the picker is the only channel list they show.
+    pub picker: Option<usize>,
     pub conn: ConnState,
     pub status: String,
     pub composer: Composer,
@@ -240,6 +243,7 @@ impl App {
             focus: 0,
             mode: Mode::Navigation,
             help: false,
+            picker: None,
             conn: ConnState::Connecting,
             status: "connecting".to_owned(),
             composer: Composer::new(),
@@ -365,6 +369,7 @@ impl App {
                     self.selected = self.channels.len().saturating_sub(1);
                 }
                 self.set_focus(self.focus);
+                self.clamp_picker();
                 self.status = format!("channel closed: {reason}");
                 if let Some(entry) = self.channels.get(self.selected) {
                     let id = entry.id;
@@ -405,6 +410,7 @@ impl App {
             self.selected = self.channels.len().saturating_sub(1);
             self.set_focus(self.focus);
         }
+        self.clamp_picker();
     }
 
     fn load_history(&mut self, channel: Uuid, events: Vec<nostr::Event>, now: u64) {
@@ -582,10 +588,36 @@ impl App {
             Action::Quit => {
                 self.quit = true;
             }
-            Action::ToggleHelp => self.help = !self.help,
+            Action::ToggleHelp => {
+                self.help = !self.help;
+                if self.help {
+                    // The help draws over the picker, so it replaces it.
+                    self.picker = None;
+                }
+            }
+            Action::Dismiss => {
+                if self.help {
+                    self.help = false;
+                } else {
+                    self.picker = None;
+                }
+            }
             Action::NextChannel => self.switch_channel(self.selected.saturating_add(1)),
             Action::PrevChannel => self.switch_channel(self.selected.saturating_sub(1)),
-            Action::Channel(n) => self.switch_channel(n.saturating_sub(1)),
+            Action::NextRow => self.set_focus(self.focus.saturating_add(1)),
+            Action::PrevRow => self.set_focus(self.focus.saturating_sub(1)),
+            Action::Channel(n) => {
+                self.picker = None;
+                self.switch_channel(n.saturating_sub(1));
+            }
+            Action::TogglePicker => self.toggle_picker(),
+            Action::PickerNext => self.move_picker(1),
+            Action::PickerPrev => self.move_picker(-1),
+            Action::PickerConfirm => {
+                if let Some(index) = self.picker.take() {
+                    self.switch_channel(index);
+                }
+            }
             Action::Top => self.set_focus(0),
             Action::Bottom => self.set_focus(usize::MAX),
             Action::PageUp => {
@@ -664,6 +696,35 @@ impl App {
         self.status = format!("opened #{}", self.channels[index].name);
         self.channels[index].loading = true;
         self.outbox.push(SessionCommand::OpenChannel(id));
+    }
+
+    /// `c`: the picker opens on the selected channel, and closes when it is
+    /// already open. An empty channel list has nothing to pick.
+    fn toggle_picker(&mut self) {
+        self.picker = match self.picker {
+            Some(_) => None,
+            None if !self.channels.is_empty() => {
+                // Only one overlay is on screen at a time.
+                self.help = false;
+                Some(self.selected)
+            }
+            None => None,
+        };
+    }
+
+    fn move_picker(&mut self, step: isize) {
+        let last = self.channels.len().saturating_sub(1);
+        if let Some(index) = self.picker {
+            self.picker = Some(index.saturating_add_signed(step).min(last));
+        }
+    }
+
+    /// The membership can change under the picker; its cursor never points
+    /// past the list.
+    fn clamp_picker(&mut self) {
+        if let Some(index) = self.picker {
+            self.picker = Some(index.min(self.channels.len().saturating_sub(1)));
+        }
     }
 
     fn react_focused(&mut self) {
@@ -1575,6 +1636,69 @@ mod tests {
         assert_eq!(app.selected, 2);
         app.handle(Action::Channel(9), 0);
         assert_eq!(app.selected, 2, "out-of-range digits do nothing");
+    }
+
+    #[test]
+    fn the_picker_opens_on_the_selection_and_confirm_switches_the_channel() {
+        let mut app = app();
+        let ids: Vec<Uuid> = (1..=3).map(|n| channel(n).id).collect();
+        app.channels = vec![channel(1), channel(2), channel(3)];
+        app.selected = 1;
+        app.handle(Action::TogglePicker, 0);
+        assert_eq!(app.picker, Some(1), "the picker opens on the selection");
+        app.handle(Action::PickerNext, 0);
+        app.handle(Action::PickerNext, 0);
+        app.handle(Action::PickerNext, 0);
+        assert_eq!(app.picker, Some(2), "the cursor clamps at the last channel");
+        app.handle(Action::PickerConfirm, 0);
+        assert_eq!(app.picker, None, "confirming closes the picker");
+        assert_eq!(app.channels[app.selected].id, ids[2]);
+        assert!(
+            matches!(
+                outbox_drained(&mut app)[..],
+                [SessionCommand::OpenChannel(_)]
+            ),
+            "confirming opens the picked channel"
+        );
+    }
+
+    #[test]
+    fn the_overlays_replace_each_other_and_escape_closes_whichever_is_open() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.handle(Action::ToggleHelp, 0);
+        assert!(app.help);
+        // Opening the picker puts the help away: they never share the screen.
+        app.handle(Action::TogglePicker, 0);
+        assert_eq!(app.picker, Some(0));
+        assert!(!app.help);
+        app.handle(Action::Dismiss, 0);
+        assert_eq!(app.picker, None);
+        app.handle(Action::ToggleHelp, 0);
+        app.handle(Action::Dismiss, 0);
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn a_picker_without_channels_stays_closed() {
+        let mut app = app();
+        app.handle(Action::TogglePicker, 0);
+        assert_eq!(app.picker, None);
+    }
+
+    #[test]
+    fn a_channel_list_that_shrinks_pulls_the_picker_cursor_back() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2), channel(3)];
+        app.picker = Some(2);
+        app.apply(
+            ChatEvent::ChannelGone {
+                channel: channel(3).id,
+                reason: "restricted".into(),
+            },
+            0,
+        );
+        assert_eq!(app.picker, Some(1));
     }
 
     #[test]

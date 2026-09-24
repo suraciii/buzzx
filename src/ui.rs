@@ -1,17 +1,15 @@
 //! Rendering only. `ui.rs` reads `App` state and draws; it never mutates it
-//! and never touches the network.
+//! and never touches the network. The layout mode follows the frame size, and
+//! one-column modes reuse the same state as the wide one.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{App, ConnState, Mode};
-
-/// The smallest terminal the interface is designed for.
-pub const MIN_WIDTH: u16 = 80;
-pub const MIN_HEIGHT: u16 = 12;
+use crate::layout::{self, LayoutMode};
 
 fn no_color() -> bool {
     static NO_COLOR: std::sync::LazyLock<bool> =
@@ -47,6 +45,14 @@ fn highlight_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
+fn conn_word(state: ConnState) -> &'static str {
+    match state {
+        ConnState::Connecting => "connecting",
+        ConnState::Connected => "connected",
+        ConnState::Reconnecting => "reconnecting",
+    }
+}
+
 /// Seconds to a short human age, coarse on purpose.
 fn age(created_at: u64, now: u64) -> String {
     let secs = now.saturating_sub(created_at);
@@ -62,13 +68,21 @@ fn age(created_at: u64, now: u64) -> String {
 }
 
 /// The lines one row renders as: the header, the wrapped body, attachments,
-/// and reactions.
-fn row_lines(row: &crate::content::Row, now: u64, width: u16) -> Vec<Line<'static>> {
-    let mut header = vec![
-        Span::styled(row.author.clone(), author_style()),
-        Span::raw(" "),
-        Span::raw(age(row.created_at, now)),
-    ];
+/// and reactions. One-column modes ask for the compact markers, so a row
+/// spends its width on the message instead of on words like `(reply)`.
+fn row_lines(row: &crate::content::Row, now: u64, width: u16, compact: bool) -> Vec<Line<'static>> {
+    let (reply, broadcast, edited) = if compact {
+        (" <", " @c", " (ed)")
+    } else {
+        (" (reply)", " @channel", " (edited)")
+    };
+    let mut header: Vec<Span<'static>> = Vec::new();
+    if row.mentions_me {
+        header.push(Span::styled("*".to_owned(), mention_style()));
+    }
+    header.push(Span::styled(row.author.clone(), author_style()));
+    header.push(Span::raw(" "));
+    header.push(Span::raw(age(row.created_at, now)));
     if row.pending {
         header.push(Span::styled(" ...".to_owned(), pending_style()));
     }
@@ -76,24 +90,18 @@ fn row_lines(row: &crate::content::Row, now: u64, width: u16) -> Vec<Line<'stati
         header.push(Span::styled(" ?".to_owned(), mention_style()));
     }
     if row.parent_id.is_some() {
-        header.push(Span::raw(" (reply)"));
+        header.push(Span::raw(reply));
     }
     if row.broadcast {
-        header.push(Span::raw(" @channel"));
+        header.push(Span::raw(broadcast));
     }
     if row.mentions_me {
         header.push(Span::styled(" @you".to_owned(), mention_style()));
     }
     if row.edited {
-        header.push(Span::raw(" (edited)"));
+        header.push(Span::raw(edited));
     }
     let mut lines = vec![Line::from(header)];
-    if row.mentions_me {
-        lines[0] = Line::from(vec![
-            Span::styled("*".to_owned(), mention_style()),
-            lines[0].spans.remove(0),
-        ]);
-    }
 
     let body_style = if row.pending || row.uncertain {
         pending_style()
@@ -115,12 +123,10 @@ fn row_lines(row: &crate::content::Row, now: u64, width: u16) -> Vec<Line<'stati
         let counters: Vec<String> = row
             .reactions
             .iter()
-            .map(|(emoji, count)| {
-                if *count > 1 {
-                    format!("{emoji} x{count}")
-                } else {
-                    emoji.clone()
-                }
+            .map(|(emoji, count)| match (*count, compact) {
+                (1, _) => emoji.clone(),
+                (n, true) => format!("{emoji}{n}"),
+                (n, false) => format!("{emoji} x{n}"),
             })
             .collect();
         lines.push(Line::styled(counters.join(" "), pending_style()));
@@ -162,33 +168,109 @@ fn wrap(line: &str, width: u16) -> Vec<String> {
     out
 }
 
+/// The visible slice of one composer line around the cursor, so a narrow
+/// composer keeps the insertion point on screen. The draft itself is
+/// unchanged; this is a view of it.
+fn cursor_window(line: &str, cursor: usize, width: usize) -> String {
+    let width = width.max(1);
+    let cursor = cursor.min(line.len());
+    let skipped = line[..cursor].chars().count();
+    let start = skipped.saturating_sub(width.saturating_sub(1));
+    line.chars().skip(start).take(width).collect()
+}
+
 /// Draw the whole interface for one frame.
 pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     let area = frame.area();
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        let notice = format!(
-            "buzzx needs at least {} columns by {} rows; this terminal is {} by {}",
-            MIN_WIDTH, MIN_HEIGHT, area.width, area.height
-        );
-        let block = Block::default().borders(Borders::ALL);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        frame.render_widget(Paragraph::new(notice), inner);
-        return;
+    let mode = layout::mode(area.width, area.height);
+    match mode {
+        LayoutMode::TooSmall => draw_size_message(frame, area),
+        LayoutMode::Wide => draw_wide(frame, app, now, area),
+        LayoutMode::Narrow => draw_narrow(frame, app, now, area),
+        LayoutMode::Minimal => draw_minimal(frame, app, now, area),
     }
-
-    let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-    let main = Layout::horizontal([Constraint::Length(22), Constraint::Min(40)]).split(outer[0]);
-
-    draw_channels(frame, app, main[0]);
-    draw_timeline(frame, app, main[1], now);
-    draw_status(frame, app, outer[1]);
+    if app.picker.is_some() {
+        draw_picker(frame, app, area);
+    }
     if app.help {
-        draw_help(frame, area);
+        draw_help(frame, area, mode);
     }
 }
 
-fn draw_channels(frame: &mut Frame, app: &App, area: Rect) {
+/// Channels, timeline, and composer side by side. This is the desktop shape,
+/// and its key behavior is the one docs/tui-use.md documents first.
+fn draw_wide(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let main = Layout::horizontal([Constraint::Length(22), Constraint::Min(40)]).split(outer[0]);
+
+    draw_channel_list(frame, app, main[0]);
+    let column = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .split(main[1]);
+    draw_header(frame, app, column[0], false);
+    draw_timeline(frame, app, column[1], now, false);
+    draw_composer(frame, app, column[2], false);
+    draw_status(frame, app, outer[1], true);
+}
+
+/// One column: header, timeline, composer, status hint. The channel list is
+/// behind `c`.
+fn draw_narrow(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let column = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    draw_header(frame, app, column[0], true);
+    draw_timeline(frame, app, column[1], now, false);
+    draw_composer(frame, app, column[2], true);
+    draw_status(frame, app, column[3], false);
+}
+
+/// One column with compact rows. The composer takes a single line, and only
+/// while it is being used.
+fn draw_minimal(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let composer_rows = u16::from(app.mode == Mode::Composer);
+    let column = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(composer_rows),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    draw_header(frame, app, column[0], true);
+    draw_timeline(frame, app, column[1], now, true);
+    if composer_rows == 1 {
+        draw_composer_line(frame, app, column[2]);
+    }
+    draw_status(frame, app, column[3], false);
+}
+
+/// The channel and its loading state; the compact modes add the connection
+/// state here, because their status line carries the relay's answer.
+fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
+    let entry = app.channels.get(app.selected);
+    let name = entry.map(|c| c.name.as_str()).unwrap_or("no channel");
+    let loading = entry.map(|c| c.loading).unwrap_or(false);
+    let channel = if loading {
+        format!("#{name} loading")
+    } else {
+        format!("#{name}")
+    };
+    let text = if with_conn {
+        format!("{channel} · {}", conn_word(app.conn))
+    } else {
+        channel
+    };
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+fn draw_channel_list(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .channels
         .iter()
@@ -209,68 +291,117 @@ fn draw_channels(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64) {
-    let header_height = 1u16;
-    let composer_height = 3u16;
-    let column = Layout::vertical([
-        Constraint::Length(header_height),
-        Constraint::Min(1),
-        Constraint::Length(composer_height),
-    ])
-    .split(area);
-
-    let selected_name = app
-        .channels
-        .get(app.selected)
-        .map(|c| c.name.as_str())
-        .unwrap_or("no channel");
-    let header_text = if app
-        .channels
-        .get(app.selected)
-        .map(|e| e.loading)
-        .unwrap_or(false)
-    {
-        format!("#{selected_name} loading")
-    } else {
-        format!("#{selected_name}")
-    };
-    frame.render_widget(Paragraph::new(header_text), column[0]);
-
-    let body_width = column[1].width.saturating_sub(2);
-    let items: Vec<ListItem> = app
+/// The timeline, drawn as a line window instead of a widget list. A widget
+/// list drops any item taller than its area, and in a chat one long message
+/// is exactly that; this keeps the focused row's own lines on screen.
+fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, compact: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let body_width = area.width.saturating_sub(2);
+    let rows = app
         .channels
         .get(app.selected)
         .map(|e| e.rows.as_slice())
-        .unwrap_or(&[])
-        .iter()
-        .map(|row| ListItem::new(row_lines(row, now, body_width)))
-        .collect();
-    let has_rows = !items.is_empty();
-    let list = List::new(items)
-        .highlight_style(highlight_style())
-        .highlight_symbol("> ");
-    let mut state = ListState::default();
-    if has_rows {
-        state.select(Some(app.focus));
+        .unwrap_or(&[]);
+    if rows.is_empty() {
+        return;
     }
-    frame.render_stateful_widget(list, column[1], &mut state);
 
-    draw_composer(frame, app, column[2]);
+    // Flatten the rows, and remember where each row starts, so the window can
+    // be placed in lines rather than in whole rows.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len() + 1);
+    for row in rows {
+        starts.push(lines.len());
+        lines.extend(row_lines(row, now, body_width, compact));
+    }
+    starts.push(lines.len());
+
+    let focus = app.focus.min(rows.len() - 1);
+    let viewport = area.height as usize;
+    let height = starts[focus + 1] - starts[focus];
+    let offset = if height > viewport {
+        // Taller than the view: show the row from its head, where its author
+        // and age are.
+        starts[focus]
+    } else {
+        // Otherwise show its last line and fill upward.
+        starts[focus + 1].saturating_sub(viewport)
+    };
+
+    let focused = highlight_style();
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(offset)
+        .take(viewport)
+        .enumerate()
+        .map(|(index, line)| {
+            let at = offset + index;
+            let row = match starts.binary_search(&at) {
+                Ok(index) => index,
+                Err(index) => index.saturating_sub(1),
+            };
+            let symbol = if row == focus && at == starts[focus] {
+                "> "
+            } else {
+                "  "
+            };
+            let mut spans = vec![Span::raw(symbol)];
+            spans.extend(line.spans);
+            let line = Line::from(spans);
+            if row == focus {
+                line.style(focused)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
-fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
-    let hint = if app.composer.edit.is_some() {
-        "editing your message - enter to save, esc to cancel".to_owned()
+fn composer_hint(app: &App, compact: bool) -> String {
+    if app.composer.edit.is_some() {
+        if compact {
+            "edit · enter save · esc cancel".to_owned()
+        } else {
+            "editing your message - enter to save, esc to cancel".to_owned()
+        }
     } else if let Some(reply) = &app.composer.reply {
-        format!("reply to {} - enter to send, esc to clear", reply.author)
+        if compact {
+            format!("reply {} · enter send", reply.author)
+        } else {
+            format!("reply to {} - enter to send, esc to clear", reply.author)
+        }
     } else if app.mode == Mode::Composer {
-        "new message - enter to send, alt+enter newline".to_owned()
+        if compact {
+            "new message · enter send".to_owned()
+        } else {
+            "new message - enter to send, alt+enter newline".to_owned()
+        }
+    } else if compact {
+        "i compose · enter reply".to_owned()
     } else {
         "i compose - enter reply".to_owned()
-    };
+    }
+}
+
+fn draw_composer(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
+    let hint = composer_hint(app, compact);
     let block = Block::default().borders(Borders::ALL).title(hint);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if compact {
+        // The narrow composer box has one inner row: follow the cursor
+        // instead of scrolling whole lines off the top.
+        let (line, col) = app.composer.cursor;
+        let text = app.composer.lines.get(line).cloned().unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(cursor_window(&text, col, inner.width as usize)),
+            inner,
+        );
+        return;
+    }
     let visible = inner.height as usize;
     let lines: Vec<Line> = app
         .composer
@@ -287,44 +418,129 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let conn = match app.conn {
-        ConnState::Connecting => "connecting",
-        ConnState::Connected => "connected",
-        ConnState::Reconnecting => "reconnecting",
+/// The minimal composer: one line, with the target it is aimed at.
+fn draw_composer_line(frame: &mut Frame, app: &App, area: Rect) {
+    let prompt = if app.composer.edit.is_some() {
+        "e> "
+    } else if app.composer.reply.is_some() {
+        "r> "
+    } else {
+        "> "
     };
-    let mode = match app.mode {
-        Mode::Navigation => "nav",
-        Mode::Composer => "composer",
-    };
-    let status = format!(
-        "status: {conn} {} | {} | mode: {mode} | ?=help",
-        app.relay_label, app.status
+    let (line, col) = app.composer.cursor;
+    let text = app.composer.lines.get(line).cloned().unwrap_or_default();
+    let width = area.width.saturating_sub(prompt.len() as u16) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("{prompt}{}", cursor_window(&text, col, width))),
+        area,
     );
+}
+
+fn draw_status(frame: &mut Frame, app: &App, area: Rect, wide: bool) {
+    let status = if wide {
+        let mode = match app.mode {
+            Mode::Navigation => "nav",
+            Mode::Composer => "composer",
+        };
+        format!(
+            "status: {} {} | {} | mode: {mode} | ?=help",
+            conn_word(app.conn),
+            app.relay_label,
+            app.status
+        )
+    } else {
+        let mode = match app.mode {
+            Mode::Navigation => "nav",
+            Mode::Composer => "compose",
+        };
+        format!("{mode} · {}", app.status)
+    };
     frame.render_widget(Paragraph::new(status), area);
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let text = "\
+fn draw_size_message(frame: &mut Frame, area: Rect) {
+    let text = vec![
+        Line::raw(format!(
+            "needs {} cols x {} rows",
+            layout::MIN_WIDTH,
+            layout::MIN_HEIGHT
+        )),
+        Line::raw(format!("now {} cols x {} rows", area.width, area.height)),
+        Line::raw("resize, or q to quit"),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
+}
+
+fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| ListItem::new(Line::raw(format!("{} {}", index + 1, channel.name))))
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("channels")
+        .title_bottom(Line::raw("enter select · esc close"));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style())
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(app.picker);
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The key help. The wide layout has the room for the detailed text; the
+/// one-column layouts get the terse one, sized to what they can show.
+fn help_text(mode: LayoutMode) -> &'static str {
+    match mode {
+        LayoutMode::Wide => WIDE_HELP,
+        _ => COMPACT_HELP,
+    }
+}
+
+const WIDE_HELP: &str = "\
 navigation
-  j k up down   switch channel     1-9 jump
-  g G PgUp PgDn move the focused row
-  i Tab         compose new         Enter  reply to focused row
-  r             react (press again to remove)
-  e             edit your focused row
-  d             delete your focused row
-  ?             toggle this help    q quit
+  j k up down    switch channel    1-9 jump
+  c              channel picker    Esc close
+  g G PgUp PgDn  move the focused row
+  i Tab          compose new       Enter  reply
+  r e d          react / edit / delete
+  ?              help              q quit
 composer
-  Enter send    Alt+Enter newline   Esc clear target, then leave";
-    let width = 56u16;
-    let height = 14u16;
-    let left = area.width.saturating_sub(width) / 2;
-    let top = area.height.saturating_sub(height) / 2;
+  Enter send     Alt+Enter newline
+  Esc leaves the composer, keeps the text";
+
+const COMPACT_HELP: &str = "\
+i compose  Enter send
+j k move row  c picker
+Enter reply  r react
+e edit  d delete
+1-9 jump  g G start/end
+PgUp/PgDn move ten rows
+? help  q quit
+Esc close  Alt+Enter nl";
+
+fn draw_help(frame: &mut Frame, area: Rect, mode: LayoutMode) {
+    let text = help_text(mode);
+    frame.render_widget(Clear, area);
+    if mode != LayoutMode::Wide {
+        // No border: at the smallest sizes every row carries a key.
+        frame.render_widget(Paragraph::new(text), area);
+        return;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let content = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let width = (content + 2).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
     let popup = Rect {
-        x: left,
-        y: top,
-        width: width.min(area.width),
-        height: height.min(area.height),
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
     };
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -355,5 +571,159 @@ mod tests {
         assert_eq!(wrap("abc def", 10), vec!["abc def"]);
         assert_eq!(wrap("aaa bbb ccc", 7), vec!["aaa bbb", "ccc"]);
         assert_eq!(wrap("", 10), vec![""]);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_row_breaks_without_overflowing() {
+        let url = "https://example.test/a/very/long/path/that/keeps/going";
+        for chunk in wrap(url, 22) {
+            assert!(chunk.chars().count() <= 22, "{chunk:?} is wider than 22");
+        }
+        assert_eq!(wrap(url, 22).concat(), url, "only the wrapping changed");
+    }
+
+    #[test]
+    fn the_composer_window_keeps_the_cursor_on_screen() {
+        assert_eq!(cursor_window("hello", 5, 10), "hello");
+        // The cursor sits past the right edge: the window slides with it and
+        // gives the last column to the cursor itself.
+        assert_eq!(cursor_window("abcdefghij", 10, 4), "hij");
+        assert_eq!(cursor_window("abcdefghij", 5, 4), "cdef");
+        // A multi-byte draft keeps its characters intact.
+        assert_eq!(cursor_window("aé日x", 7, 3), "日x");
+    }
+
+    fn chat_app(rows: Vec<crate::content::Row>) -> App {
+        let mut app = App::new(&nostr::Keys::generate(), "http://relay.test");
+        app.conn = ConnState::Connected;
+        app.status = "connected".to_owned();
+        app.channels.push(crate::app::ChannelEntry {
+            id: uuid::Uuid::new_v4(),
+            name: "general".to_owned(),
+            rows,
+            seen: Default::default(),
+            loading: false,
+        });
+        app
+    }
+
+    fn message_row(n: usize, body: &str) -> crate::content::Row {
+        crate::content::Row {
+            event_id: format!("{n:064x}"),
+            pubkey: "p".into(),
+            author: "alice".into(),
+            created_at: 100,
+            body: body.to_owned(),
+            kind: 9,
+            root_id: None,
+            parent_id: None,
+            broadcast: false,
+            mentions_me: false,
+            reactions: Vec::new(),
+            attachment: None,
+            pending: false,
+            uncertain: false,
+            edited: false,
+        }
+    }
+
+    fn frame_text(app: &App, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, app, 130))
+            .expect("test frame");
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn a_row_taller_than_the_timeline_still_shows_its_head() {
+        // A widget list drops an item taller than its area; the timeline
+        // window must not, or one long message blanks the screen.
+        let body = "the migration is on main so the schema is already applied everywhere";
+        let app = chat_app(vec![message_row(0, body)]);
+        let text = frame_text(&app, 24, 6);
+        assert!(text.contains("> alice"), "focus marker on the author line");
+        assert!(
+            text.contains("the migration"),
+            "the head of the body:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_window_follows_the_focused_row() {
+        let rows = (0..12)
+            .map(|n| message_row(n, &format!("message {n} body")))
+            .collect();
+        let mut app = chat_app(rows);
+        app.focus = 0;
+        let oldest = frame_text(&app, 40, 10);
+        assert!(oldest.contains("message 0 body"), "focused row visible");
+        assert!(!oldest.contains("message 11"), "rows below stay out");
+        app.focus = 11;
+        let newest = frame_text(&app, 40, 10);
+        assert!(newest.contains("message 11 body"));
+        assert!(!newest.contains("message 0 body"));
+    }
+
+    #[test]
+    fn a_row_that_mentions_me_keeps_its_age_and_markers() {
+        let mut row = message_row(0, "hi");
+        row.mentions_me = true;
+        row.parent_id = Some("root".into());
+        let header = row_lines(&row, 110, 40, true)[0].to_string();
+        assert!(header.starts_with("*alice 10s"), "{header}");
+        assert!(header.contains(" <"), "{header}");
+        assert!(header.contains("@you"), "{header}");
+    }
+
+    #[test]
+    fn compact_rows_shorten_the_markers_they_add() {
+        let mut row = crate::content::Row {
+            event_id: "e".into(),
+            pubkey: "p".into(),
+            author: "alice".into(),
+            created_at: 0,
+            body: "hi".into(),
+            kind: 9,
+            root_id: Some("root".into()),
+            parent_id: Some("root".into()),
+            broadcast: true,
+            mentions_me: false,
+            reactions: vec![("+".into(), 2)],
+            attachment: None,
+            pending: false,
+            uncertain: false,
+            edited: true,
+        };
+        let render = |row: &crate::content::Row, compact| -> Vec<String> {
+            row_lines(row, 0, 40, compact)
+                .iter()
+                .map(|line| line.to_string())
+                .collect()
+        };
+        let wide = render(&row, false);
+        let compact = render(&row, true);
+        assert!(wide[0].contains("(reply)") && wide[0].contains("@channel"));
+        assert!(!compact[0].contains("(reply)") && !compact[0].contains("@channel"));
+        assert!(compact[0].contains('@') || compact[0].contains('<'));
+        assert_eq!(wide.last().unwrap(), "+ x2");
+        assert_eq!(compact.last().unwrap(), "+2");
+        row.parent_id = None;
+        row.broadcast = false;
+        row.edited = false;
+        row.reactions.clear();
+        let plain = render(&row, true);
+        assert_eq!(plain.len(), 2, "a plain row is the header and the body");
+        assert!(plain[0].starts_with("alice 0s"), "author and age stay");
     }
 }

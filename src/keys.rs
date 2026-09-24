@@ -1,8 +1,11 @@
 //! `KeyEvent` to `Action`, pure. The key set is the contract in
-//! docs/tui-use.md. Navigation mode handles the timeline and channels;
-//! composer mode handles text input.
+//! docs/tui-use.md and docs/tui.md. Navigation mode handles the timeline and
+//! channels; composer mode handles text input. The layout decides whether
+//! `j` and `k` move the channel list or the timeline.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::layout::LayoutMode;
 
 /// How many rows one PgUp or PgDn moves.
 pub const PAGE_ROWS: usize = 10;
@@ -11,8 +14,19 @@ pub const PAGE_ROWS: usize = 10;
 pub enum Action {
     NextChannel,
     PrevChannel,
+    /// The next or previous timeline row. One-column layouts move the
+    /// timeline with `j` and `k`, because it is the list they show.
+    NextRow,
+    PrevRow,
     /// Jump to the channel with this 1-based index.
     Channel(usize),
+    /// `c`: open the channel picker, or close it when it is open.
+    TogglePicker,
+    PickerNext,
+    PickerPrev,
+    PickerConfirm,
+    /// Esc: close the topmost overlay. The composer keeps its own escape.
+    Dismiss,
     /// `g` or Home: focus the oldest loaded row.
     Top,
     /// `G` or End: focus the newest row.
@@ -47,27 +61,56 @@ pub enum Action {
     Ignored,
 }
 
-/// Map a key press to an action in navigation mode.
-pub fn map_navigation(key: KeyEvent) -> Action {
+/// Map a key press to an action in navigation mode. `layout` selects the
+/// list that `j` and `k` move; `picker` routes keys to the open channel
+/// picker, which isolates the rest of the navigation keys.
+pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
             _ => Action::Ignored,
         };
     }
+    if layout == LayoutMode::TooSmall {
+        // The interface is a size message; only leaving it makes sense.
+        return match key.code {
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
+    if picker {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::PickerNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::PickerPrev,
+            KeyCode::Enter => Action::PickerConfirm,
+            KeyCode::Esc | KeyCode::Char('c') => Action::Dismiss,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Char(d @ '1'..='9') => Action::Channel(d as usize - '0' as usize),
+            _ => Action::Ignored,
+        };
+    }
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down => Action::NextChannel,
-        KeyCode::Char('k') | KeyCode::Up => Action::PrevChannel,
+        KeyCode::Char('j') | KeyCode::Down => match layout {
+            LayoutMode::Wide => Action::NextChannel,
+            _ => Action::NextRow,
+        },
+        KeyCode::Char('k') | KeyCode::Up => match layout {
+            LayoutMode::Wide => Action::PrevChannel,
+            _ => Action::PrevRow,
+        },
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('i') | KeyCode::Tab => Action::ComposeNew,
         KeyCode::Enter => Action::ComposeReply,
+        KeyCode::Char('c') => Action::TogglePicker,
         KeyCode::Char('r') => Action::React,
         KeyCode::Char('e') => Action::EditRow,
         KeyCode::Char('d') => Action::DeleteRow,
         KeyCode::Char('?') => Action::ToggleHelp,
+        KeyCode::Esc => Action::Dismiss,
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Char(d @ '1'..='9') => Action::Channel(d as usize - '0' as usize),
         _ => Action::Ignored,
@@ -114,78 +157,101 @@ mod tests {
         }
     }
 
+    fn wide(code: KeyCode) -> Action {
+        map_navigation(key(code, KeyModifiers::NONE), LayoutMode::Wide, false)
+    }
+
+    fn narrow(code: KeyCode) -> Action {
+        map_navigation(key(code, KeyModifiers::NONE), LayoutMode::Narrow, false)
+    }
+
     #[test]
     fn navigation_moves_channels_with_j_k_and_digits() {
+        assert_eq!(wide(KeyCode::Char('j')), Action::NextChannel);
+        assert_eq!(wide(KeyCode::Down), Action::NextChannel);
+        assert_eq!(wide(KeyCode::Char('k')), Action::PrevChannel);
+        assert_eq!(wide(KeyCode::Up), Action::PrevChannel);
+        assert_eq!(wide(KeyCode::Char('3')), Action::Channel(3));
+    }
+
+    #[test]
+    fn a_one_column_layout_moves_rows_with_j_k_and_opens_the_picker_with_c() {
+        assert_eq!(narrow(KeyCode::Char('j')), Action::NextRow);
+        assert_eq!(narrow(KeyCode::Down), Action::NextRow);
+        assert_eq!(narrow(KeyCode::Char('k')), Action::PrevRow);
+        assert_eq!(narrow(KeyCode::Up), Action::PrevRow);
+        assert_eq!(narrow(KeyCode::Char('c')), Action::TogglePicker);
+        // The digits still jump straight to a channel.
+        assert_eq!(narrow(KeyCode::Char('3')), Action::Channel(3));
+    }
+
+    #[test]
+    fn an_open_picker_takes_the_selection_keys_and_isolates_the_rest() {
+        let picker =
+            |code: KeyCode| map_navigation(key(code, KeyModifiers::NONE), LayoutMode::Narrow, true);
+        assert_eq!(picker(KeyCode::Char('j')), Action::PickerNext);
+        assert_eq!(picker(KeyCode::Up), Action::PickerPrev);
+        assert_eq!(picker(KeyCode::Enter), Action::PickerConfirm);
+        assert_eq!(picker(KeyCode::Esc), Action::Dismiss);
+        assert_eq!(picker(KeyCode::Char('c')), Action::Dismiss);
+        assert_eq!(picker(KeyCode::Char('q')), Action::Quit);
+        // Composing, reacting, and editing do not fire while picking.
+        assert_eq!(picker(KeyCode::Char('i')), Action::Ignored);
+        assert_eq!(picker(KeyCode::Char('r')), Action::Ignored);
+        assert_eq!(picker(KeyCode::Char('e')), Action::Ignored);
+        assert_eq!(picker(KeyCode::Char('g')), Action::Ignored);
+    }
+
+    #[test]
+    fn a_too_small_terminal_only_answers_q_and_ctrl_c() {
+        let small = |code: KeyCode, modifiers| {
+            map_navigation(key(code, modifiers), LayoutMode::TooSmall, false)
+        };
+        assert_eq!(small(KeyCode::Char('q'), KeyModifiers::NONE), Action::Quit);
         assert_eq!(
-            map_navigation(key(KeyCode::Char('j'), KeyModifiers::NONE)),
-            Action::NextChannel
+            small(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Action::Quit
         );
         assert_eq!(
-            map_navigation(key(KeyCode::Down, KeyModifiers::NONE)),
-            Action::NextChannel
+            small(KeyCode::Char('i'), KeyModifiers::NONE),
+            Action::Ignored
         );
         assert_eq!(
-            map_navigation(key(KeyCode::Char('k'), KeyModifiers::NONE)),
-            Action::PrevChannel
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::Up, KeyModifiers::NONE)),
-            Action::PrevChannel
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::Char('3'), KeyModifiers::NONE)),
-            Action::Channel(3)
+            small(KeyCode::Char('c'), KeyModifiers::NONE),
+            Action::Ignored
         );
     }
 
     #[test]
     fn navigation_scrolls_and_targets_rows() {
+        assert_eq!(wide(KeyCode::Char('g')), Action::Top);
+        assert_eq!(wide(KeyCode::Home), Action::Top);
         assert_eq!(
-            map_navigation(key(KeyCode::Char('g'), KeyModifiers::NONE)),
-            Action::Top
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::Home, KeyModifiers::NONE)),
-            Action::Top
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            map_navigation(
+                key(KeyCode::Char('G'), KeyModifiers::SHIFT),
+                LayoutMode::Wide,
+                false
+            ),
             Action::Bottom
         );
-        assert_eq!(
-            map_navigation(key(KeyCode::End, KeyModifiers::NONE)),
-            Action::Bottom
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::PageUp, KeyModifiers::NONE)),
-            Action::PageUp
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::PageDown, KeyModifiers::NONE)),
-            Action::PageDown
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::Char('r'), KeyModifiers::NONE)),
-            Action::React
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::Char('e'), KeyModifiers::NONE)),
-            Action::EditRow
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::Char('d'), KeyModifiers::NONE)),
-            Action::DeleteRow
-        );
-        assert_eq!(
-            map_navigation(key(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::ComposeReply
-        );
+        assert_eq!(wide(KeyCode::End), Action::Bottom);
+        assert_eq!(wide(KeyCode::PageUp), Action::PageUp);
+        assert_eq!(wide(KeyCode::PageDown), Action::PageDown);
+        assert_eq!(wide(KeyCode::Char('r')), Action::React);
+        assert_eq!(wide(KeyCode::Char('e')), Action::EditRow);
+        assert_eq!(wide(KeyCode::Char('d')), Action::DeleteRow);
+        assert_eq!(wide(KeyCode::Enter), Action::ComposeReply);
+        assert_eq!(wide(KeyCode::Esc), Action::Dismiss);
     }
 
     #[test]
     fn ctrl_c_quits_from_either_mode() {
         assert_eq!(
-            map_navigation(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            map_navigation(
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                false
+            ),
             Action::Quit
         );
         assert_eq!(

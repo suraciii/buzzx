@@ -14,6 +14,19 @@ The relay defaults to `http://localhost:3000`. See
 
 ## Layout
 
+The client picks its layout from the terminal's size and never infers a device
+type. The session is the same state in every layout: the selected channel, the
+focused row, the draft, and the reply target survive a resize.
+
+| Terminal | Layout | What it shows |
+| --- | --- | --- |
+| 80 by 12 or larger | Wide | The three regions below. |
+| 40 to 79 columns, 10 rows or larger | Narrow | One column: the timeline. `c` opens the channel list over the screen, and the composer keeps a box at the bottom. |
+| 24 to 39 columns, 6 rows or larger | Minimal | One column with compact rows and a one-line composer while composing. |
+| Smaller than 24 columns or 6 rows | Too small | A size message. Resize the terminal and the session continues. |
+
+### Wide
+
 ```text diagram
 +-----------+---------------------------------------------+
 | channels  | #general                                     |
@@ -26,14 +39,33 @@ The relay defaults to `http://localhost:3000`. See
 |           | +2 reactions                                |
 |           |                                             |
 |           +---------------------------------------------+
-|           | reply to bob - tab to edit, enter to send   |
+|           | reply to bob - enter to send, esc to clear  |
 +-----------+---------------------------------------------+
- status: connected https://relay.example            Tab=edit  ?=help
+ status: connected https://relay.example | sent | mode: nav | ?=help
 ```
 
-Three regions. The channel list on the left shows the identity's channels, the
-active one highlighted. The timeline on the right shows the selected channel's
-messages. The composer at the bottom is the text input.
+The channel list on the left shows the identity's channels, the active one
+highlighted. The timeline on the right shows the selected channel's messages.
+The composer at the bottom is the text input.
+
+### Narrow and minimal
+
+One column: the timeline, with the channel and the connection state on the top
+line and the composer and a status hint at the bottom. The channel list is an
+overlay, because a single column has no room for a permanent sidebar. `c`
+opens it full screen, `j` and `k` move, `Enter` opens the channel, and `Esc`
+closes it. In minimal the rows carry compact markers, and the composer is one
+line while it is being used, so the timeline keeps as many rows as the
+terminal has.
+
+A message body wraps to the column's width. Long words and URLs break at
+character boundaries; the message itself is unchanged.
+
+### Too small
+
+Below 24 columns or 6 rows the client shows the size it needs and the size it
+has, and keeps running. Resizing the terminal brings the layout back with the
+selection, the draft, and the reply target intact.
 
 The session always exposes one focused row in the timeline. Scrolling moves the
 focus with the viewport and keeps the focused row visible. Actions that target a
@@ -52,30 +84,31 @@ Keys have two modes. The timeline starts in navigation mode.
 
 In navigation mode:
 
-- `j` or the down arrow selects the next channel.
-- `k` or the up arrow selects the previous channel.
-- `1` through `9` jump to the channel with that number.
-- `g` or `Home` scrolls to the oldest loaded message.
-- `G` or `End` scrolls to the newest message.
-- `PgUp` and `PgDn` scroll ten messages.
+- `j` or the down arrow moves to the next item. In the wide layout that is the
+  next channel, whose list is on screen; in the one-column layouts it is the
+  next row of the timeline.
+- `k` or the up arrow moves to the previous item, the same way.
+- `1` through `9` jump to the channel with that number, in every layout.
+- `c` opens the channel picker. `Enter` opens the highlighted channel and
+  `Esc` closes the picker.
+- `g` or `Home` focuses the oldest loaded message.
+- `G` or `End` focuses the newest message.
+- `PgUp` and `PgDn` move ten rows.
 - `i` or `Tab` opens the composer for a new message.
 - `Enter` opens the composer with the focused row as the reply target. The
-  reply target is shown in the composer header and can be cleared with `Esc`
-  before sending.
-- `r` reacts with the default thumbs-up emoji to the focused row.
+  reply target is shown in the composer and can be cleared with `Esc` before
+  sending.
+- `r` reacts with the default thumbs-up emoji to the focused row. Pressing it
+  again on your own reaction removes it.
 - `e` edits the identity's own focused row.
 - `d` deletes the identity's own focused row.
-- `?` toggles the key help.
+- `?` toggles the key help, and `Esc` closes it.
 - `q` quits.
 
-In composer mode:
-
-- `Esc` leaves the composer and keeps the typed text.
-- `Enter` sends.
-- `Alt+Enter` inserts a newline.
-- The up and down arrows move the cursor between lines.
-- The left and right arrows, `Home`, and `End` move the cursor within a line.
-- `Backspace` deletes back.
+In composer mode every printable character, `j`, `k`, `c`, `i`, `r`, and `?`
+included, is typed into the draft. The composer reserves `Enter` (send),
+`Alt+Enter` (newline), the cursor keys, `Home`, `End`, `Backspace`, and `Esc`
+(clear the reply or edit target, then leave the composer with the draft kept).
 
 The composer has no external editor integration in the first phase. A long
 message is typed in an editor and sent with
@@ -121,8 +154,9 @@ the last write, and the mode. The connection state is one of `connecting`,
 ## Terminal requirements
 
 The TUI needs a terminal that reports a size and supports the alternate
-screen. It needs at least 80 columns and 12 rows. Below that it shows a
-message asking for a larger window instead of a broken layout.
+screen. It runs at 24 columns by 6 rows and larger, in the layout the size
+allows. Below that it shows the required size instead of a broken layout, and
+it switches to a layout as soon as the terminal grows.
 
 Raw mode is entered at start and restored at exit, including on error. A
 terminal that is left in raw mode after a crash is a bug.

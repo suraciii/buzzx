@@ -7,6 +7,7 @@ mod config;
 mod content;
 mod http;
 mod keys;
+mod layout;
 mod login;
 mod session;
 mod sub;
@@ -265,10 +266,12 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
                 let _ = session.commands.send(command).await;
             }
 
-            // 2. Draw.
-            terminal
+            // 2. Draw, then read back the frame size: the keys map against
+            //    the layout the user is looking at, resize included.
+            let frame = terminal
                 .draw(|frame| ui::draw(frame, &app, now_secs()))
                 .map_err(|e| e.to_string())?;
+            let layout = layout::mode(frame.area.width, frame.area.height);
 
             // 3. Poll for a key with the tick timeout, then apply it. The
             //    blocking poll only delays this frame; the session tasks run
@@ -283,7 +286,9 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             };
             if let Some(key) = key {
                 let action = match app.mode {
-                    app::Mode::Navigation => keys::map_navigation(key),
+                    app::Mode::Navigation => {
+                        keys::map_navigation(key, layout, app.picker.is_some())
+                    }
                     app::Mode::Composer => keys::map_composer(key),
                 };
                 app.handle(action, now_secs());

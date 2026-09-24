@@ -14,6 +14,8 @@ way dependencies point. [relay-transport.md](relay-transport.md) and
    app.rs             state machine: channels, rows, composer, key handling
    +-----> ui.rs          ratatui widgets (render only)
    |
+   +-----> layout.rs      terminal size -> layout mode (pure)
+   |
    +-----> keys.rs        KeyEvent -> Action (pure)
    |
    +-----> content.rs     Event -> Row (pure)
@@ -49,6 +51,7 @@ parts that cannot be unit tested, and both are thin.
 | `app.rs` | Channel list, per-channel rows, composer, selection, scroll offset, quit | Sign, send, parse frames, or draw |
 | `ui.rs` | Layout and drawing | Mutate `app.rs` state or call the network |
 | `keys.rs` | `KeyEvent` to `Action` | Read terminal state |
+| `layout.rs` | The layout mode a terminal size selects | Hold state, draw, or read `App` |
 | `content.rs` | `Event` to `Row`, thread refs, reaction merging | Fetch or send |
 | `login.rs` | The login flow: key input from flag, file, stdin, environment, or wizard; one-shot relay verification; the atomic config write | Hold session state, render the TUI, or stay in the process after the config is written |
 | `session.rs` | The two channels between UI and transport, and command dispatch | Render or decide UI state |

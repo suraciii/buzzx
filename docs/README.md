@@ -3,6 +3,8 @@
 Product documentation. It states what the product must satisfy and how a user
 works with it.
 
+- [tui.md](tui.md) is the TUI capability: its layout modes, its unified keys,
+  and the criteria it must satisfy.
 - [tui-use.md](tui-use.md) is the TUI manual: the keys, the modes, and the
   states a user sees.
 - [configuration.md](configuration.md) is the configuration reference:
