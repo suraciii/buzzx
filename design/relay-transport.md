@@ -130,7 +130,10 @@ Lifecycle:
 3. The TUI sends new events into the channel's rows and stops treating the
    channel as loading.
 4. On reconnect, REQ is sent again from scratch. Reconnects are full
-   resubscribes, not resumes.
+   resubscribes, not resumes: a subscription id belongs to the socket that
+   opened it, so the client forgets every id when the socket ends and rebuilds
+   the whole set on the new one. A guard that remembers an id across
+   connections would skip the REQ it is there to send.
 
 Auxiliary events — reactions (kind 7), edits (40003), deletions (5, 9005) —
 are fetched by reference, not by channel:
