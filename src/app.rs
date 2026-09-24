@@ -197,6 +197,13 @@ enum PendingOp {
         row_id: String,
         emoji: String,
     },
+    /// Removing the identity's own reaction. Its WriteOk must not re-record
+    /// the reaction as active.
+    ReactRemove {
+        row_id: String,
+        emoji: String,
+        reaction_id: String,
+    },
 }
 
 pub struct App {
@@ -435,8 +442,10 @@ impl App {
     fn apply_timeline(&mut self, channel: Uuid, event: nostr::Event, _now: u64) {
         let id = event.id.to_hex();
         let me = self.me.clone();
+        let profiles = self.profiles.clone();
+        let author = author_name(&profiles, &me, &event.pubkey.to_hex());
         let known_author =
-            self.profiles.contains_key(&event.pubkey.to_hex()) || event.pubkey.to_hex() == me;
+            profiles.contains_key(&event.pubkey.to_hex()) || event.pubkey.to_hex() == me;
         let selected = self.selected_entry().map(|e| e.id) == Some(channel);
         let was_at_bottom = selected && self.at_bottom();
         let Some(entry) = self.entry_mut(&channel) else {
@@ -446,7 +455,8 @@ impl App {
             return;
         }
         entry.seen.insert(id);
-        let row = content::row_from_event(&event, &me);
+        let mut row = content::row_from_event(&event, &me);
+        row.author = author;
         entry.rows.push(row);
         if was_at_bottom {
             self.focus = entry.rows.len() - 1;
@@ -460,6 +470,29 @@ impl App {
     fn apply_overlay(&mut self, event: nostr::Event) {
         let id = event.id.to_hex();
         if !self.seen_aux.insert(id.clone()) {
+            return;
+        }
+        // A kind 5 aimed at a known reaction event id removes that reaction
+        // before the generic overlay path sees it as a row deletion.
+        if event.kind.as_u16() == 5
+            && let Some(target) = event.tags.iter().find_map(|t| {
+                let parts = t.as_slice();
+                (parts.first().map(String::as_str) == Some("e"))
+                    .then(|| parts.get(1).cloned())
+                    .flatten()
+            })
+            && let Some((row_id, emoji)) = self.reaction_of.get(&target).cloned()
+        {
+            self.apply_to_row(&row_id, |row| {
+                content::apply_overlay(
+                    row,
+                    &content::Overlay::Reaction {
+                        emoji: format!("-{emoji}"),
+                    },
+                );
+            });
+            self.reaction_of.remove(&target);
+            self.my_reaction.remove(&(row_id, emoji));
             return;
         }
         let reaction_of = self.reaction_of.clone();
@@ -500,6 +533,14 @@ impl App {
             content::Overlay::Delete => {
                 self.remove_row(&target);
             }
+        }
+    }
+
+    /// Drop the bookkeeping for one reaction so a later toggle cannot remove
+    /// an already-removed reaction twice.
+    fn purge_reaction(&mut self, reaction_id: &str) {
+        if let Some((row_id, emoji)) = self.reaction_of.remove(reaction_id) {
+            self.my_reaction.remove(&(row_id, emoji));
         }
     }
 
@@ -561,7 +602,11 @@ impl App {
                 let target = self
                     .focused_row()
                     .map(|row| (row.event_id.clone(), row.author.clone(), row.pending));
-                if target.as_ref().map(|(_, _, pending)| *pending) == Some(true) {
+                if target
+                    .as_ref()
+                    .map(|(id, _, pending)| *pending || !is_event_id(id))
+                    == Some(true)
+                {
                     self.status = "the focused message is still sending".to_owned();
                     return;
                 }
@@ -633,9 +678,10 @@ impl App {
             let local = format!("pending:{}", Uuid::new_v4());
             self.pending.insert(
                 local.clone(),
-                PendingOp::React {
+                PendingOp::ReactRemove {
                     row_id: row_id.clone(),
                     emoji: emoji.clone(),
+                    reaction_id: reaction_id.clone(),
                 },
             );
             content::apply_overlay(
@@ -687,7 +733,7 @@ impl App {
     fn edit_focused(&mut self) {
         let Some(row) = self.focused_row().filter(|row| row.pubkey == self.me) else {
             if let Some(row) = self.focused_row() {
-                self.status = if row.pending {
+                self.status = if row.pending || !is_event_id(&row.event_id) {
                     "the focused message is still sending".to_owned()
                 } else {
                     "only your own messages can be edited".to_owned()
@@ -714,8 +760,8 @@ impl App {
             .focused_row()
             .map(|row| (row.pubkey == self.me, row.event_id.clone(), row.pending));
         let Some((true, id, false)) = own else {
-            if let Some((_, _, pending)) = own {
-                self.status = if pending {
+            if let Some((_, id, pending)) = own {
+                self.status = if pending || !is_event_id(&id) {
                     "the focused message is still sending".to_owned()
                 } else {
                     "only your own messages can be deleted".to_owned()
@@ -863,6 +909,11 @@ impl App {
                 self.my_reaction.insert((row_id, emoji), event_id);
                 self.status = "reacted".to_owned();
             }
+            Some(PendingOp::ReactRemove { reaction_id, .. }) => {
+                self.seen_aux_insert(&event_id);
+                self.purge_reaction(&reaction_id);
+                self.status = "reaction removed".to_owned();
+            }
             None => {}
         }
         self.set_focus(self.focus);
@@ -916,6 +967,24 @@ impl App {
                 }
                 self.status = format!("reaction failed: {reason}");
             }
+            Some(PendingOp::ReactRemove {
+                row_id,
+                emoji,
+                reaction_id,
+            }) => {
+                // The removal was refused: the counter comes back, and so
+                // does the toggle entry.
+                if let Some(row) = self.row_mut(&row_id) {
+                    content::apply_overlay(
+                        row,
+                        &content::Overlay::Reaction {
+                            emoji: emoji.clone(),
+                        },
+                    );
+                }
+                self.my_reaction.insert((row_id, emoji), reaction_id);
+                self.status = format!("reaction removal failed: {reason}");
+            }
             None => {}
         }
     }
@@ -941,12 +1010,17 @@ impl App {
             Some(PendingOp::Delete { .. }) => {
                 self.status = format!("delete uncertain, not retried: {reason}");
             }
-            Some(PendingOp::React { .. }) => {
+            Some(PendingOp::React { .. }) | Some(PendingOp::ReactRemove { .. }) => {
                 self.status = format!("reaction uncertain, not retried: {reason}");
             }
             None => {}
         }
     }
+}
+
+/// A real event address: 64 hex characters, not a local pending marker.
+fn is_event_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Display name for an author: the profile name when known, `you` for the
@@ -1121,11 +1195,12 @@ mod tests {
         app.channels = vec![channel(1)];
         app.handle(Action::ComposeNew, 0);
         app.composer.set_text("hello");
+        let parent = format!("{:0<64}", "bb");
         app.composer.reply = Some(ReplyTarget {
-            event_id: "b".into(),
+            event_id: parent.clone(),
             author: "bob".into(),
         });
-        app.channels[0].rows = vec![row("b", 1, "bob")];
+        app.channels[0].rows = vec![row(&parent, 1, "bob")];
         app.focus = 0;
 
         app.handle(Action::ComposerSend, 100);
@@ -1140,11 +1215,11 @@ mod tests {
                 },
             ] => {
                 assert_eq!(content, "hello");
-                assert_eq!(thread.as_ref().unwrap(), &("b".to_owned(), "b".to_owned()));
+                assert_eq!(thread.as_ref().unwrap(), &(parent.clone(), parent.clone()));
                 assert!(local.starts_with("pending:"));
                 let pending = app.channels[0].rows.last().unwrap();
                 assert!(pending.pending);
-                assert_eq!(pending.parent_id.as_deref(), Some("b"));
+                assert_eq!(pending.parent_id.as_deref(), Some(parent.as_str()));
 
                 app.apply(
                     ChatEvent::WriteOk {
@@ -1221,29 +1296,28 @@ mod tests {
     fn a_reply_targets_a_nested_thread_with_root_and_parent() {
         let mut app = app();
         app.channels = vec![channel(1)];
+        let root = format!("{:0<64}", "11");
+        let child = format!("{:0<64}", "22");
         app.channels[0].rows = vec![
             Row {
-                event_id: "root1".into(),
+                event_id: root.clone(),
                 root_id: None,
-                ..row("root1", 1, "bob")
+                ..row(&root, 1, "bob")
             },
             Row {
-                event_id: "child".into(),
-                root_id: Some("root1".into()),
-                ..row("child", 2, "amy")
+                event_id: child.clone(),
+                root_id: Some(root.clone()),
+                ..row(&child, 2, "amy")
             },
         ];
         app.focus = 1;
         app.handle(Action::ComposeReply, 0);
-        assert_eq!(app.composer.reply.as_ref().unwrap().event_id, "child");
+        assert_eq!(app.composer.reply.as_ref().unwrap().event_id, child);
         app.composer.set_text("nested answer");
         app.handle(Action::ComposerSend, 0);
         match &outbox_drained(&mut app)[..] {
             [SessionCommand::Send { thread, .. }] => {
-                assert_eq!(
-                    thread.as_ref().unwrap(),
-                    &("root1".to_owned(), "child".to_owned())
-                );
+                assert_eq!(thread.as_ref().unwrap(), &(root, child));
             }
             other => panic!("expected one send, got {other:?}"),
         }
@@ -1252,8 +1326,9 @@ mod tests {
     #[test]
     fn escape_clears_the_reply_target_before_leaving_the_composer() {
         let mut app = app();
+        let target = format!("{:0<64}", "bb");
         app.channels = vec![channel(1)];
-        app.channels[0].rows = vec![row("b", 1, "bob")];
+        app.channels[0].rows = vec![row(&target, 1, "bob")];
         app.focus = 0;
         app.handle(Action::ComposeReply, 0);
         app.handle(Action::ComposerEscape, 0);
@@ -1270,8 +1345,9 @@ mod tests {
     #[test]
     fn edit_and_delete_refuse_rows_the_identity_did_not_write() {
         let mut app = app();
+        let other = format!("{:0<64}", "bb");
         app.channels = vec![channel(1)];
-        app.channels[0].rows = vec![row("b", 1, "someone-else")];
+        app.channels[0].rows = vec![row(&other, 1, "someone-else")];
         app.focus = 0;
         app.handle(Action::EditRow, 0);
         assert_eq!(app.mode, Mode::Navigation);
@@ -1285,7 +1361,7 @@ mod tests {
         let mut app = app();
         let me = app.me.clone();
         app.channels = vec![channel(1)];
-        app.channels[0].rows = vec![row("m1", 1, &me)];
+        app.channels[0].rows = vec![row(&format!("{:0<64}", "e1"), 1, &me)];
         app.focus = 0;
         app.handle(Action::EditRow, 0);
         app.composer.set_text("corrected");
@@ -1302,7 +1378,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(target, "m1");
+        assert_eq!(target, &format!("{:0<64}", "e1"));
         assert_eq!(content, "corrected");
 
         app.apply(
@@ -1313,7 +1389,8 @@ mod tests {
             0,
         );
         assert_eq!(
-            app.channels[0].rows[0].body, "body m1",
+            app.channels[0].rows[0].body,
+            format!("body {:0<64}", "e1"),
             "the old body returns"
         );
     }
@@ -1323,7 +1400,8 @@ mod tests {
         let mut app = app();
         let me = app.me.clone();
         app.channels = vec![channel(1)];
-        app.channels[0].rows = vec![row("keep", 1, "p"), row("mine", 2, &me)];
+        let mine = format!("{:0<64}", "dd");
+        app.channels[0].rows = vec![row("keep", 1, "p"), row(&mine, 2, &me)];
         app.focus = 1;
         app.handle(Action::DeleteRow, 0);
         assert_eq!(app.channels[0].rows.len(), 1, "the row disappears at once");
@@ -1331,7 +1409,7 @@ mod tests {
         let SessionCommand::Delete { local, target, .. } = &commands[0] else {
             panic!()
         };
-        assert_eq!(target, "mine");
+        assert_eq!(target, &mine);
 
         app.apply(
             ChatEvent::WriteFailed {
@@ -1568,6 +1646,81 @@ mod tests {
         composer.left();
         composer.input('l');
         assert_eq!(composer.text(), "hello");
+    }
+
+    #[test]
+    fn a_reaction_removal_does_not_resurrect_itself_on_ok() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        let row_id = format!("{:0<64}", "a1");
+        app.channels[0].rows = vec![row(&row_id, 1, &app.me.clone())];
+        app.focus = 0;
+
+        app.handle(Action::React, 0);
+        let SessionCommand::React { local, .. } = &app.take_outbox()[0] else {
+            panic!()
+        };
+        app.apply(
+            ChatEvent::WriteOk {
+                local: local.clone(),
+                event_id: "b2".repeat(32),
+            },
+            0,
+        );
+
+        app.handle(Action::React, 0);
+        match &app.take_outbox()[0] {
+            SessionCommand::React {
+                local,
+                remove: Some(_),
+                ..
+            } => {
+                // The removal succeeding must not re-record the reaction as
+                // active: a third press adds again instead of removing twice.
+                app.apply(
+                    ChatEvent::WriteOk {
+                        local: local.clone(),
+                        event_id: "c3".repeat(32),
+                    },
+                    0,
+                );
+            }
+            other => panic!("expected a removal, got {other:?}"),
+        }
+        assert!(
+            !app.my_reaction
+                .contains_key(&(row_id.clone(), content::DEFAULT_REACTION.to_owned()))
+        );
+        app.handle(Action::React, 0);
+        match &app.take_outbox()[0] {
+            SessionCommand::React { remove: None, .. } => {}
+            other => panic!("a third press must add again, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_remote_removal_purges_the_toggle_entry() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        let row_id = format!("{:0<64}", "a1");
+        let reaction_id = format!("{:0<64}", "e9");
+        app.channels[0].rows = vec![row(&row_id, 1, "p")];
+        app.reaction_of.insert(
+            reaction_id.clone(),
+            (row_id.clone(), content::DEFAULT_REACTION.to_owned()),
+        );
+        app.my_reaction.insert(
+            (row_id.clone(), content::DEFAULT_REACTION.to_owned()),
+            reaction_id.clone(),
+        );
+
+        let removal = delete_event(&reaction_id);
+        app.apply(ChatEvent::Overlay(removal), 0);
+        assert!(!app.reaction_of.contains_key(&reaction_id));
+        assert!(
+            !app.my_reaction
+                .contains_key(&(row_id, content::DEFAULT_REACTION.to_owned()))
+        );
     }
 
     fn reaction_event(target: &str, emoji: &str, id: &str) -> nostr::Event {

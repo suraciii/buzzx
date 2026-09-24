@@ -82,6 +82,10 @@ pub async fn run_ws_pump(
     let mut state = PumpState::default();
     let mut first = true;
     let mut attempt: u32 = 0;
+    // Controls that arrive while the pump is backing off. They are applied
+    // right after the next connection; dropping one would silently lose a
+    // subscription for the rest of the session.
+    let mut queued: Vec<SubControl> = Vec::new();
     loop {
         let connected =
             NostrWsConnection::connect_authenticated(&ws_url, &keys, auth_tag.as_ref()).await;
@@ -96,6 +100,9 @@ pub async fn run_ws_pump(
                 attempt = 0;
                 let _ = events.send(ChatEvent::Connected).await;
                 state.resubscribe_all(&mut conn).await;
+                for control in queued.drain(..) {
+                    apply_control(&mut conn, &mut state, control).await;
+                }
                 match pump_connection(
                     &mut conn,
                     &mut state,
@@ -130,14 +137,17 @@ pub async fn run_ws_pump(
                     .await;
             }
         }
-        let delay = reconnect_delay(attempt);
+        // A control arriving mid-backoff must not shorten the backoff: the
+        // relay reconnect floor still applies. It is queued instead.
+        let deadline = tokio::time::Instant::now() + reconnect_delay(attempt);
         attempt += 1;
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            control = control.recv() => {
-                if control.is_none() {
-                    return;
-                }
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                control = control.recv() => match control {
+                    Some(control) => queued.push(control),
+                    None => return,
+                },
             }
         }
     }
@@ -246,7 +256,14 @@ async fn pump_connection(
     }
 }
 
-/// Apply every queued control message. A None channel means shutdown.
+async fn apply_control(conn: &mut NostrWsConnection, state: &mut PumpState, control: SubControl) {
+    match control {
+        SubControl::Timeline(channel) => state.subscribe_timeline(conn, channel).await,
+        SubControl::Aux { channel, ids } => state.subscribe_aux(conn, channel, ids).await,
+    }
+}
+
+/// Apply every queued control message. A closed channel means shutdown.
 async fn drain_control(
     conn: &mut NostrWsConnection,
     state: &mut PumpState,
@@ -254,8 +271,7 @@ async fn drain_control(
 ) -> Result<(), String> {
     loop {
         match control.try_recv() {
-            Ok(SubControl::Timeline(channel)) => state.subscribe_timeline(conn, channel).await,
-            Ok(SubControl::Aux { channel, ids }) => state.subscribe_aux(conn, channel, ids).await,
+            Ok(control) => apply_control(conn, state, control).await,
             Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
             Err(mpsc::error::TryRecvError::Disconnected) => return Err("shutting down".to_owned()),
         }

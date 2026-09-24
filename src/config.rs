@@ -220,10 +220,16 @@ pub fn init_at(
     }
 
     if let Some(parent) = path.parent() {
+        // Only a directory buzzx just created is chmodded; an existing
+        // ~/.config belongs to the user, not to this tool.
+        let created = !parent.exists();
         fs::create_dir_all(parent)
             .map_err(|e| StartupError::other(format!("cannot create {}: {e}", parent.display())))?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|e| StartupError::other(format!("cannot chmod {}: {e}", parent.display())))?;
+        if created {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                StartupError::other(format!("cannot chmod {}: {e}", parent.display()))
+            })?;
+        }
     }
     fs::write(path, body)
         .map_err(|e| StartupError::other(format!("cannot write {}: {e}", path.display())))?;
