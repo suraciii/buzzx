@@ -1,4 +1,4 @@
-# buzzx TUI Product Specification
+# buzzx TUI
 
 ## Problem
 
