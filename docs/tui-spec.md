@@ -1,4 +1,4 @@
-# Responsive TUI
+# buzzx TUI Product Specification
 
 ## Problem
 
@@ -8,7 +8,7 @@ console from using the chat client. The product needs to preserve the core
 conversation loop on narrow screens without squeezing the desktop layout into
 unreadable columns.
 
-This specification changes the presentation layout only. Channel membership,
+This specification defines the TUI capability, including its responsive presentation. It changes the presentation layout only. Channel membership,
 timeline rows, focus behavior, composer semantics, relay transport, and event
 contracts remain the same as described in [tui-use.md](tui-use.md) and
 [render-contract.md](../design/render-contract.md).
