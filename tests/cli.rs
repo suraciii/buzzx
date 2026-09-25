@@ -1035,6 +1035,38 @@ fn a_relay_failure_after_a_write_exits_by_its_category() {
 }
 
 #[test]
+fn a_relay_failure_after_a_reply_keeps_the_reply_ids() {
+    let relay = FakeRelay::start();
+    let keys = keys();
+    let root = message(&keys, "root", 100);
+    relay.seed(&root);
+    relay.answer(WriteAnswer::ServerError);
+    let (code, json, stderr) = run(
+        &relay.url,
+        &keys,
+        &[
+            "messages",
+            "reply",
+            "--event",
+            &root.id.to_hex(),
+            "--content",
+            "hi",
+        ],
+        None,
+    );
+    // The lookup succeeded, so the failure is the write's: the reply carries
+    // the channel it derived and the target it answers, and no event id,
+    // because storage is not established.
+    assert_eq!(code, 4, "stderr: {stderr}");
+    assert_eq!(json["status"], json!("sent_unconfirmed"));
+    assert_eq!(json["error"], json!("relay_rejected"));
+    assert_eq!(json["event_id"], Value::Null);
+    assert_eq!(json["channel_id"], json!(CHANNEL));
+    assert_eq!(json["reply_to"], json!(root.id.to_hex()));
+    assert_eq!(relay.writes().len(), 1, "a failed answer is not retried");
+}
+
+#[test]
 fn an_unreadable_relay_answer_is_not_an_empty_read() {
     let relay = FakeRelay::start();
     let keys = keys();
@@ -1053,66 +1085,88 @@ fn an_unreadable_relay_answer_is_not_an_empty_read() {
 
 #[test]
 fn a_startup_failure_prints_one_json_error() {
-    // No identity anywhere: a read answers with its error object, and a
-    // recognized write keeps the write shape, so a caller reads `status` on
-    // every path but the parser's.
-    for (args, channel, reply_to) in [
-        (vec!["channels", "list"], None, None),
-        (vec!["messages", "get", "--channel", CHANNEL], None, None),
+    // A failure raised before the command ran answers in the recognized
+    // command's shape: one error object for a read, and a write that was
+    // never sent for a write. The category and the exit code are the
+    // reason's, so a script sees the code the category table promises.
+    let valid_key = keys().secret_key().to_secret_hex();
+    let reasons = [
+        (None, "http://127.0.0.1:1", 3, "forbidden", "identity"),
         (
-            vec!["messages", "send", "--channel", CHANNEL, "--content", "hi"],
-            Some(CHANNEL),
-            None,
+            Some("not-a-key"),
+            "http://127.0.0.1:1",
+            3,
+            "forbidden",
+            "private key",
         ),
         (
-            vec![
-                "messages",
-                "reply",
-                "--event",
-                &"cd".repeat(32),
-                "--content",
-                "hi",
-            ],
-            None,
-            Some("cd".repeat(32)),
+            Some(valid_key.as_str()),
+            "not-a-url",
+            1,
+            "invalid_input",
+            "has no scheme",
         ),
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_buzzx"))
-            .args(&args)
-            .env("BUZZ_RELAY_URL", "http://127.0.0.1:1")
-            .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
-            .env_remove("BUZZ_PRIVATE_KEY")
-            .env_remove("BUZZ_AUTH_TAG")
-            .output()
-            .expect("the buzzx binary");
-        assert_eq!(
-            output.status.code(),
-            Some(3),
-            "{args:?}: an identity failure is 3"
-        );
-        let json: Value =
-            serde_json::from_slice(&output.stdout).expect("one JSON object on stdout");
-        assert_eq!(json["error"], json!("forbidden"), "{args:?}: {json}");
-        assert!(
-            json["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("identity")),
-            "{args:?}: {json}"
-        );
-        assert!(
-            !output.stderr.is_empty(),
-            "{args:?}: the reason is on stderr"
-        );
-        match (&channel, &reply_to) {
-            (None, None) => assert!(json.get("status").is_none(), "{args:?}: {json}"),
-            _ => {
-                assert_eq!(json["status"], json!("not_sent"), "{args:?}: {json}");
-                assert_eq!(json["event_id"], Value::Null, "{args:?}: {json}");
-                if let Some(channel) = channel {
-                    assert_eq!(json["channel_id"], json!(channel), "{args:?}: {json}");
-                }
-                if let Some(reply_to) = &reply_to {
-                    assert_eq!(json["reply_to"], json!(reply_to), "{args:?}: {json}");
+    ];
+    for (key, relay, code, category, reason) in reasons {
+        for (args, channel, reply_to) in [
+            (vec!["channels", "list"], None, None),
+            (vec!["messages", "get", "--channel", CHANNEL], None, None),
+            (
+                vec!["messages", "send", "--channel", CHANNEL, "--content", "hi"],
+                Some(CHANNEL),
+                None,
+            ),
+            (
+                vec![
+                    "messages",
+                    "reply",
+                    "--event",
+                    &"cd".repeat(32),
+                    "--content",
+                    "hi",
+                ],
+                None,
+                Some("cd".repeat(32)),
+            ),
+        ] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_buzzx"));
+            command
+                .args(&args)
+                .env("BUZZ_RELAY_URL", relay)
+                .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
+                .env_remove("BUZZ_AUTH_TAG");
+            match key {
+                Some(key) => command.env("BUZZ_PRIVATE_KEY", key),
+                None => command.env_remove("BUZZ_PRIVATE_KEY"),
+            };
+            let output = command.output().expect("the buzzx binary");
+            let how = format!("{args:?} {relay} key={key:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(code),
+                "{how}: the code the category carries"
+            );
+            let json: Value =
+                serde_json::from_slice(&output.stdout).expect("one JSON object on stdout");
+            assert_eq!(json["error"], json!(category), "{how}: {json}");
+            assert!(
+                json["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(reason)),
+                "{how}: {json}"
+            );
+            assert!(!output.stderr.is_empty(), "{how}: the reason is on stderr");
+            match (&channel, &reply_to) {
+                (None, None) => assert!(json.get("status").is_none(), "{how}: {json}"),
+                _ => {
+                    assert_eq!(json["status"], json!("not_sent"), "{how}: {json}");
+                    assert_eq!(json["event_id"], Value::Null, "{how}: {json}");
+                    if let Some(channel) = channel {
+                        assert_eq!(json["channel_id"], json!(channel), "{how}: {json}");
+                    }
+                    if let Some(reply_to) = &reply_to {
+                        assert_eq!(json["reply_to"], json!(reply_to), "{how}: {json}");
+                    }
                 }
             }
         }
