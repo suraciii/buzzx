@@ -4,6 +4,11 @@ This document describes the layers of `buzzx`, what each layer owns, and which
 way dependencies point. [relay-transport.md](relay-transport.md) and
 [render-contract.md](render-contract.md) detail the two hard parts.
 
+The CLI slice adds one-shot commands that perform operations the layers below
+already perform. [shared-core.md](shared-core.md) fixes the target shape of
+that work: a core module both front ends drive, with the bridge moving out of
+`session.rs`. This map changes when the code moves.
+
 ## Layers
 
 ```text diagram
