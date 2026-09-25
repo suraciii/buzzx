@@ -128,16 +128,22 @@ fn main() {
             cli.private_key.as_deref(),
             cli.auth_tag.as_deref(),
         ) {
-            Ok(resolved) => block_on(cli::run_channels(&resolved, action)),
-            Err(code) => code,
+            Ok(resolved) => match block_on(cli::run_channels(&resolved, action)) {
+                Ok(code) => code,
+                Err(error) => cli::fail_startup(config::EXIT_OTHER, &error),
+            },
+            Err(error) => cli::fail_startup(error.code, &error.message),
         },
         Command::Messages { action } => match resolve_identity(
             cli.relay.as_deref(),
             cli.private_key.as_deref(),
             cli.auth_tag.as_deref(),
         ) {
-            Ok(resolved) => block_on(cli::run_messages(&resolved, action)),
-            Err(code) => code,
+            Ok(resolved) => match block_on(cli::run_messages(&resolved, action)) {
+                Ok(code) => code,
+                Err(error) => cli::fail_startup(config::EXIT_OTHER, &error),
+            },
+            Err(error) => cli::fail_startup(error.code, &error.message),
         },
         Command::Login {
             private_key_file,
@@ -183,8 +189,17 @@ fn main() {
                 cli.private_key.as_deref(),
                 cli.auth_tag.as_deref(),
             ) {
-                Ok(resolved) => block_on(session::run_watch(&resolved, channel)),
-                Err(code) => code,
+                Ok(resolved) => match block_on(session::run_watch(&resolved, channel)) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        eprintln!("buzzx: {error}");
+                        config::EXIT_OTHER
+                    }
+                },
+                Err(error) => {
+                    eprintln!("buzzx: {error}");
+                    error.code
+                }
             },
         },
         Command::Tui => run_tui(&cli),
@@ -198,29 +213,18 @@ fn resolve_identity(
     relay: Option<&str>,
     private_key: Option<&str>,
     auth_tag: Option<&str>,
-) -> Result<Resolved, i32> {
-    match config::resolve(private_key, relay, auth_tag) {
-        Ok(resolved) => Ok(resolved),
-        Err(error) => {
-            eprintln!("buzzx: {error}");
-            Err(error.code)
-        }
-    }
+) -> Result<Resolved, config::StartupError> {
+    config::resolve(private_key, relay, auth_tag)
 }
 
 /// One multi-threaded runtime per process, for the commands that reach the
 /// relay.
-fn block_on<F: Future<Output = i32>>(future: F) -> i32 {
-    match tokio::runtime::Builder::new_multi_thread()
+fn block_on<F: Future<Output = i32>>(future: F) -> Result<i32, String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-    {
-        Ok(runtime) => runtime.block_on(future),
-        Err(error) => {
-            eprintln!("buzzx: runtime: {error}");
-            config::EXIT_OTHER
-        }
-    }
+        .map_err(|e| format!("runtime: {e}"))?;
+    Ok(runtime.block_on(future))
 }
 
 fn run_tui(cli: &Cli) -> i32 {
@@ -234,7 +238,10 @@ fn run_tui(cli: &Cli) -> i32 {
         cli.auth_tag.as_deref(),
     ) {
         Ok(resolved) => resolved,
-        Err(code) => return code,
+        Err(error) => {
+            eprintln!("buzzx: {error}");
+            return error.code;
+        }
     };
     match run_tui_session(resolved) {
         Ok(code) => code,
