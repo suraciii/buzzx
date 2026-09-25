@@ -191,11 +191,18 @@ They do not include private keys or raw authorization headers.
 
 ## Implementation status
 
-At implementation commit `9495a0f`, the collaboration commands exist, but
-before-submission write failures still omit `status`, and history help says
-newest first despite the returned chronological order. Those two gaps require
-implementation changes and verification; this specification does not mark them
-complete.
+The two gaps recorded here are closed at implementation commit `34eadb0`. A
+failed `messages send` or `messages reply` answers with the write object on
+every path before submission - configuration resolution, argument validation,
+stdin, and reply-target lookup - carrying `status: not_sent`, `event_id:
+null`, the target in `reply_to` for a reply, and the channel in `channel_id`
+when the command names one. Channel-history help names both the selection and
+the output order.
+
+`tests/cli.rs` drives all of it against the fake relay, including the
+categories, the ids, and the shapes; a live relay run covered the success and
+failure shapes of both write commands. The rest of this contract was verified
+the same way, so every acceptance criterion above is exercised.
 
 ## Product boundary after this slice
 
