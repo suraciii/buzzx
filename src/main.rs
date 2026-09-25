@@ -3,8 +3,11 @@
 
 mod account;
 mod app;
+mod cli;
+mod client;
 mod config;
 mod content;
+mod failure;
 mod http;
 mod keys;
 mod layout;
@@ -13,6 +16,7 @@ mod session;
 mod sub;
 mod ui;
 
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,7 +25,6 @@ use clap::{Parser, Subcommand};
 use crossterm::event::{Event as TermEvent, KeyEventKind};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use uuid::Uuid;
 
 use app::App;
 use config::Resolved;
@@ -51,6 +54,16 @@ struct Cli {
 enum Command {
     /// Open the interactive terminal chat session.
     Tui,
+    /// Discover and read channels.
+    Channels {
+        #[command(subcommand)]
+        action: cli::ChannelsCommand,
+    },
+    /// Read and write messages.
+    Messages {
+        #[command(subcommand)]
+        action: cli::MessagesCommand,
+    },
     /// Stream one channel's live events as JSON lines.
     Watch {
         /// Channel UUID to watch.
@@ -96,8 +109,36 @@ fn main() {
     // inside rustls without an explicit provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // `--help` and `--version` are not failures. Everything else is
+            // bad input, which is code 1, not clap's own 2.
+            let help = matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            );
+            let _ = error.print();
+            std::process::exit(if help { 0 } else { config::EXIT_USAGE });
+        }
+    };
     let code: i32 = match cli.command {
+        Command::Channels { action } => match resolve_identity(
+            cli.relay.as_deref(),
+            cli.private_key.as_deref(),
+            cli.auth_tag.as_deref(),
+        ) {
+            Ok(resolved) => block_on(cli::run_channels(&resolved, action)),
+            Err(code) => code,
+        },
+        Command::Messages { action } => match resolve_identity(
+            cli.relay.as_deref(),
+            cli.private_key.as_deref(),
+            cli.auth_tag.as_deref(),
+        ) {
+            Ok(resolved) => block_on(cli::run_messages(&resolved, action)),
+            Err(code) => code,
+        },
         Command::Login {
             private_key_file,
             private_key_stdin,
@@ -132,34 +173,54 @@ fn main() {
             flag_key: cli.private_key.clone(),
             env_key: std::env::var("BUZZ_PRIVATE_KEY").is_ok(),
         }),
-        Command::Watch { channel } => match Uuid::parse_str(&channel) {
-            Err(_) => {
-                eprintln!("buzzx: channel must be a UUID");
+        Command::Watch { channel } => match client::channel_id(&channel) {
+            Err(failure) => {
+                eprintln!("buzzx: {failure}");
                 config::EXIT_USAGE
             }
-            Ok(channel) => {
-                match config::resolve(
-                    cli.private_key.as_deref(),
-                    cli.relay.as_deref(),
-                    cli.auth_tag.as_deref(),
-                ) {
-                    Ok(resolved) => {
-                        let runtime = tokio::runtime::Builder::new_multi_thread()
-                            .enable_all()
-                            .build()
-                            .expect("tokio runtime");
-                        runtime.block_on(session::run_watch(&resolved, channel))
-                    }
-                    Err(e) => {
-                        eprintln!("buzzx: {e}");
-                        e.code
-                    }
-                }
-            }
+            Ok(channel) => match resolve_identity(
+                cli.relay.as_deref(),
+                cli.private_key.as_deref(),
+                cli.auth_tag.as_deref(),
+            ) {
+                Ok(resolved) => block_on(session::run_watch(&resolved, channel)),
+                Err(code) => code,
+            },
         },
         Command::Tui => run_tui(&cli),
     };
     std::process::exit(code);
+}
+
+/// The effective identity and relay, or the failure and the code it carries.
+/// The three flags are read from the parsed tree before a command consumes it.
+fn resolve_identity(
+    relay: Option<&str>,
+    private_key: Option<&str>,
+    auth_tag: Option<&str>,
+) -> Result<Resolved, i32> {
+    match config::resolve(private_key, relay, auth_tag) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) => {
+            eprintln!("buzzx: {error}");
+            Err(error.code)
+        }
+    }
+}
+
+/// One multi-threaded runtime per process, for the commands that reach the
+/// relay.
+fn block_on<F: Future<Output = i32>>(future: F) -> i32 {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(future),
+        Err(error) => {
+            eprintln!("buzzx: runtime: {error}");
+            config::EXIT_OTHER
+        }
+    }
 }
 
 fn run_tui(cli: &Cli) -> i32 {
@@ -167,16 +228,13 @@ fn run_tui(cli: &Cli) -> i32 {
         eprintln!("buzzx: TERM=dumb cannot run the TUI");
         return config::EXIT_USAGE;
     }
-    let resolved = match config::resolve(
-        cli.private_key.as_deref(),
+    let resolved = match resolve_identity(
         cli.relay.as_deref(),
+        cli.private_key.as_deref(),
         cli.auth_tag.as_deref(),
     ) {
         Ok(resolved) => resolved,
-        Err(error) => {
-            eprintln!("buzzx: {error}");
-            return error.code;
-        }
+        Err(code) => return code,
     };
     match run_tui_session(resolved) {
         Ok(code) => code,

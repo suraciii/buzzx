@@ -7,9 +7,10 @@ use std::collections::{HashMap, HashSet};
 use nostr::Keys;
 use uuid::Uuid;
 
+use crate::client::ChannelInfo;
 use crate::content::{self, Row};
 use crate::keys::{Action, PAGE_ROWS};
-use crate::session::{ChannelInfo, ChatEvent, SessionCommand};
+use crate::session::{ChatEvent, SessionCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {

@@ -346,6 +346,7 @@ dependencies = [
  "dirs",
  "hex",
  "nostr",
+ "parking_lot",
  "rand 0.10.3",
  "ratatui",
  "reqwest",

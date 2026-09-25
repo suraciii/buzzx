@@ -7,6 +7,8 @@ use nostr::{Event, EventBuilder, Keys, Kind, Tag};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::failure::{Category, Failure};
+
 /// Sign a NIP-98 kind 27235 event and return the Authorization header value.
 /// The nonce tag is what makes two identical bodies two different events; the
 /// relay keeps a replay guard.
@@ -42,12 +44,24 @@ pub enum WriteOutcome {
     /// The relay accepted the event under this stored id. The relay
     /// canonicalizes events, so this id, not the locally signed one, is the
     /// address later edits, deletions, and replies must target.
-    Ok { event_id: String },
-    /// The relay refused the event. The reason is the relay's own.
-    Failed { reason: String },
-    /// The request was sent and the answer never arrived. The event may have
-    /// been admitted. The caller reports uncertainty and does not resend.
-    Uncertain { reason: String },
+    Stored { event_id: String },
+    /// The request never left the client, or the relay refused it. Nothing
+    /// was stored.
+    Refused { category: Category, reason: String },
+    /// The request was sent and storage is not established: the answer was
+    /// lost, or the relay failed after accepting. The caller reports
+    /// uncertainty and does not resend.
+    Unknown { category: Category, reason: String },
+}
+
+/// A failure raised before anything was sent is a refusal.
+impl From<Failure> for WriteOutcome {
+    fn from(failure: Failure) -> Self {
+        WriteOutcome::Refused {
+            category: failure.category,
+            reason: failure.detail,
+        }
+    }
 }
 
 fn relay_reason(status: reqwest::StatusCode, body: &str) -> String {
@@ -61,6 +75,61 @@ fn relay_reason(status: reqwest::StatusCode, body: &str) -> String {
         })
         .unwrap_or_else(|| body.to_owned());
     format!("HTTP {status}: {extracted}")
+}
+
+/// The category an error status carries. 401 and 403 are the identity's
+/// answer; every other refusal is the relay's own, except 404, which means a
+/// reference resolved to nothing.
+fn status_category(status: reqwest::StatusCode) -> Category {
+    match status.as_u16() {
+        401 | 403 => Category::Forbidden,
+        404 => Category::NotFound,
+        _ => Category::RelayRejected,
+    }
+}
+
+/// Classify an answer to `POST /query`. A read that a relay refuses is an
+/// error, never an empty collection.
+fn read_response(status: reqwest::StatusCode, body: &str) -> Failure {
+    Failure::new(status_category(status), relay_reason(status, body))
+}
+
+/// Classify an answer to `POST /events`. A success needs the relay's
+/// canonical id: without it nothing can address the stored event, so the
+/// result is unknown rather than confirmed. A 4xx refusal means nothing was
+/// stored; a 5xx answer leaves storage unestablished.
+fn write_response(status: reqwest::StatusCode, body: &str) -> WriteOutcome {
+    if status.is_success() {
+        let stored = serde_json::from_str::<Value>(body).ok().and_then(|v| {
+            v.get("event_id")
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        });
+        return match stored {
+            Some(event_id) => WriteOutcome::Stored { event_id },
+            None => WriteOutcome::Unknown {
+                category: Category::TimeoutUnknown,
+                reason: "the relay accepted the event without a canonical id".to_owned(),
+            },
+        };
+    }
+    if matches!(status.as_u16(), 502..=504) {
+        return WriteOutcome::Unknown {
+            category: Category::TimeoutUnknown,
+            reason: relay_reason(status, body),
+        };
+    }
+    if status.is_server_error() {
+        return WriteOutcome::Unknown {
+            category: Category::RelayRejected,
+            reason: relay_reason(status, body),
+        };
+    }
+    WriteOutcome::Refused {
+        category: status_category(status),
+        reason: relay_reason(status, body),
+    }
 }
 
 /// The NIP-98 HTTP bridge client. One instance per session.
@@ -93,10 +162,19 @@ impl HttpTransport {
     }
 
     /// One filter per call, per the bridge contract. The body is the filter
-    /// wrapped in an array, the same REQ shape the bridge accepts.
-    pub async fn query(&self, filter: &Value) -> Result<Vec<Event>, String> {
+    /// wrapped in an array, the same REQ shape the bridge accepts. A read
+    /// changes nothing, so a lost answer is repeated once.
+    pub async fn query(&self, filter: &Value) -> Result<Vec<Event>, Failure> {
+        match self.query_once(filter).await {
+            Err(failure) if failure.category == Category::Network => self.query_once(filter).await,
+            result => result,
+        }
+    }
+
+    async fn query_once(&self, filter: &Value) -> Result<Vec<Event>, Failure> {
         let url = format!("{}/query", self.base);
-        let body = serde_json::to_vec(&serde_json::json!([filter])).map_err(|e| e.to_string())?;
+        let body = serde_json::to_vec(&serde_json::json!([filter]))
+            .map_err(|e| Failure::invalid_input(format!("query body: {e}")))?;
         let header = self.auth_header("POST", &url, Some(&body));
         let mut request = self
             .http
@@ -109,17 +187,17 @@ impl HttpTransport {
         let response = request
             .send()
             .await
-            .map_err(|e| format!("query failed: {e}"))?;
+            .map_err(|e| Failure::network(format!("query failed: {e}")))?;
         let status = response.status();
         let text = response
             .text()
             .await
-            .map_err(|e| format!("query body lost: {e}"))?;
+            .map_err(|e| Failure::network(format!("query body lost: {e}")))?;
         if !status.is_success() {
-            return Err(relay_reason(status, &text));
+            return Err(read_response(status, &text));
         }
-        let values: Vec<Value> =
-            serde_json::from_str(&text).map_err(|e| format!("query response: {e}"))?;
+        let values: Vec<Value> = serde_json::from_str(&text)
+            .map_err(|e| Failure::new(Category::RelayRejected, format!("query response: {e}")))?;
         let mut events = Vec::with_capacity(values.len());
         for value in values {
             match serde_json::from_value::<Event>(value) {
@@ -131,14 +209,17 @@ impl HttpTransport {
         Ok(events)
     }
 
-    /// Submit one signed event. A connection failure is retried once; a
-    /// timeout after the request was sent is uncertain, not a failure.
+    /// Submit one signed event. A connection failure is retried once, because
+    /// a request that never left the client cannot have been stored. Every
+    /// other transport failure after the request was sent is uncertain, not a
+    /// refusal.
     pub async fn submit(&self, event: &Event) -> WriteOutcome {
         let url = format!("{}/events", self.base);
         let body = match serde_json::to_vec(event) {
             Ok(bytes) => bytes,
             Err(e) => {
-                return WriteOutcome::Failed {
+                return WriteOutcome::Refused {
+                    category: Category::InvalidInput,
                     reason: format!("serialize: {e}"),
                 };
             }
@@ -155,50 +236,29 @@ impl HttpTransport {
                 request = request.header("x-auth-tag", tag);
             }
             match request.send().await {
-                Ok(response) => return self.submit_response(response).await,
+                Ok(response) => {
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    return write_response(status, &text);
+                }
                 Err(e) => {
-                    let connect = e.is_connect();
-                    if attempt == 0 && connect {
-                        continue;
-                    }
-                    if connect || e.is_timeout() || e.is_request() || e.is_body() {
-                        return WriteOutcome::Uncertain {
-                            reason: format!("write outcome unknown: {e}"),
+                    if e.is_connect() {
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return WriteOutcome::Refused {
+                            category: Category::Network,
+                            reason: format!("write failed, nothing was sent: {e}"),
                         };
                     }
-                    return WriteOutcome::Failed {
-                        reason: format!("write failed: {e}"),
+                    return WriteOutcome::Unknown {
+                        category: Category::TimeoutUnknown,
+                        reason: format!("write outcome unknown: {e}"),
                     };
                 }
             }
         }
         unreachable!("the loop returns on the second attempt")
-    }
-
-    async fn submit_response(&self, response: reqwest::Response) -> WriteOutcome {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        if status.is_success() {
-            let stored = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| {
-                    v.get("event_id")
-                        .and_then(|id| id.as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_default();
-            return WriteOutcome::Ok { event_id: stored };
-        }
-        // A proxy failure after the relay may have stored the event is
-        // uncertain. A direct refusal is a failure.
-        if matches!(status.as_u16(), 502..=504) {
-            return WriteOutcome::Uncertain {
-                reason: relay_reason(status, &text),
-            };
-        }
-        WriteOutcome::Failed {
-            reason: relay_reason(status, &text),
-        }
     }
 }
 
@@ -254,5 +314,68 @@ mod tests {
         let a = build_nip98_header(&keys, "POST", "https://r/events", Some(b"x")).unwrap();
         let b = build_nip98_header(&keys, "POST", "https://r/events", Some(b"x")).unwrap();
         assert_ne!(a, b, "identical bodies must produce distinct events");
+    }
+
+    #[test]
+    fn a_stored_id_needs_the_relays_own_id() {
+        match write_response(reqwest::StatusCode::OK, r#"{"event_id":"ab"}"#) {
+            WriteOutcome::Stored { event_id } => assert_eq!(event_id, "ab"),
+            other => panic!("expected Stored, got {other:?}"),
+        }
+        // A success without the relay's id cannot address the stored event.
+        match write_response(reqwest::StatusCode::OK, "{}") {
+            WriteOutcome::Unknown { category, .. } => {
+                assert_eq!(category, Category::TimeoutUnknown)
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        match write_response(reqwest::StatusCode::OK, r#"{"event_id":""}"#) {
+            WriteOutcome::Unknown { .. } => {}
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_write_is_not_sent_and_a_server_failure_is_unknown() {
+        match write_response(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":"not a member"}"#,
+        ) {
+            WriteOutcome::Refused { category, reason } => {
+                assert_eq!(category, Category::Forbidden);
+                assert!(reason.contains("not a member"), "{reason}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        match write_response(reqwest::StatusCode::BAD_REQUEST, r#"{"error":"bad tag"}"#) {
+            WriteOutcome::Refused { category, .. } => assert_eq!(category, Category::RelayRejected),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // A proxy failure may have reached the relay, so the event may exist.
+        match write_response(reqwest::StatusCode::BAD_GATEWAY, "upstream gone") {
+            WriteOutcome::Unknown { category, .. } => {
+                assert_eq!(category, Category::TimeoutUnknown)
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // A 500 is the relay's own failure: it answered, and storage is not
+        // established either way.
+        match write_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom") {
+            WriteOutcome::Unknown { category, .. } => {
+                assert_eq!(category, Category::RelayRejected)
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_read_carries_its_own_category() {
+        let forbidden = read_response(reqwest::StatusCode::FORBIDDEN, "");
+        assert_eq!(forbidden.category, Category::Forbidden);
+        let missing = read_response(reqwest::StatusCode::NOT_FOUND, "");
+        assert_eq!(missing.category, Category::NotFound);
+        let rejected = read_response(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        assert_eq!(rejected.category, Category::RelayRejected);
+        assert!(rejected.detail.contains("slow down"), "{rejected}");
     }
 }
