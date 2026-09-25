@@ -1,38 +1,20 @@
-//! The session: the only module that touches both transports. It owns the
-//! command pump (HTTP reads and writes) and spawns the WebSocket pump. The
-//! UI never awaits a network call; it sends a `SessionCommand` and keeps
-//! rendering until a `ChatEvent` arrives.
+//! The live session: the subscriptions, the reconnect, and the `ChatEvent`
+//! stream the TUI renders. The command pump translates one `SessionCommand`
+//! into one core call and one `ChatEvent`; the relay operations themselves
+//! live in `client.rs`. The contract is design/shared-core.md.
 
-use std::collections::HashSet;
-
-use buzz_sdk::builders::{
-    build_delete_message, build_edit, build_message, build_reaction, build_remove_reaction,
-};
-use nostr::{Event, EventId, Keys, Tag};
+use nostr::Event;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::client::{Client, WriteOutcome, event_id};
 use crate::config::Resolved;
-use crate::content::{self, MEMBERSHIP_KIND, PROFILE_KIND};
+use crate::content;
+use crate::failure::Failure;
 use crate::sub::{self, SubControl};
 
-/// The tag that names a channel id on membership and metadata events.
-const D_TAG: &str = "d";
-/// The tag that names a channel's display name on metadata events.
-const NAME_TAG: &str = "name";
-use crate::http::{HttpTransport, WriteOutcome};
-/// How many channel ids one membership or metadata query carries.
-const CHANNEL_QUERY_LIMIT: u64 = 500;
 /// How many history events one open fetches.
 const HISTORY_LIMIT: u64 = 100;
-/// How many authors one profile query carries.
-const PROFILE_CHUNK: usize = 50;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChannelInfo {
-    pub id: Uuid,
-    pub name: String,
-}
 
 /// What the transport side tells the UI. Every mutation the UI renders
 /// arrives as one of these.
@@ -41,7 +23,7 @@ pub enum ChatEvent {
     Connected,
     Disconnected(String),
     /// The identity's channel list. Sent after connect and after a reload.
-    Channels(Vec<ChannelInfo>),
+    Channels(Vec<crate::client::ChannelInfo>),
     /// A channel's history, oldest first. Replaces the loaded rows.
     History {
         channel: Uuid,
@@ -152,21 +134,14 @@ pub fn spawn(resolved: &Resolved, events: mpsc::Sender<ChatEvent>) -> Session {
     tokio::spawn(sub::run_ws_pump(
         ws_url,
         resolved.keys.clone(),
-        auth_tag.clone(),
+        auth_tag,
         sub_rx,
         events.clone(),
         started_tx,
     ));
 
-    let transport = HttpTransport::new(
-        &resolved.http_url,
-        resolved.keys.clone(),
-        resolved.auth_tag.clone(),
-    );
     tokio::spawn(run_command_pump(
-        transport,
-        resolved.keys.clone(),
-        auth_tag,
+        Client::new(resolved),
         cmd_rx,
         sub_tx,
         events,
@@ -178,49 +153,33 @@ pub fn spawn(resolved: &Resolved, events: mpsc::Sender<ChatEvent>) -> Session {
     }
 }
 
-fn thread_ref(thread: &Option<(String, String)>) -> Option<buzz_sdk::ThreadRef> {
-    let (root, parent) = thread.as_ref()?;
-    Some(buzz_sdk::ThreadRef {
-        root_event_id: EventId::from_hex(root).ok()?,
-        parent_event_id: EventId::from_hex(parent).ok()?,
-    })
-}
-
-/// Sign a builder with the identity, attaching the NIP-OA tag when the
-/// identity carries one. The event tag is authoritative on the relay.
-fn sign(
-    builder: nostr::EventBuilder,
-    keys: &Keys,
-    auth_tag: &Option<Tag>,
-) -> Result<Event, String> {
-    let builder = match auth_tag {
-        Some(tag) => builder.tag(tag.clone()),
-        None => builder,
+/// A malformed thread id never becomes an unthreaded message.
+fn thread_ref(thread: &Option<(String, String)>) -> Result<Option<buzz_sdk::ThreadRef>, Failure> {
+    let Some((root, parent)) = thread else {
+        return Ok(None);
     };
-    builder
-        .sign_with_keys(keys)
-        .map_err(|e| format!("signing failed: {e}"))
+    Ok(Some(buzz_sdk::ThreadRef {
+        root_event_id: event_id(root)?,
+        parent_event_id: event_id(parent)?,
+    }))
 }
 
 async fn run_command_pump(
-    transport: HttpTransport,
-    keys: Keys,
-    auth_tag: Option<Tag>,
+    client: Client,
     mut commands: mpsc::Receiver<SessionCommand>,
     subs: mpsc::Sender<SubControl>,
     events: mpsc::Sender<ChatEvent>,
 ) {
-    let me = keys.public_key().to_hex();
     while let Some(command) = commands.recv().await {
         match command {
             SessionCommand::LoadChannels => {
-                load_channels(&transport, &me, &subs, &events).await;
+                load_channels(&client, &subs, &events).await;
             }
             SessionCommand::OpenChannel(channel) => {
-                open_channel(&transport, channel, &subs, &events).await;
+                open_channel(&client, channel, &subs, &events).await;
             }
             SessionCommand::LoadProfiles(pubkeys) => {
-                load_profiles(&transport, pubkeys, &events).await;
+                load_profiles(&client, pubkeys, &events).await;
             }
             SessionCommand::Send {
                 channel,
@@ -228,21 +187,11 @@ async fn run_command_pump(
                 thread,
                 local,
             } => {
-                let builder = build_message(
-                    channel,
-                    &content,
-                    thread_ref(&thread).as_ref(),
-                    &[],
-                    false,
-                    &[],
-                );
-                let outcome = match builder {
-                    Ok(builder) => {
-                        submit(builder, &transport, &keys, &auth_tag, &local, &events).await
-                    }
-                    Err(e) => Err(e.to_string()),
+                let outcome = match thread_ref(&thread) {
+                    Ok(thread) => client.send_message(channel, &content, thread).await,
+                    Err(failure) => failure.into(),
                 };
-                report_refusal(outcome, local, &events).await;
+                report(outcome, local, &events).await;
             }
             SessionCommand::Edit {
                 channel,
@@ -250,34 +199,22 @@ async fn run_command_pump(
                 content,
                 local,
             } => {
-                let builder = match EventId::from_hex(&target) {
-                    Ok(target) => build_edit(channel, target, &content).map_err(|e| e.to_string()),
-                    Err(_) => Err("edit target is not an event id".to_owned()),
+                let outcome = match event_id(&target) {
+                    Ok(target) => client.edit(channel, target, &content).await,
+                    Err(failure) => failure.into(),
                 };
-                let outcome = match builder {
-                    Ok(builder) => {
-                        submit(builder, &transport, &keys, &auth_tag, &local, &events).await
-                    }
-                    Err(e) => Err(e.to_string()),
-                };
-                report_refusal(outcome, local, &events).await;
+                report(outcome, local, &events).await;
             }
             SessionCommand::Delete {
                 channel,
                 target,
                 local,
             } => {
-                let builder = match EventId::from_hex(&target) {
-                    Ok(target) => build_delete_message(channel, target).map_err(|e| e.to_string()),
-                    Err(_) => Err("delete target is not an event id".to_owned()),
+                let outcome = match event_id(&target) {
+                    Ok(target) => client.delete(channel, target).await,
+                    Err(failure) => failure.into(),
                 };
-                let outcome = match builder {
-                    Ok(builder) => {
-                        submit(builder, &transport, &keys, &auth_tag, &local, &events).await
-                    }
-                    Err(e) => Err(e.to_string()),
-                };
-                report_refusal(outcome, local, &events).await;
+                report(outcome, local, &events).await;
             }
             SessionCommand::React {
                 target,
@@ -285,185 +222,80 @@ async fn run_command_pump(
                 remove,
                 local,
             } => {
-                let builder = match (&remove, EventId::from_hex(&target)) {
-                    (Some(reaction_id), _) => match EventId::from_hex(reaction_id) {
-                        Ok(id) => build_remove_reaction(id).map_err(|e| e.to_string()),
-                        Err(e) => Err(format!("reaction id is invalid: {e}")),
+                let outcome = match &remove {
+                    Some(reaction_id) => match event_id(reaction_id) {
+                        Ok(id) => client.remove_reaction(id).await,
+                        Err(failure) => failure.into(),
                     },
-                    (None, Ok(target)) => {
-                        let emoji = if emoji.is_empty() {
-                            content::DEFAULT_REACTION.to_owned()
-                        } else {
-                            emoji.clone()
-                        };
-                        build_reaction(target, &emoji).map_err(|e| e.to_string())
-                    }
-                    (None, Err(_)) => Err("react target is not an event id".to_owned()),
+                    None => match event_id(&target) {
+                        Ok(target) => {
+                            let emoji = if emoji.is_empty() {
+                                content::DEFAULT_REACTION.to_owned()
+                            } else {
+                                emoji.clone()
+                            };
+                            client.react(target, &emoji).await
+                        }
+                        Err(failure) => failure.into(),
+                    },
                 };
-                let outcome = match builder {
-                    Ok(builder) => {
-                        submit(builder, &transport, &keys, &auth_tag, &local, &events).await
-                    }
-                    Err(e) => Err(e.to_string()),
-                };
-                report_refusal(outcome, local, &events).await;
+                report(outcome, local, &events).await;
             }
             SessionCommand::Shutdown => return,
         }
     }
 }
 
-async fn submit(
-    builder: nostr::EventBuilder,
-    transport: &HttpTransport,
-    keys: &Keys,
-    auth_tag: &Option<Tag>,
-    local: &str,
-    events: &mpsc::Sender<ChatEvent>,
-) -> Result<(), String> {
-    let event = match sign(builder, keys, auth_tag) {
-        Ok(event) => event,
-        Err(e) => return Err(e),
+/// One write result, as the UI renders it. An unconfirmed write is never
+/// retried; the row stays marked until the user decides.
+async fn report(outcome: WriteOutcome, local: String, events: &mpsc::Sender<ChatEvent>) {
+    let event = match outcome {
+        WriteOutcome::Stored { event_id } => ChatEvent::WriteOk { local, event_id },
+        WriteOutcome::Refused { reason, .. } => ChatEvent::WriteFailed { local, reason },
+        WriteOutcome::Unknown { reason, .. } => ChatEvent::WriteUncertain { local, reason },
     };
-    match transport.submit(&event).await {
-        WriteOutcome::Ok { event_id } => {
-            // An empty stored id falls back to the signed id; a body without
-            // one is not a refusal.
-            let event_id = if event_id.is_empty() {
-                event.id.to_hex()
-            } else {
-                event_id
-            };
-            let _ = events
-                .send(ChatEvent::WriteOk {
-                    local: local.to_owned(),
-                    event_id,
-                })
-                .await;
-            Ok(())
-        }
-        WriteOutcome::Failed { reason } => Err(reason),
-        WriteOutcome::Uncertain { reason } => {
-            let _ = events
-                .send(ChatEvent::WriteUncertain {
-                    local: local.to_owned(),
-                    reason,
-                })
-                .await;
-            Ok(())
-        }
-    }
-}
-
-/// A build or sign failure is a refusal the UI must show; the composer draft
-/// is restored for it just like a relay refusal.
-async fn report_refusal(
-    outcome: Result<(), String>,
-    local: String,
-    events: &mpsc::Sender<ChatEvent>,
-) {
-    if let Err(reason) = outcome {
-        let _ = events.send(ChatEvent::WriteFailed { local, reason }).await;
-    }
-}
-
-fn tag_value(event: &Event, name: &str) -> Option<String> {
-    event.tags.iter().find_map(|t| {
-        let parts = t.as_slice();
-        (parts.first().map(String::as_str) == Some(name))
-            .then(|| parts.get(1).cloned())
-            .flatten()
-    })
+    let _ = events.send(event).await;
 }
 
 async fn load_channels(
-    transport: &HttpTransport,
-    me: &str,
+    client: &Client,
     subs: &mpsc::Sender<SubControl>,
     events: &mpsc::Sender<ChatEvent>,
 ) {
-    // Membership first: kind 39002 names the channels the identity belongs
-    // to. Metadata for those ids second.
-    let membership = serde_json::json!({
-        "kinds": [MEMBERSHIP_KIND],
-        "#p": [me],
-        "limit": CHANNEL_QUERY_LIMIT,
-    });
-    let roster = match transport.query(&membership).await {
-        Ok(events) => events,
-        Err(e) => {
+    let channels = match client.channels().await {
+        Ok(channels) => channels,
+        Err(failure) => {
             let _ = events
-                .send(ChatEvent::Status(format!("channel list failed: {e}")))
+                .send(ChatEvent::Status(format!("channel list failed: {failure}")))
                 .await;
             return;
         }
     };
-    let mut ids: Vec<String> = Vec::new();
-    for event in &roster {
-        if let Some(id) = tag_value(event, D_TAG).filter(|id| !id.is_empty() && !ids.contains(id)) {
-            ids.push(id);
-        }
-    }
-    if ids.is_empty() {
-        // No membership means no channel to watch for typing either; the
-        // empty list replaces whatever the previous connection subscribed to.
-        let _ = subs.send(SubControl::Typing(Vec::new())).await;
-        let _ = events.send(ChatEvent::Channels(Vec::new())).await;
-        return;
-    }
-    let metadata = serde_json::json!({
-        "kinds": [content::CHANNEL_METADATA_KIND],
-        "#d": ids,
-        "limit": CHANNEL_QUERY_LIMIT,
-    });
-    let described = transport.query(&metadata).await.unwrap_or_default();
-    let mut channels: Vec<ChannelInfo> = Vec::new();
-    for event in &described {
-        let Some(id) = tag_value(event, D_TAG).filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let Ok(id) = Uuid::parse_str(&id) else {
-            continue;
-        };
-        let name = tag_value(event, NAME_TAG)
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| id.to_string());
-        channels.push(ChannelInfo { id, name });
-    }
-    channels.sort_by_key(|c| c.name.to_lowercase());
     // Every member channel, not just the open one: the channel list shows an
     // activity marker per channel, and an indicator that arrives while the
     // user is elsewhere is exactly what the marker is for.
-    let ids: Vec<Uuid> = channels.iter().map(|c| c.id).collect();
+    let ids: Vec<Uuid> = channels.iter().map(|channel| channel.id).collect();
     let _ = subs.send(SubControl::Typing(ids)).await;
     let _ = events.send(ChatEvent::Channels(channels)).await;
 }
 
 async fn open_channel(
-    transport: &HttpTransport,
+    client: &Client,
     channel: Uuid,
     subs: &mpsc::Sender<SubControl>,
     events: &mpsc::Sender<ChatEvent>,
 ) {
     let _ = subs.send(SubControl::Timeline(channel)).await;
-    let filter = serde_json::json!({
-        "kinds": content::TIMELINE_KINDS,
-        "#h": [channel.to_string()],
-        "limit": HISTORY_LIMIT,
-    });
-    let mut history = match transport.query(&filter).await {
-        Ok(events) => events,
-        Err(e) => {
+    let history = match client.history(channel, HISTORY_LIMIT).await {
+        Ok(history) => history,
+        Err(failure) => {
             let _ = events
-                .send(ChatEvent::Status(format!("history failed: {e}")))
+                .send(ChatEvent::Status(format!("history failed: {failure}")))
                 .await;
             return;
         }
     };
-    // The relay returns newest first; the timeline renders oldest first.
-    history.sort_by_key(|e| e.created_at.as_secs());
-
-    let ids: Vec<String> = history.iter().map(|e| e.id.to_hex()).collect();
+    let ids: Vec<String> = history.iter().map(|event| event.id.to_hex()).collect();
     let _ = subs.send(SubControl::Aux { channel, ids }).await;
     let _ = events
         .send(ChatEvent::History {
@@ -473,38 +305,14 @@ async fn open_channel(
         .await;
 }
 
-async fn load_profiles(
-    transport: &HttpTransport,
-    pubkeys: Vec<String>,
-    events: &mpsc::Sender<ChatEvent>,
-) {
-    let mut seen: HashSet<String> = HashSet::new();
-    let wanted: Vec<String> = pubkeys
-        .into_iter()
-        .filter(|k| seen.insert(k.clone()))
-        .take(200)
-        .collect();
-    for chunk in wanted.chunks(PROFILE_CHUNK) {
-        let filter = serde_json::json!({
-            "kinds": [PROFILE_KIND],
-            "authors": chunk,
-            "limit": chunk.len() as u64,
-        });
-        let Ok(found) = transport.query(&filter).await else {
-            continue;
-        };
-        let mut resolved: Vec<(String, String)> = Vec::new();
-        for event in found {
-            if let Some((name, display)) = content::profile_names(&event) {
-                let best = display.or(name);
-                if let Some(best) = best {
-                    resolved.push((event.pubkey.to_hex(), best));
-                }
-            }
-        }
-        if !resolved.is_empty() {
-            let _ = events.send(ChatEvent::Profiles(resolved)).await;
-        }
+async fn load_profiles(client: &Client, pubkeys: Vec<String>, events: &mpsc::Sender<ChatEvent>) {
+    // A name that does not resolve stays a short key, so a failed read is
+    // not worth a status line.
+    let Ok(resolved) = client.profiles(pubkeys).await else {
+        return;
+    };
+    if !resolved.is_empty() {
+        let _ = events.send(ChatEvent::Profiles(resolved)).await;
     }
 }
 

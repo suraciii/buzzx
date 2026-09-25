@@ -192,6 +192,24 @@ success. Code 1 is bad input, before any network call. Code 2 is a relay
 unreachable or network failure. Code 3 is an authentication or identity
 failure. Code 4 is another failure. Code 5 is a write conflict.
 
+The one-shot commands (`channels list`, `messages get|thread|send|reply`)
+carry the failure categories of
+[browse-collab-cli.md](browse-collab-cli.md), which widen code 1:
+
+| Category | Exit | Raised when |
+|---|---|---|
+| `invalid_input` | 1 | an argument is missing, malformed, or contradictory; content is empty; an id does not parse |
+| `not_found` | 1 | a referenced event resolves to no event |
+| `network` | 2 | a connection failed, or a read lost its answer |
+| `timeout_unknown` | 2 | a write was submitted and its answer was lost; the write is never retried |
+| `forbidden` | 3 | the relay refused the identity with 401 or 403 |
+| `relay_rejected` | 4 | the relay refused a submitted event for any other reason |
+
+A write that is not confirmed exits non-zero and prints `not_sent` or
+`sent_unconfirmed` with the category, so a script never reads an unknown write
+as a success. Usage errors from the argument parser are code 1 and print prose
+to stderr; every other failure prints one JSON object on stdout.
+
 The TUI exits 0 on a clean quit and 3 when the relay refused the identity.
 The TUI does not use the other codes: it is interactive, and its failures
 appear on the status line rather than in an exit code.

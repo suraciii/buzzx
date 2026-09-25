@@ -26,5 +26,8 @@ hex = "0.4"
 rand = "0.10"
 dirs = "6"
 
+[dev-dependencies]
+parking_lot = "0.12"
+
 [profile.release]
 lto = "thin"

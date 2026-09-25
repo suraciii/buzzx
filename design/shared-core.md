@@ -10,9 +10,11 @@ does not restate it. The terms are defined in [../CONTEXT.md](../CONTEXT.md).
 share the transport, the identity handling, and the event construction with
 the TUI. This is how that requirement is met.
 
-The five commands of the slice do not exist yet. This is the design they
-start from. [architecture.md](architecture.md) records the module map of the
-code that exists, and points here for the target.
+The five commands of the slice exist, and the core they share exists with
+them. [architecture.md](architecture.md) records the module map;
+[../docs/browse-collab-cli.md](../docs/browse-collab-cli.md) is what the CLI
+promises a caller, and [../docs/configuration.md](../docs/configuration.md)
+owns the exit codes. This document states the shape the code must keep.
 
 ## Why one implementation
 
@@ -182,30 +184,25 @@ event, and a thread root that does not resolve, are `not_found`. A reply
 target without a channel is `invalid_input`, like empty or oversized content
 and a malformed id.
 
-| Outcome | Meaning | CLI status | Exit |
-|---|---|---|---|
-| `Stored` | the relay accepted the event and returned its canonical id | `sent_confirmed` | 0 |
-| `Refused` | never submitted, or the relay refused it | `not_sent` | by category |
-| `Unknown` | submitted, and storage is not established | `sent_unconfirmed` | 2 |
-
-| Category | Exit |
-|---|---|
-| `invalid_input`, `not_found` | 1 |
-| `network`, `timeout_unknown` | 2 |
-| `forbidden` | 3 |
-| `relay_rejected` | 4 |
+| Outcome | Meaning | CLI status |
+|---|---|---|
+| `Stored` | the relay accepted the event and returned its canonical id | `sent_confirmed` |
+| `Refused` | never submitted, or the relay refused it | `not_sent` |
+| `Unknown` | submitted, and storage is not established | `sent_unconfirmed` |
 
 `not_found` exits 1 to match `buzz`'s own contract, which groups input and
 not-found. It is not a pre-network verdict: a referenced event that resolves
-to nothing is learned from the relay's answer.
-[../docs/configuration.md](../docs/configuration.md) now defines code 1 as
-bad input before any network call, and gains this case when the code lands.
+to nothing is learned from the relay's answer, which is why
+[../docs/configuration.md](../docs/configuration.md) widened code 1 from
+"bad input before any network call" to include it.
 
 The mapping covers the five commands of the CLI slice. The subcommands that
 already exist keep the codes that document records.
 
-`sent_unconfirmed` exits 2, so a script cannot read an unknown write as a
-success. The CLI never retries it; the caller decides.
+[../docs/configuration.md](../docs/configuration.md) owns the table that turns
+a category into an exit code. `sent_unconfirmed` exits 2, so a script cannot
+read an unknown write as a success. The CLI never retries it; the caller
+decides.
 
 `Stored` requires the relay's canonical id, because a reply, an edit, or a
 delete must address the event the relay stored, and the relay may store a
@@ -261,24 +258,15 @@ never retried.
   two front ends share.
 - No TUI redesign.
 
-## How this lands
+## Status
 
-1. `failure.rs` and the core's reads; `session.rs` drives them and loses the
-   moved code, including the silent metadata fallback. A live run opens the
-   channel list, one channel, and its history.
-2. The writes move; the pump keeps only the translation. A live run sends,
-   replies, reacts, edits, and deletes.
-3. `cli.rs`, the clap tree, the JSON projection, and the exit codes. The
-   canonical flow of the spec runs end to end against the live relay.
-4. The documents that own the facts this design borrowed:
-   [architecture.md](architecture.md) gains the core's rows and the
-   dependency rule, [../docs/configuration.md](../docs/configuration.md)
-   gains the exit codes and the widened code 1, and this document loses what
-   they now own. One product question stays open: [../core.md](../core.md)
-   still sends the automation caller's one-shot reads to `buzz`, while
-   [../docs/browse-collab-cli.md](../docs/browse-collab-cli.md) supersedes
-   that paragraph for this slice. The two contracts should agree before the
-   code lands.
+Landed. `client.rs` owns the operations, `session.rs` translates, `cli.rs`
+projects, and `tests/cli.rs` drives the five commands against a fake relay.
+
+One product question stays open, outside this design:
+[../core.md](../core.md) still sends the automation caller's one-shot reads to
+`buzz`, while [../docs/browse-collab-cli.md](../docs/browse-collab-cli.md)
+supersedes that paragraph for this slice. The two contracts should agree.
 
 ## Verification
 

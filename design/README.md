@@ -7,7 +7,7 @@ an implementation must preserve.
   and the direction the dependencies point.
 - [shared-core.md](shared-core.md) is the core contract: the relay operations
   the TUI and the CLI both perform, what each of them owns on top, and the
-  failure categories and exit codes.
+  failure categories they branch on.
 - [relay-transport.md](relay-transport.md) is the relay contract: the HTTP
   bridge, the WebSocket, NIP-98, the ephemeral kinds, and failure handling.
 - [render-contract.md](render-contract.md) is the row contract: which kinds
