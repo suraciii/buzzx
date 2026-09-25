@@ -191,13 +191,14 @@ They do not include private keys or raw authorization headers.
 
 ## Implementation status
 
-The two gaps recorded here are closed at implementation commit `34eadb0`. A
-failed `messages send` or `messages reply` answers with the write object on
-every path before submission - configuration resolution, argument validation,
-stdin, and reply-target lookup - carrying `status: not_sent`, `event_id:
-null`, the target in `reply_to` for a reply, and the channel in `channel_id`
-when the command names one. Channel-history help names both the selection and
-the output order.
+The two gaps recorded here are closed on `main`
+([PR #8](https://github.com/suraciii/buzzx/pull/8)). A failed `messages send`
+or `messages reply` answers with the write object on every path before
+submission - configuration resolution, argument validation, stdin, and
+reply-target lookup - carrying `status: not_sent`, `event_id: null`, the
+target in `reply_to` for a reply, and the channel in `channel_id` when the
+command names one. Channel-history help names both the selection and the
+output order.
 
 `tests/cli.rs` drives all of it against the fake relay, including the
 categories, the ids, and the shapes; a live relay run covered the success and
