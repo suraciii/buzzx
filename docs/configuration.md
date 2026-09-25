@@ -203,11 +203,14 @@ carry the failure categories of
 | `network` | 2 | a connection failed, or a read lost its answer |
 | `timeout_unknown` | 2 | a write was submitted and its answer was lost; the write is never retried |
 | `forbidden` | 3 | the relay refused the identity with 401 or 403 |
-| `relay_rejected` | 4 | the relay refused a submitted event for any other reason |
+| `relay_rejected` | 4 | another relay failure, including refusal, 5xx, or an unusable response |
 
-A write that is not confirmed exits non-zero and prints `not_sent` or
+For a write that is not confirmed, the contract requires a non-zero exit and
+`not_sent` or
 `sent_unconfirmed` with the category, so a script never reads an unknown write
-as a success. A one-shot command prints one JSON object on stdout for every
+as a success. Known implementation gaps are recorded in
+[browse-collab-cli.md](browse-collab-cli.md#implementation-status).
+A one-shot command prints one JSON object on stdout for every
 failure except a parser usage error, which is code 1 and prints prose to
 stderr. The other subcommands print prose to stderr.
 

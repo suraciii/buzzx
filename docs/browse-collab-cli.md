@@ -78,6 +78,10 @@ channel and creates a top-level message.
 | `messages send` | `--channel`, content | A top-level message write result |
 | `messages reply` | `--event`, content | A reply write result with derived routing |
 
+`messages get --channel` selects the latest N messages (`--limit`, default 20)
+and returns that window in chronological order, oldest first. Help must
+separate which messages are selected from their output order.
+
 All read commands are safe to repeat. They return an empty collection when a
 valid channel has no matching messages. They never turn a permission failure
 into an empty result.
@@ -109,14 +113,32 @@ must remain machine-readable JSON.
 
 ## Write-result semantics
 
-Every write has exactly one of these outcomes:
+Every recognized `messages send` or `messages reply` invocation returns a
+`status`, including failures during configuration resolution, input validation,
+stdin reading, or reply-target lookup before submission. Parser usage errors
+that prevent command dispatch keep the exception in
+[configuration.md](configuration.md#exit-codes).
+
+Each write has exactly one of these outcomes:
 
 - `sent_confirmed`: the relay accepted the signed event and returned its
   canonical event id.
-- `sent_unconfirmed`: the client submitted the write, but the response was
-  lost or timed out before acceptance could be confirmed. The event may exist.
-- `not_sent`: validation, authorization, or a transport failure happened before
-  submission was known to occur.
+- `sent_unconfirmed`: submission may have occurred, but storage cannot be
+  established. This includes a lost response, a timeout after possible
+  submission, a 5xx response, or a 2xx response without a canonical event id.
+- `not_sent`: the request was not submitted, or the relay explicitly confirmed
+  refusal without storage. This includes failures before submission and
+  definitive relay rejections.
+
+`status` is the authority on whether a write may have been stored. `error`
+and the exit code explain why the command failed; they do not replace status.
+For example, HTTP 500 can produce `sent_unconfirmed`, `relay_rejected`, and
+exit 4. That combination does not permit an automatic resend.
+
+A failed write returns `event_id: null` when no canonical id is known, plus
+`error` and `message`. Include channel and reply context when resolved. An
+unresolved reply target belongs in `reply_to`, never in the output
+`event_id` reserved for the newly stored reply. Read failures keep their existing JSON shape.
 
 The CLI never retries `sent_unconfirmed` automatically. A caller may inspect
 the channel or query the returned event id when one is available, then decide
@@ -133,8 +155,9 @@ Failures use a stable `error` category and a non-zero exit code:
 - `network`: connection failed before a write was submitted
 - `timeout_unknown`: write submission may have happened, but confirmation timed
   out; the result must be represented as `sent_unconfirmed`
-- `relay_rejected`: the relay refused a submitted event; represent the write as
-  `not_sent` only when the relay confirms it did not store the event
+- `relay_rejected`: another relay failure, including refusal, a 5xx response,
+  or an unusable response. For writes, use `not_sent` only when non-storage is
+  established; otherwise use `sent_unconfirmed`.
 
 Errors identify the relevant `channel_id` or `event_id` when one is known.
 They do not include private keys or raw authorization headers.
@@ -157,6 +180,22 @@ They do not include private keys or raw authorization headers.
    rejected before submission.
 8. Read commands preserve the event's channel, author, timestamp, thread root,
    and direct-parent identifiers.
+9. Before-submission failures in send/reply, including missing content,
+   malformed ids, startup failure, and unresolved reply targets, return
+   `status: not_sent` with no write submitted. Parser usage errors follow the
+   documented exception.
+10. A 5xx response or 2xx without a canonical id returns `sent_unconfirmed`;
+    neither triggers an automatic resend.
+11. Channel history help describes the latest N messages returned oldest first,
+    and the returned array follows that order.
+
+## Implementation status
+
+At implementation commit `9495a0f`, the collaboration commands exist, but
+before-submission write failures still omit `status`, and history help says
+newest first despite the returned chronological order. Those two gaps require
+implementation changes and verification; this specification does not mark them
+complete.
 
 ## Product boundary after this slice
 

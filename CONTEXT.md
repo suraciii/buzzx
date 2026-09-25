@@ -82,8 +82,8 @@ download is authorized by an event in the query.
 ## buzzx terms
 
 **buzzx**:
-This client. It reads a Buzz relay, renders a channel, and sends events as the
-identity.
+Buzz's extension CLI (`buzz ext`), with a TUI and non-interactive commands.
+Its product boundary is defined in [core.md](core.md).
 
 **core**:
 The relay operations that both the TUI and the CLI perform. One call per
@@ -104,9 +104,8 @@ primary user. The automation caller is secondary. Do not call this person the
 for running a relay rather than a client for a person.
 
 **automation caller**:
-A script or an agent that uses `buzzx` for an operation it cannot do without a
-held session - watching a channel. Anything a one-shot `buzz` invocation can
-answer is not buzzx's job.
+A script or an agent that invokes buzzx commands and consumes their structured
+results. It may perform one-shot collaboration or continuous observation.
 
 **row**:
 One rendered timeline entry. A row is built from one event. Kinds that overlay

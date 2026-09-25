@@ -31,9 +31,9 @@ The existing clients do not do this job:
 
 ## The product
 
-`buzzx` is a terminal client for Buzz users. It gives one human identity full
-channel chat — read, send, reply, react, edit, delete — from a terminal, over
-the relay it is already a member of.
+`buzzx` is Buzz's extension CLI (`buzz ext`). It serves terminal users through
+an interactive TUI and scripts or agents through non-interactive commands.
+Both use the same relay, identity, authorization, and event semantics.
 
 Where the desktop app and the mobile app are Buzz's clients for people with a
 display, `buzzx` is Buzz's client for people in a terminal. Same product,
@@ -54,30 +54,30 @@ exist. Claiming it before then shows a number the client cannot know.
 The session is live. A message that arrives appears without a refresh. A
 message that the user sends appears at once.
 
-The non-interactive subcommands expose the operations that need a held
-session. They print JSON and set an exit code. They share the transport, the
-identity handling, and the event construction with the TUI. `buzzx watch`
-streams live channel events, which the one-shot `buzz` CLI cannot do by
-construction.
+The non-interactive commands print JSON and set an exit code. Operations shared
+with the TUI use the same internal logic; see
+[design/shared-core.md](design/shared-core.md). The first collaboration slice
+is specified in [docs/browse-collab-cli.md](docs/browse-collab-cli.md).
 
-What `buzzx` does *not* re-implement is the one-shot query surface. `buzz`
-already answers `channels list` and `messages search` as single invocations,
-and a second implementation of the same query would only be a second thing to
-drift. Where `buzz` and `buzzx` can both do a job, `buzz` is the canonical
-answer and `buzzx` points at it.
+The standalone `buzz` CLI has limits and its development is outside this
+project's scope. `buzzx` may provide one-shot browsing, collaboration, and
+Agent management capabilities even where `buzz` offers a similar command.
+It reuses Buzz semantics without requiring callers to switch to `buzz`.
+Agent management is a future slice, not part of the current collaboration MVP.
+The extension boundary does not make buzzx a relay or an agent harness.
 
 ## Users
 
 **The terminal user**, primary. A person who already uses Buzz — on the desktop
 app, on a phone — and who spends their working hours in a terminal. Over SSH,
 in a container, on a console. They want the same channels they already have,
-from where they already are. The TUI is the whole product for them.
+from where they already are. They can use the TUI for a conversation or the
+CLI for a single operation.
 
-**The automation caller**, secondary. A script or an agent that must watch a
-channel, or send a message as part of a longer job. For watching, `buzzx
-watch` is the surface. For a one-shot question — list channels, search
-messages, read one thread — `buzz` already answers it, and `buzzx` sends the
-caller there rather than growing a second copy.
+**The automation caller**, secondary. A script or an agent that uses the CLI
+to discover channels, read messages and threads, send or reply, and inspect
+the result. Stable JSON and explicit write outcomes let it compose these
+operations. Continuous observation is a separate `watch` capability.
 
 The terminal user is the one whose workflow gets designed first. `buzzx` is a
 client for people before it is an interface for programs, and when the two
