@@ -85,6 +85,17 @@ download is authorized by an event in the query.
 This client. It reads a Buzz relay, renders a channel, and sends events as the
 identity.
 
+**core**:
+The relay operations that both the TUI and the CLI perform. One call per
+operation, no state between calls, and no rendering, wording, or exit code:
+each of them translates the result into what it shows. `src/client.rs` is the
+core; see [design/shared-core.md](design/shared-core.md).
+
+**CLI**:
+The non-interactive way to drive `buzzx`: one command per run, one JSON value
+on stdout, and an exit code. The TUI is the interactive one. The first CLI
+slice is [docs/browse-collab-cli.md](docs/browse-collab-cli.md).
+
 **terminal user**:
 The person `buzzx` is built for. Someone who already uses Buzz - on the desktop
 app or a phone - and who spends their working hours in a terminal. This is the
