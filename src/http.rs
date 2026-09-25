@@ -77,13 +77,23 @@ fn relay_reason(status: reqwest::StatusCode, body: &str) -> String {
     format!("HTTP {status}: {extracted}")
 }
 
-/// The category an error status carries. 401 and 403 are the identity's
-/// answer; every other refusal is the relay's own, except 404, which means a
-/// reference resolved to nothing.
+/// The category an error status carries on a read. 401 and 403 are the
+/// identity's answer; every other refusal is the relay's own, except 404,
+/// which means a reference resolved to nothing.
 fn status_category(status: reqwest::StatusCode) -> Category {
     match status.as_u16() {
         401 | 403 => Category::Forbidden,
         404 => Category::NotFound,
+        _ => Category::RelayRejected,
+    }
+}
+
+/// The category an error status carries on a write. A write has no
+/// "resolved to nothing": 401 and 403 are the identity's answer, and every
+/// other refusal is the relay's own, a 404 included.
+fn write_category(status: reqwest::StatusCode) -> Category {
+    match status.as_u16() {
+        401 | 403 => Category::Forbidden,
         _ => Category::RelayRejected,
     }
 }
@@ -127,7 +137,7 @@ fn write_response(status: reqwest::StatusCode, body: &str) -> WriteOutcome {
         };
     }
     WriteOutcome::Refused {
-        category: status_category(status),
+        category: write_category(status),
         reason: relay_reason(status, body),
     }
 }
@@ -199,12 +209,21 @@ impl HttpTransport {
         let values: Vec<Value> = serde_json::from_str(&text)
             .map_err(|e| Failure::new(Category::RelayRejected, format!("query response: {e}")))?;
         let mut events = Vec::with_capacity(values.len());
+        let mut unreadable = 0usize;
         for value in values {
             match serde_json::from_value::<Event>(value) {
                 Ok(event) => events.push(event),
                 // One malformed row must not discard the channel's history.
-                Err(_) => continue,
+                Err(_) => unreadable += 1,
             }
+        }
+        // An answer nothing parsed is not an empty read: a caller must not
+        // read a relay that answered garbage as "no such event".
+        if events.is_empty() && unreadable > 0 {
+            return Err(Failure::new(
+                Category::RelayRejected,
+                format!("the relay answered with {unreadable} unreadable event(s)"),
+            ));
         }
         Ok(events)
     }
@@ -349,6 +368,15 @@ mod tests {
         }
         match write_response(reqwest::StatusCode::BAD_REQUEST, r#"{"error":"bad tag"}"#) {
             WriteOutcome::Refused { category, .. } => assert_eq!(category, Category::RelayRejected),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // A write has no "resolved to nothing": a 404 is the relay refusing
+        // the request, not a missing reference.
+        match write_response(reqwest::StatusCode::NOT_FOUND, r#"{"error":"no path"}"#) {
+            WriteOutcome::Refused { category, reason } => {
+                assert_eq!(category, Category::RelayRejected);
+                assert!(reason.contains("no path"), "{reason}");
+            }
             other => panic!("expected Refused, got {other:?}"),
         }
         // A proxy failure may have reached the relay, so the event may exist.

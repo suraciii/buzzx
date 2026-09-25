@@ -96,7 +96,14 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
             limit,
         } => match (channel, event) {
             (Some(channel), None) => read_channel(&client, &channel, limit.as_deref()).await,
-            (None, Some(event)) => read_event(&client, &event).await,
+            (None, Some(event)) => match limit {
+                // A single event has no window to apply a limit to.
+                Some(_) => fail(
+                    &Failure::invalid_input("--limit applies to --channel reads"),
+                    None,
+                ),
+                None => read_event(&client, &event).await,
+            },
             (Some(_), Some(_)) => fail(
                 &Failure::invalid_input("--channel and --event are mutually exclusive"),
                 None,
@@ -259,10 +266,11 @@ fn write_result(outcome: WriteOutcome, channel: Uuid, reply_to: Option<&str>) ->
     print(&write_json(&outcome, channel, reply_to));
     match outcome {
         WriteOutcome::Stored { .. } => 0,
-        WriteOutcome::Refused { category, .. } => exit_code(category),
-        // The caller may inspect the channel and decide whether to retry; the
-        // CLI never retries an unconfirmed write.
-        WriteOutcome::Unknown { .. } => config::EXIT_NETWORK,
+        // Both failures exit by their category, so the code and the `error`
+        // the object prints never disagree.
+        WriteOutcome::Refused { category, .. } | WriteOutcome::Unknown { category, .. } => {
+            exit_code(category)
+        }
     }
 }
 
@@ -336,6 +344,28 @@ fn exit_code(category: Category) -> i32 {
         Category::Network | Category::TimeoutUnknown => config::EXIT_NETWORK,
         Category::Forbidden => config::EXIT_AUTH,
         Category::RelayRejected => config::EXIT_OTHER,
+    }
+}
+
+/// A failure raised before a command ran: the identity or the relay did not
+/// resolve. It prints the same one-object failure as a failed read, so a
+/// caller parses one shape on every path.
+pub fn fail_startup(code: i32, message: &str) -> i32 {
+    let category = startup_category(code);
+    print(&json!({"error": category.as_str(), "message": message}));
+    eprintln!("buzzx: {message}");
+    exit_code(category)
+}
+
+/// The category a startup failure carries. Startup failures are raised
+/// before any relay call: code 1 is bad input, code 3 is the identity, and
+/// the catch-all code 4 is the relay's own bucket. The category decides the
+/// code, so the two cannot disagree.
+fn startup_category(code: i32) -> Category {
+    match code {
+        config::EXIT_USAGE => Category::InvalidInput,
+        config::EXIT_AUTH => Category::Forbidden,
+        _ => Category::RelayRejected,
     }
 }
 
@@ -438,6 +468,32 @@ mod tests {
         assert_eq!(object["status"], json!("sent_unconfirmed"));
         assert_eq!(object["error"], json!("timeout_unknown"));
         assert_eq!(write_result(unknown, channel(), None), config::EXIT_NETWORK);
+
+        // An unconfirmed write exits by its category, so a relay that
+        // answered and failed is not reported as a lost answer.
+        let failed = WriteOutcome::Unknown {
+            category: Category::RelayRejected,
+            reason: "HTTP 500: boom".to_owned(),
+        };
+        let object = write_json(&failed, channel(), None);
+        assert_eq!(object["status"], json!("sent_unconfirmed"));
+        assert_eq!(object["error"], json!("relay_rejected"));
+        assert_eq!(write_result(failed, channel(), None), config::EXIT_OTHER);
+    }
+
+    #[test]
+    fn a_startup_failure_carries_the_category_of_its_code() {
+        assert_eq!(startup_category(config::EXIT_USAGE), Category::InvalidInput);
+        assert_eq!(startup_category(config::EXIT_AUTH), Category::Forbidden);
+        assert_eq!(
+            startup_category(config::EXIT_OTHER),
+            Category::RelayRejected
+        );
+        // The category decides the code the caller sees, so the JSON never
+        // names a category whose exit code is different.
+        for code in [config::EXIT_USAGE, config::EXIT_AUTH, config::EXIT_OTHER] {
+            assert_eq!(exit_code(startup_category(code)), code);
+        }
     }
 
     #[test]

@@ -3,8 +3,10 @@
 //!
 //! The fake relay answers `/query` by applying the filter to the events the
 //! test seeded, and `/events` by recording the body and answering with the
-//! status the test chose. Every event is signed for real, and the NIP-98
-//! header of a write is checked against the body it authorizes.
+//! status the test chose. It admits a request only when its NIP-98 header
+//! covers the method, the URL, and the body, and it stores a write only when
+//! the event verifies, so a client that signs the wrong thing fails here the
+//! way the relay would refuse it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -12,9 +14,11 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
+use base64::Engine;
 use nostr::{Event, EventBuilder, Keys, Kind, Tag};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// The channel every seeded event belongs to.
 const CHANNEL: &str = "7e5faaba-948a-47b5-8ca0-20c6e47953d3";
@@ -30,6 +34,10 @@ enum WriteAnswer {
     Recanonicalized,
     /// Refuse it: nothing was stored.
     Refused,
+    /// Refuse it without naming the identity: nothing was stored either.
+    RefusedBadRequest,
+    /// Fail after receiving the event: storage is not established.
+    ServerError,
     /// Fail after the relay may have accepted it.
     Lost,
 }
@@ -60,12 +68,14 @@ impl FakeRelay {
             drop_reads: 0,
         }));
         let served = Arc::clone(&state);
+        let base = url.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
                         let state = Arc::clone(&served);
-                        thread::spawn(move || serve(stream, &state));
+                        let base = base.clone();
+                        thread::spawn(move || serve(stream, &state, &base));
                     }
                     Err(_) => break,
                 }
@@ -79,6 +89,11 @@ impl FakeRelay {
             .lock()
             .events
             .push(serde_json::to_value(event).unwrap());
+    }
+
+    /// Seed a row the relay holds but the client cannot read as an event.
+    fn seed_unreadable(&self, row: Value) {
+        self.state.lock().events.push(row);
     }
 
     fn answer(&self, answer: WriteAnswer) {
@@ -100,29 +115,39 @@ impl FakeRelay {
     }
 }
 
-fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
+fn serve(stream: TcpStream, state: &Arc<Mutex<State>>, base: &str) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
         return;
     }
-    let path = request_line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .to_owned();
-    let mut length = 0usize;
+    let mut line_parts = request_line.split_whitespace();
+    let method = line_parts.next().unwrap_or("").to_owned();
+    let path = line_parts.next().unwrap_or("").to_owned();
+    let mut headers: Vec<String> = Vec::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
             break;
         }
-        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
-            length = value.trim().parse().unwrap_or(0);
-        }
+        headers.push(line.trim_end().to_owned());
     }
+    let length = headers
+        .iter()
+        .find_map(|line| {
+            line.to_lowercase()
+                .strip_prefix("content-length:")
+                .map(|value| value.trim().parse().unwrap_or(0))
+        })
+        .unwrap_or(0);
     let mut body = vec![0u8; length];
     let _ = reader.read_exact(&mut body);
+    // The relay admits a request only when its NIP-98 header covers this
+    // method, this URL, and this body.
+    if !nip98_covers(&headers, base, &method, &path, &body) {
+        let _ = respond(stream, 401, &json!({"error": "nip-98"}));
+        return;
+    }
     let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let (status, answer) = match path.as_str() {
         "/query" => {
@@ -145,23 +170,74 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
         "/events" => {
             let mut state = state.lock();
             state.writes.push(request.clone());
-            match state.answer {
-                WriteAnswer::Stored => (200, json!({"event_id": request["id"]})),
-                WriteAnswer::Recanonicalized => (200, json!({"event_id": "ab".repeat(32)})),
-                WriteAnswer::Refused => (403, json!({"error": "not a member"})),
-                WriteAnswer::Lost => (502, json!({"error": "upstream unreachable"})),
+            // The relay stores signed events only: an unsigned body, or one
+            // altered on the way, is refused.
+            let signed = serde_json::from_value::<Event>(request)
+                .ok()
+                .filter(|event| event.verify().is_ok())
+                .map(|event| event.id.to_hex());
+            match signed {
+                None => (400, json!({"error": "bad signature"})),
+                Some(id) => match state.answer {
+                    WriteAnswer::Stored => (200, json!({"event_id": id})),
+                    WriteAnswer::Recanonicalized => (200, json!({"event_id": "ab".repeat(32)})),
+                    WriteAnswer::Refused => (403, json!({"error": "not a member"})),
+                    WriteAnswer::RefusedBadRequest => (400, json!({"error": "bad tag"})),
+                    WriteAnswer::ServerError => (500, json!({"error": "storage failed"})),
+                    WriteAnswer::Lost => (502, json!({"error": "upstream unreachable"})),
+                },
             }
         }
         _ => (404, json!({"error": "no such path"})),
     };
+    let _ = respond(stream, status, &answer);
+}
+
+/// Whether the request carries a NIP-98 header that covers this method, this
+/// URL, and this body, signed by the identity it names.
+fn nip98_covers(headers: &[String], base: &str, method: &str, path: &str, body: &[u8]) -> bool {
+    let Some(header) = headers.iter().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_owned())
+    }) else {
+        return false;
+    };
+    let Some(encoded) = header.strip_prefix("Nostr ") else {
+        return false;
+    };
+    let Ok(json) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Ok(event) = serde_json::from_slice::<Event>(&json) else {
+        return false;
+    };
+    if event.kind.as_u16() != 27235 || event.verify().is_err() {
+        return false;
+    }
+    let tag = |name: &str| {
+        event.tags.iter().find_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.first().map(String::as_str) == Some(name))
+                .then(|| parts.get(1).cloned())
+                .flatten()
+        })
+    };
+    let url = format!("{base}{path}");
+    let payload = hex::encode(Sha256::digest(body));
+    tag("u").as_deref() == Some(url.as_str())
+        && tag("method").as_deref() == Some(method)
+        && tag("payload").as_deref() == Some(payload.as_str())
+}
+
+fn respond(mut stream: TcpStream, status: u16, answer: &Value) -> std::io::Result<()> {
     let body = answer.to_string();
     let response = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let mut stream = stream;
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
 }
 
 /// The relay's `POST /query`: apply the one filter to the seeded events, then
@@ -714,7 +790,7 @@ fn an_unreachable_relay_is_network_and_a_write_stores_nothing() {
 fn bad_input_is_rejected_before_the_relay_is_touched() {
     let relay = FakeRelay::start();
     let keys = keys();
-    let cases: [(&[&str], Option<&str>, &str); 5] = [
+    let cases: [(&[&str], Option<&str>, &str); 6] = [
         (
             &[
                 "messages",
@@ -728,6 +804,18 @@ fn bad_input_is_rejected_before_the_relay_is_touched() {
             "invalid_input",
         ),
         (&["messages", "get"], None, "invalid_input"),
+        (
+            &[
+                "messages",
+                "get",
+                "--event",
+                &"cd".repeat(32),
+                "--limit",
+                "5",
+            ],
+            None,
+            "invalid_input",
+        ),
         (
             &["messages", "send", "--channel", CHANNEL],
             None,
@@ -754,6 +842,11 @@ fn bad_input_is_rejected_before_the_relay_is_touched() {
         relay.writes().is_empty(),
         "bad input never reaches the relay"
     );
+    assert_eq!(
+        relay.queries(),
+        0,
+        "bad input is rejected before the first read"
+    );
 }
 
 #[test]
@@ -769,4 +862,98 @@ fn a_malformed_channel_is_bad_input_and_names_the_id() {
     assert_eq!(code, 1, "stderr: {stderr}");
     assert_eq!(json["error"], json!("invalid_input"));
     assert_eq!(json["channel_id"], json!("not-a-uuid"));
+}
+
+#[test]
+fn a_write_refused_without_naming_the_identity_exits_four() {
+    let relay = FakeRelay::start();
+    relay.answer(WriteAnswer::RefusedBadRequest);
+    let keys = keys();
+    let (code, json, stderr) = run(
+        &relay.url,
+        &keys,
+        &[
+            "messages",
+            "send",
+            "--channel",
+            CHANNEL,
+            "--content",
+            "hello",
+        ],
+        None,
+    );
+    assert_eq!(code, 4, "stderr: {stderr}");
+    assert_eq!(json["status"], json!("not_sent"));
+    assert_eq!(json["error"], json!("relay_rejected"));
+    assert_eq!(json["event_id"], Value::Null);
+    assert_eq!(relay.writes().len(), 1, "a refusal is not retried");
+}
+
+#[test]
+fn a_relay_failure_after_a_write_exits_by_its_category() {
+    let relay = FakeRelay::start();
+    relay.answer(WriteAnswer::ServerError);
+    let keys = keys();
+    let (code, json, stderr) = run(
+        &relay.url,
+        &keys,
+        &[
+            "messages",
+            "send",
+            "--channel",
+            CHANNEL,
+            "--content",
+            "hello",
+        ],
+        None,
+    );
+    // The relay answered, and storage is not established: the write is
+    // unconfirmed, and the exit code is the one its category carries, so a
+    // script never reads it as a lost answer.
+    assert_eq!(code, 4, "stderr: {stderr}");
+    assert_eq!(json["status"], json!("sent_unconfirmed"));
+    assert_eq!(json["error"], json!("relay_rejected"));
+    assert_eq!(json["event_id"], Value::Null);
+    assert_eq!(relay.writes().len(), 1, "a failed answer is not retried");
+}
+
+#[test]
+fn an_unreadable_relay_answer_is_not_an_empty_read() {
+    let relay = FakeRelay::start();
+    let keys = keys();
+    let id = "ef".repeat(32);
+    // The relay holds a row for the id, but the row is not an event.
+    relay.seed_unreadable(json!({"id": id, "kind": 9}));
+    let (code, json, stderr) = run(
+        &relay.url,
+        &keys,
+        &["messages", "get", "--event", &id],
+        None,
+    );
+    assert_eq!(code, 4, "stderr: {stderr}");
+    assert_eq!(json["error"], json!("relay_rejected"));
+}
+
+#[test]
+fn a_startup_failure_prints_one_json_error() {
+    // No identity anywhere: the command must fail the way a failed read
+    // does, with one JSON object on stdout rather than prose alone.
+    let output = Command::new(env!("CARGO_BIN_EXE_buzzx"))
+        .args(["channels", "list"])
+        .env("BUZZ_RELAY_URL", "http://127.0.0.1:1")
+        .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
+        .env_remove("BUZZ_PRIVATE_KEY")
+        .env_remove("BUZZ_AUTH_TAG")
+        .output()
+        .expect("the buzzx binary");
+    assert_eq!(output.status.code(), Some(3), "an identity failure is 3");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("one JSON object on stdout");
+    assert_eq!(json["error"], json!("forbidden"));
+    assert!(
+        json["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("identity")),
+        "{json}"
+    );
+    assert!(!output.stderr.is_empty(), "the reason is on stderr too");
 }

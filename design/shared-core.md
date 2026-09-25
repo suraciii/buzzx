@@ -116,8 +116,8 @@ path.
 
 Invariants:
 
-- One validation point, before signing. Empty content, content over 64 KiB,
-  and a malformed id are `invalid_input`, and no event is signed.
+- One validation point, before signing. Empty content and a malformed id are
+  `invalid_input`, and no event is signed.
 - One retry rule, owned by [relay-transport.md](relay-transport.md). A read
   may be retried once after a connect failure or a lost answer, because a
   read changes nothing. A write is retried only while it is certain that the
@@ -175,14 +175,26 @@ The bridge raises what the relay's answer decides:
   502 through a 504 from a proxy - is `timeout_unknown`, and storage is not
   established.
 - A 4xx answer to a write is `relay_rejected` (401 and 403 excepted): the
-  relay refused, and it did not store the event.
+  relay refused, and it did not store the event. A write has no `not_found`:
+  a 404 on a write is the relay's own refusal, not a reference that resolved
+  to nothing.
 - Any other refusal is `relay_rejected`, carrying the relay's own reason. A
   5xx answer to a write leaves storage unestablished.
+- An answer whose rows none parse as events is `relay_rejected`, never an
+  empty collection: a read the client could not read is not a read that
+  found nothing. A row that fails to parse among readable ones is dropped,
+  so one bad row cannot discard a channel's history.
 
 The core raises what a result decides. A single-event read that returns no
 event, and a thread root that does not resolve, are `not_found`. A reply
-target without a channel is `invalid_input`, like empty or oversized content
-and a malformed id.
+target without a channel is `invalid_input`, like empty content and a
+malformed id.
+
+A startup failure - an identity or a relay that does not resolve - is raised
+before any relay call and keeps its configuration code. The CLI prints the
+category that carries that code, so a one-shot command answers with one JSON
+object on every path: 1 is `invalid_input`, 3 is `forbidden`, and 4 is
+`relay_rejected`.
 
 | Outcome | Meaning | CLI status |
 |---|---|---|
@@ -200,9 +212,12 @@ The mapping covers the five commands of the CLI slice. The subcommands that
 already exist keep the codes that document records.
 
 [../docs/configuration.md](../docs/configuration.md) owns the table that turns
-a category into an exit code. `sent_unconfirmed` exits 2, so a script cannot
-read an unknown write as a success. The CLI never retries it; the caller
-decides.
+a category into an exit code. A failure exits by its category, so the code
+and the `error` the object prints cannot disagree: a write whose answer was
+lost is `timeout_unknown` and exits 2, and a relay that answered and failed
+leaves the write `sent_unconfirmed` with `relay_rejected` and exit 4. Either
+way a script cannot read an unknown write as a success. The CLI never retries
+it; the caller decides.
 
 `Stored` requires the relay's canonical id, because a reply, an edit, or a
 delete must address the event the relay stored, and the relay may store a
@@ -226,7 +241,8 @@ never retried.
 - `channels list` returns one object per channel: `channel_id` and `name`.
 - `messages get --channel` returns the newest `--limit` messages (default 20,
   minimum 1) in timeline order, oldest first. An empty channel is an empty
-  array.
+  array. `--limit` belongs to a channel read: with `--event` it is
+  `invalid_input`, like any other contradictory argument.
 - `messages get --event` returns one object, and `messages thread` returns an
   array with the root first. Each is `not_found` when the id resolves to no
   event.
@@ -237,6 +253,9 @@ never retried.
 - A read failure returns one object: `error`, `message`, and the id the
   command was given or derived from (`channel_id`, or `event_id`);
   `channels list` carries neither.
+- A failure raised before the command ran - an identity or a relay that does
+  not resolve - prints the same one-object shape, so every path but the
+  argument parser ends in JSON on stdout.
 - `--content -` reads stdin as bytes and keeps every byte, including a
   trailing newline. An empty stream or invalid UTF-8 is `invalid_input`
   before anything is signed.

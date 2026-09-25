@@ -207,8 +207,9 @@ carry the failure categories of
 
 A write that is not confirmed exits non-zero and prints `not_sent` or
 `sent_unconfirmed` with the category, so a script never reads an unknown write
-as a success. Usage errors from the argument parser are code 1 and print prose
-to stderr; every other failure prints one JSON object on stdout.
+as a success. A one-shot command prints one JSON object on stdout for every
+failure except a parser usage error, which is code 1 and prints prose to
+stderr. The other subcommands print prose to stderr.
 
 The TUI exits 0 on a clean quit and 3 when the relay refused the identity.
 The TUI does not use the other codes: it is interactive, and its failures
