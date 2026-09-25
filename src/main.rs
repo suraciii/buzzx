@@ -134,17 +134,23 @@ fn main() {
             },
             Err(error) => cli::fail_startup(error.code, &error.message),
         },
-        Command::Messages { action } => match resolve_identity(
-            cli.relay.as_deref(),
-            cli.private_key.as_deref(),
-            cli.auth_tag.as_deref(),
-        ) {
-            Ok(resolved) => match block_on(cli::run_messages(&resolved, action)) {
-                Ok(code) => code,
-                Err(error) => cli::fail_startup(config::EXIT_OTHER, &error),
-            },
-            Err(error) => cli::fail_startup(error.code, &error.message),
-        },
+        Command::Messages { action } => {
+            // Read the failure shape before the command consumes its
+            // arguments: a write answers with `status`, a read with its
+            // error object.
+            let shape = cli::failure_shape(&action);
+            match resolve_identity(
+                cli.relay.as_deref(),
+                cli.private_key.as_deref(),
+                cli.auth_tag.as_deref(),
+            ) {
+                Ok(resolved) => match block_on(cli::run_messages(&resolved, action)) {
+                    Ok(code) => code,
+                    Err(error) => cli::fail_message_startup(&shape, config::EXIT_OTHER, &error),
+                },
+                Err(error) => cli::fail_message_startup(&shape, error.code, &error.message),
+            }
+        }
         Command::Login {
             private_key_file,
             private_key_stdin,

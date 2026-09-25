@@ -8,7 +8,6 @@ use buzz_sdk::extract_channel_id;
 use clap::Subcommand;
 use nostr::Event;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use crate::client::{Client, WriteOutcome, channel_id, event_id};
 use crate::config::{self, Resolved};
@@ -34,7 +33,7 @@ pub enum MessagesCommand {
         /// Event id, instead of `--channel`.
         #[arg(long)]
         event: Option<String>,
-        /// How many messages to return, newest first.
+        /// How many of the latest messages to return, oldest first.
         #[arg(long)]
         limit: Option<String>,
     },
@@ -116,57 +115,56 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
         MessagesCommand::Thread { event } => read_thread(&client, event.as_deref()).await,
         MessagesCommand::Send { channel, content } => {
             let channel = match channel.as_deref() {
-                Some(raw) => channel_id(raw),
-                None => Err(Failure::invalid_input("--channel is required")),
-            };
-            let channel = match channel {
-                Ok(channel) => channel,
-                Err(failure) => return fail(&failure, None),
-            };
-            let content = match content_of(content.as_deref()) {
-                Ok(content) => content,
-                Err(failure) => return fail(&failure, Some(("channel_id", &channel.to_string()))),
-            };
-            write_result(
-                client.send_message(channel, &content, None).await,
-                channel,
-                None,
-            )
-        }
-        MessagesCommand::Reply { event, content } => {
-            let target = match event.as_deref() {
-                Some(raw) => event_id(raw),
-                None => Err(Failure::invalid_input("--event is required")),
-            };
-            let target = match target {
-                Ok(target) => target,
-                Err(failure) => {
-                    return fail(
-                        &failure,
-                        Some(("event_id", event.as_deref().unwrap_or_default())),
-                    );
+                Some(raw) => match channel_id(raw) {
+                    Ok(channel) => channel,
+                    Err(failure) => return refuse(&failure, Some(raw), None),
+                },
+                None => {
+                    return refuse(&Failure::invalid_input("--channel is required"), None, None);
                 }
             };
             let content = match content_of(content.as_deref()) {
                 Ok(content) => content,
-                Err(failure) => return fail(&failure, Some(("event_id", &target.to_hex()))),
+                Err(failure) => return refuse(&failure, Some(&channel.to_string()), None),
+            };
+            write_result(
+                client.send_message(channel, &content, None).await,
+                Some(&channel.to_string()),
+                None,
+            )
+        }
+        MessagesCommand::Reply { event, content } => {
+            // The target as the caller gave it: a failed reply carries it in
+            // `reply_to`, never in `event_id`, which names the new event.
+            let given = event.as_deref();
+            let target = match given {
+                Some(raw) => match event_id(raw) {
+                    Ok(target) => target,
+                    Err(failure) => return refuse(&failure, None, given),
+                },
+                None => return refuse(&Failure::invalid_input("--event is required"), None, None),
+            };
+            let target_hex = target.to_hex();
+            let content = match content_of(content.as_deref()) {
+                Ok(content) => content,
+                Err(failure) => return refuse(&failure, None, Some(&target_hex)),
             };
             // One read, then one write: the routing comes from the event the
             // relay holds, not from what the caller remembers about it.
-            let target_hex = target.to_hex();
             let resolved_event = match client.event(target).await {
                 Ok(event) => event,
-                Err(failure) => return fail(&failure, Some(("event_id", &target_hex))),
+                Err(failure) => return refuse(&failure, None, Some(&target_hex)),
             };
             let Some(channel) = extract_channel_id(&resolved_event) else {
-                return fail(
+                return refuse(
                     &Failure::invalid_input(format!("event {target_hex} is not channel-scoped")),
-                    Some(("event_id", &target_hex)),
+                    None,
+                    Some(&target_hex),
                 );
             };
             write_result(
                 client.reply(&resolved_event, &content).await,
-                channel,
+                Some(&channel.to_string()),
                 Some(&target_hex),
             )
         }
@@ -238,8 +236,9 @@ fn event_json(event: &Event) -> Value {
 }
 
 /// One write, as the contract's object. A write that is not confirmed names
-/// its category and reason so a caller never parses prose.
-fn write_json(outcome: &WriteOutcome, channel: Uuid, reply_to: Option<&str>) -> Value {
+/// its category and reason so a caller never parses prose. `channel_id` and
+/// `reply_to` are present when the command has them.
+fn write_json(outcome: &WriteOutcome, channel: Option<&str>, reply_to: Option<&str>) -> Value {
     let (status, event_id, error) = match outcome {
         WriteOutcome::Stored { event_id } => ("sent_confirmed", Some(event_id.clone()), None),
         WriteOutcome::Refused { category, reason } => ("not_sent", None, Some((*category, reason))),
@@ -250,8 +249,10 @@ fn write_json(outcome: &WriteOutcome, channel: Uuid, reply_to: Option<&str>) -> 
     let mut value = json!({
         "status": status,
         "event_id": event_id,
-        "channel_id": channel.to_string(),
     });
+    if let Some(channel) = channel {
+        value["channel_id"] = json!(channel);
+    }
     if let Some(reply_to) = reply_to {
         value["reply_to"] = json!(reply_to);
     }
@@ -262,16 +263,33 @@ fn write_json(outcome: &WriteOutcome, channel: Uuid, reply_to: Option<&str>) -> 
     value
 }
 
-fn write_result(outcome: WriteOutcome, channel: Uuid, reply_to: Option<&str>) -> i32 {
+fn write_result(outcome: WriteOutcome, channel: Option<&str>, reply_to: Option<&str>) -> i32 {
     print(&write_json(&outcome, channel, reply_to));
     match outcome {
         WriteOutcome::Stored { .. } => 0,
         // Both failures exit by their category, so the code and the `error`
-        // the object prints never disagree.
-        WriteOutcome::Refused { category, .. } | WriteOutcome::Unknown { category, .. } => {
+        // the object prints never disagree. The reason is also a diagnostic,
+        // so it reaches a person on stderr.
+        WriteOutcome::Refused { category, reason } | WriteOutcome::Unknown { category, reason } => {
+            eprintln!("buzzx: {reason}");
             exit_code(category)
         }
     }
+}
+
+/// The outcome of a write the command refused before the relay saw it.
+fn refusal(failure: &Failure) -> WriteOutcome {
+    WriteOutcome::Refused {
+        category: failure.category,
+        reason: failure.detail.clone(),
+    }
+}
+
+/// A write the command refused before the relay saw it: its own validation,
+/// its stdin, or the reply target failed. It answers with the write shape, so
+/// a caller reads `status` on every recognized write.
+fn refuse(failure: &Failure, channel: Option<&str>, reply_to: Option<&str>) -> i32 {
+    write_result(refusal(failure), channel, reply_to)
 }
 
 /// The default `--limit`, or the caller's own. Zero and nonsense are bad
@@ -351,10 +369,55 @@ fn exit_code(category: Category) -> i32 {
 /// resolve. It prints the same one-object failure as a failed read, so a
 /// caller parses one shape on every path.
 pub fn fail_startup(code: i32, message: &str) -> i32 {
-    let category = startup_category(code);
-    print(&json!({"error": category.as_str(), "message": message}));
-    eprintln!("buzzx: {message}");
-    exit_code(category)
+    fail(&Failure::new(startup_category(code), message), None)
+}
+
+/// The shape a failed `messages` invocation answers with. The recognized
+/// command decides it, and the ids come from the command line, so the shape
+/// is read before the command consumes its arguments.
+pub struct FailureShape {
+    write: bool,
+    channel: Option<String>,
+    reply_to: Option<String>,
+}
+
+/// What the recognized `messages` command answers with when it fails before
+/// it runs. A write keeps its ids: `--channel` for a send, the target for a
+/// reply.
+pub fn failure_shape(action: &MessagesCommand) -> FailureShape {
+    match action {
+        MessagesCommand::Send { channel, .. } => FailureShape {
+            write: true,
+            channel: channel.clone(),
+            reply_to: None,
+        },
+        MessagesCommand::Reply { event, .. } => FailureShape {
+            write: true,
+            channel: None,
+            reply_to: event.clone(),
+        },
+        MessagesCommand::Get { .. } | MessagesCommand::Thread { .. } => FailureShape {
+            write: false,
+            channel: None,
+            reply_to: None,
+        },
+    }
+}
+
+/// A failure raised before a `messages` command ran. A write answers with the
+/// write shape, so a caller reads `status` on every recognized write; a read
+/// answers with its error object.
+pub fn fail_message_startup(shape: &FailureShape, code: i32, message: &str) -> i32 {
+    let failure = Failure::new(startup_category(code), message);
+    if shape.write {
+        refuse(
+            &failure,
+            shape.channel.as_deref(),
+            shape.reply_to.as_deref(),
+        )
+    } else {
+        fail(&failure, None)
+    }
 }
 
 /// The category a startup failure carries. Startup failures are raised
@@ -373,6 +436,7 @@ fn startup_category(code: i32) -> Category {
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag};
+    use uuid::Uuid;
 
     fn keys() -> Keys {
         Keys::generate()
@@ -438,7 +502,7 @@ mod tests {
         let outcome = WriteOutcome::Stored {
             event_id: "ab".repeat(32),
         };
-        let object = write_json(&outcome, channel(), Some("cd"));
+        let object = write_json(&outcome, Some(&channel().to_string()), Some("cd"));
         assert_eq!(object["status"], json!("sent_confirmed"));
         assert_eq!(object["event_id"], json!("ab".repeat(32)));
         assert_eq!(object["channel_id"], json!(channel().to_string()));
@@ -452,22 +516,28 @@ mod tests {
             category: Category::Forbidden,
             reason: "not a member".to_owned(),
         };
-        let object = write_json(&refused, channel(), None);
+        let object = write_json(&refused, Some(&channel().to_string()), None);
         assert_eq!(object["status"], json!("not_sent"));
         assert_eq!(object["event_id"], Value::Null);
         assert_eq!(object["error"], json!("forbidden"));
         assert_eq!(object["message"], json!("not a member"));
         assert!(object.get("reply_to").is_none());
-        assert_eq!(write_result(refused, channel(), None), config::EXIT_AUTH);
+        assert_eq!(
+            write_result(refused, Some(&channel().to_string()), None),
+            config::EXIT_AUTH
+        );
 
         let unknown = WriteOutcome::Unknown {
             category: Category::TimeoutUnknown,
             reason: "timeout".to_owned(),
         };
-        let object = write_json(&unknown, channel(), None);
+        let object = write_json(&unknown, Some(&channel().to_string()), None);
         assert_eq!(object["status"], json!("sent_unconfirmed"));
         assert_eq!(object["error"], json!("timeout_unknown"));
-        assert_eq!(write_result(unknown, channel(), None), config::EXIT_NETWORK);
+        assert_eq!(
+            write_result(unknown, Some(&channel().to_string()), None),
+            config::EXIT_NETWORK
+        );
 
         // An unconfirmed write exits by its category, so a relay that
         // answered and failed is not reported as a lost answer.
@@ -475,10 +545,59 @@ mod tests {
             category: Category::RelayRejected,
             reason: "HTTP 500: boom".to_owned(),
         };
-        let object = write_json(&failed, channel(), None);
+        let object = write_json(&failed, Some(&channel().to_string()), None);
         assert_eq!(object["status"], json!("sent_unconfirmed"));
         assert_eq!(object["error"], json!("relay_rejected"));
-        assert_eq!(write_result(failed, channel(), None), config::EXIT_OTHER);
+        assert_eq!(
+            write_result(failed, Some(&channel().to_string()), None),
+            config::EXIT_OTHER
+        );
+    }
+
+    #[test]
+    fn a_write_that_never_left_the_client_keeps_the_write_shape() {
+        // A refusal with no channel yet: the object still carries the state
+        // a caller branches on, and no id it does not have.
+        let failure = Failure::invalid_input("--channel is required");
+        let object = write_json(&refusal(&failure), None, None);
+        assert_eq!(object["status"], json!("not_sent"));
+        assert_eq!(object["event_id"], Value::Null);
+        assert_eq!(object["error"], json!("invalid_input"));
+        assert_eq!(object["message"], json!("--channel is required"));
+        assert!(object.get("channel_id").is_none(), "{object}");
+
+        // A failed reply names its target, never the event it did not store.
+        let object = write_json(&refusal(&failure), Some("not-a-uuid"), Some("cd"));
+        assert_eq!(object["status"], json!("not_sent"));
+        assert_eq!(object["reply_to"], json!("cd"));
+        assert_eq!(object["channel_id"], json!("not-a-uuid"));
+        assert_eq!(object["event_id"], Value::Null);
+    }
+
+    #[test]
+    fn the_recognized_command_decides_the_failure_shape() {
+        let send = failure_shape(&MessagesCommand::Send {
+            channel: Some("7e5f".to_owned()),
+            content: None,
+        });
+        assert!(send.write);
+        assert_eq!(send.channel.as_deref(), Some("7e5f"));
+        assert_eq!(send.reply_to, None);
+
+        let reply = failure_shape(&MessagesCommand::Reply {
+            event: Some("cd".repeat(32)),
+            content: None,
+        });
+        assert!(reply.write);
+        assert_eq!(reply.channel, None);
+        assert_eq!(reply.reply_to.as_deref(), Some("cd".repeat(32).as_str()));
+
+        let read = failure_shape(&MessagesCommand::Get {
+            channel: Some("7e5f".to_owned()),
+            event: None,
+            limit: None,
+        });
+        assert!(!read.write);
     }
 
     #[test]
