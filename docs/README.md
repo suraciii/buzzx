@@ -12,6 +12,8 @@ works with it.
   variables, and exit codes.
 - [buzz-revisions.md](buzz-revisions.md) records the pinned Buzz crate
   revision and what it provides.
+- [browse-collab-cli.md](browse-collab-cli.md) specifies the first `buzz ext`
+  browse-and-collaborate flow for terminal users and agents.
 
 The design documents, which state the boundaries and the contracts to
 preserve, live in [../design/](../design/). The product contract, which states
