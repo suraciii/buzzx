@@ -253,9 +253,10 @@ never retried.
 - A read failure returns one object: `error`, `message`, and the id the
   command was given or derived from (`channel_id`, or `event_id`);
   `channels list` carries neither.
-- A failure raised before the command ran - an identity or a relay that does
-  not resolve - prints the same one-object shape, so every path but the
-  argument parser ends in JSON on stdout.
+- A failure raised before the command ran uses the recognized command's
+  result shape: a read error object or a write with `status: not_sent`.
+  The product specification owns this requirement and its implementation status;
+  the argument-parser exception is defined in configuration documentation.
 - `--content -` reads stdin as bytes and keeps every byte, including a
   trailing newline. An empty stream or invalid UTF-8 is `invalid_input`
   before anything is signed.
@@ -282,10 +283,9 @@ never retried.
 Landed. `client.rs` owns the operations, `session.rs` translates, `cli.rs`
 projects, and `tests/cli.rs` drives the five commands against a fake relay.
 
-One product question stays open, outside this design:
-[../core.md](../core.md) still sends the automation caller's one-shot reads to
-`buzz`, while [../docs/browse-collab-cli.md](../docs/browse-collab-cli.md)
-supersedes that paragraph for this slice. The two contracts should agree.
+The product boundary is settled in [../core.md](../core.md). Remaining
+implementation gaps are tracked in the
+[product specification](../docs/browse-collab-cli.md#implementation-status).
 
 ## Verification
 
