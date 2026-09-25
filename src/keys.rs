@@ -25,7 +25,7 @@ pub enum Action {
     PickerNext,
     PickerPrev,
     PickerConfirm,
-    /// `f` or Tab: the next Inbox filter.
+    /// `f`: the next Inbox filter.
     FilterNext,
     /// Scroll the help text by this many lines. At the minimum size the text
     /// is taller than the screen, and the whole of it must stay reachable.
@@ -38,7 +38,7 @@ pub enum Action {
     Bottom,
     PageUp,
     PageDown,
-    /// `i` or Tab: compose a new message.
+    /// `i`: compose a new message.
     ComposeNew,
     /// Enter: compose a reply to the focused row, or a new message when the
     /// timeline is empty.
@@ -121,7 +121,7 @@ pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool, help: boo
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
-        KeyCode::Char('i') | KeyCode::Tab => Action::ComposeNew,
+        KeyCode::Char('i') => Action::ComposeNew,
         KeyCode::Enter => Action::ComposeReply,
         KeyCode::Char('c') => Action::TogglePicker,
         KeyCode::Char('f') => Action::FilterNext,

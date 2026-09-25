@@ -730,7 +730,7 @@ fn help_text(app: &App, mode: LayoutMode) -> String {
         _ => COMPACT_HELP.to_owned(),
     };
     text.push_str(&format!(
-        "\nfilter: {} (f or Tab cycles All, Unread, For you)\n",
+        "\nfilter: {} (f cycles All, Unread, For you)\n",
         app.filter.name()
     ));
     if let Some(entry) = app.focused_entry() {
@@ -751,9 +751,9 @@ const WIDE_HELP: &str = "\
 navigation
   j k up down    switch conversation   1-9 jump
   c              conversation picker   Esc close
-  f Tab          Inbox filter
+  f              Inbox filter
   g G PgUp PgDn  move the focused row
-  i Tab          compose new           Enter  reply
+  i              compose new           Enter  reply
   r e d          react / edit / delete
   ?              help                  q quit
 composer
@@ -767,7 +767,7 @@ signals
 const COMPACT_HELP: &str = "\
 i compose  Enter send
 j k move row  c picker
-f Tab filter  Enter reply
+f filter  Enter reply
 r react  e edit  d delete
 1-9 jump  g G start/end
 PgUp/PgDn move ten rows

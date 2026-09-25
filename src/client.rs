@@ -41,9 +41,6 @@ const H_TAG: &str = "h";
 const DM_TYPE: &str = "dm";
 /// How many channel ids one membership or metadata query carries.
 const CHANNEL_QUERY_LIMIT: u64 = 500;
-/// How far back a read-state lookup reaches. The protocol has no expiry; this
-/// is a window on history, not on the identity's own markers.
-const READ_STATE_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 /// How many marker slots one answer may carry.
 const READ_STATE_LIMIT: u64 = 500;
 /// The second tag every read-state slot carries.
@@ -327,14 +324,12 @@ impl Client {
     /// coverage rather than reading absence into it.
     pub async fn read_state(&self) -> Result<read_state::ReadState, Failure> {
         let me = self.keys.public_key().to_hex();
-        let since = crate::sub::now_secs().saturating_sub(READ_STATE_WINDOW_SECS);
         let events = self
             .transport
             .query(&json!({
                 "kinds": [content::READ_STATE_KIND],
                 "authors": [me],
                 "#t": [READ_STATE_TAG],
-                "since": since,
                 "limit": READ_STATE_LIMIT,
             }))
             .await?;

@@ -136,6 +136,12 @@ pub enum SessionCommand {
     LoadChannels,
     /// Fetch history, subscribe live, and backfill overlays for one channel.
     OpenChannel(Uuid),
+    /// Extend the selected conversation's auxiliary feed with a live row
+    /// whose id was not part of the HTTP history answer.
+    AddAux {
+        channel: Uuid,
+        ids: Vec<String>,
+    },
     /// Resolve display names for authors the UI is missing.
     LoadProfiles(Vec<String>),
     /// Fetch what these conversations hold at or after their read frontier, or
@@ -257,6 +263,9 @@ async fn run_command_pump(
         match command {
             SessionCommand::LoadChannels => {
                 load_channels(&client, &subs, &events).await;
+            }
+            SessionCommand::AddAux { channel, ids } => {
+                let _ = subs.send(SubControl::AuxAdd { channel, ids }).await;
             }
             SessionCommand::OpenChannel(channel) => {
                 open_channel(&client, channel, &subs, &events).await;

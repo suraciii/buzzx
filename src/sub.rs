@@ -35,6 +35,9 @@ pub enum SubControl {
     /// The overlay feed for one channel's loaded ids, replacing the previous
     /// feed for that channel.
     Aux { channel: Uuid, ids: Vec<String> },
+    /// Add ids to one channel's aux feed without dropping ids learned from a
+    /// live timeline event.
+    AuxAdd { channel: Uuid, ids: Vec<String> },
     /// The typing feed for every channel the identity belongs to, replacing
     /// the previous feed. The list is per-connection state: an empty list
     /// closes the feed.
@@ -300,6 +303,19 @@ impl PumpState {
             self.sub_ids.insert(sub_id, SubKind::Aux(channel));
         }
     }
+    async fn add_aux(&mut self, conn: &mut NostrWsConnection, channel: Uuid, ids: Vec<String>) {
+        let mut merged = self.aux_ids.get(&channel).cloned().unwrap_or_default();
+        let mut changed = false;
+        for id in ids {
+            if !merged.contains(&id) {
+                merged.push(id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.subscribe_aux(conn, channel, merged).await;
+        }
+    }
 
     /// Replace the typing feed with one covering exactly these channels. Every
     /// subscription is replaced rather than added to: the channel list is the
@@ -429,6 +445,7 @@ async fn apply_control(conn: &mut NostrWsConnection, state: &mut PumpState, cont
     match control {
         SubControl::Timeline(channel) => state.subscribe_timeline(conn, channel).await,
         SubControl::Aux { channel, ids } => state.subscribe_aux(conn, channel, ids).await,
+        SubControl::AuxAdd { channel, ids } => state.add_aux(conn, channel, ids).await,
         SubControl::Typing(channels) => state.subscribe_typing(conn, channels).await,
         SubControl::Inbox(channels) => state.subscribe_inbox(conn, channels).await,
     }

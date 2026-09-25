@@ -475,6 +475,14 @@ pub struct App {
     /// Conversations waiting for a marker answer before their catch-up can be
     /// asked for.
     catch_up_pending: Vec<Uuid>,
+    /// Inbox feeds that closed before their roster entry existed, or while
+    /// their current entry was loaded. A reconnect clears these stale
+    /// connection failures.
+    inbox_failed: HashSet<Uuid>,
+    /// Conversations whose history request failed. A later catch-up or seed
+    /// cannot make the selected timeline complete; a successful History event
+    /// clears the failure.
+    history_failed: HashSet<Uuid>,
     pub conn: ConnState,
     pub status: String,
     pub composer: Composer,
@@ -511,6 +519,8 @@ impl App {
             shortcuts: Vec::new(),
             picker: None,
             roster_complete: false,
+            inbox_failed: HashSet::new(),
+            history_failed: HashSet::new(),
             marker_complete: false,
             marker_read: false,
             read_failed: None,
@@ -645,6 +655,7 @@ impl App {
     pub fn apply(&mut self, event: ChatEvent, now: u64) {
         match event {
             ChatEvent::Connected => {
+                self.inbox_failed.clear();
                 self.conn = ConnState::Connected;
                 self.status = format!("connected {}", self.relay_label);
                 if !self.opened_once {
@@ -709,6 +720,7 @@ impl App {
                 self.apply_inbox_timeline(channel, event);
             }
             ChatEvent::InboxClosed { channel, reason } => {
+                self.inbox_failed.insert(channel);
                 self.mark_failed(channel);
                 self.status = format!("inbox feed closed: {reason}");
             }
@@ -810,6 +822,9 @@ impl App {
         for entry in &mut self.channels {
             let waiting = self.catch_up_pending.contains(&entry.id);
             let remote = contexts.get(&entry.id.to_string()).copied();
+            if self.inbox_failed.contains(&entry.id) || self.history_failed.contains(&entry.id) {
+                continue;
+            }
             match remote.filter(|_| complete) {
                 None if !complete => {
                     // A failed lookup is unknown, not absence: no seed stands
@@ -853,11 +868,13 @@ impl App {
     /// it has already been shown, is not unread work.
     fn apply_catch_up(&mut self, channel: Uuid, events: Vec<nostr::Event>, complete: bool) {
         let me = self.me.clone();
+        let feed_failed =
+            self.inbox_failed.contains(&channel) || self.history_failed.contains(&channel);
         let Some(entry) = self.entry_mut(&channel) else {
             return;
         };
         entry.read.known = true;
-        entry.read.coverage = if complete {
+        entry.read.coverage = if complete && !feed_failed {
             Coverage::Complete
         } else {
             Coverage::Failed
@@ -887,15 +904,22 @@ impl App {
     /// message is the baseline, not unread work. The seed is local and is
     /// never uploaded as proof of reading.
     fn apply_seed(&mut self, channel: Uuid, latest: Option<nostr::Event>, complete: bool) {
+        let feed_failed =
+            self.inbox_failed.contains(&channel) || self.history_failed.contains(&channel);
+        let marker_unknown = !self.marker_read || !self.marker_complete;
         let Some(entry) = self.entry_mut(&channel) else {
             return;
         };
-        entry.read.coverage = if complete {
+        entry.read.coverage = if feed_failed {
+            Coverage::Failed
+        } else if marker_unknown {
+            Coverage::UnknownMarker
+        } else if complete {
             Coverage::Complete
         } else {
             Coverage::Failed
         };
-        if !complete {
+        if !complete || feed_failed || marker_unknown {
             return;
         }
         entry.read.known = true;
@@ -1143,7 +1167,11 @@ impl App {
                     // waits for a marker answer before its catch-up is asked
                     // for.
                     self.catch_up_pending.push(item.id);
-                    let coverage = if self.marker_read {
+                    let coverage = if self.inbox_failed.contains(&item.id)
+                        || self.history_failed.contains(&item.id)
+                    {
+                        Coverage::Failed
+                    } else if self.marker_read {
                         if self.marker_complete {
                             Coverage::Pending
                         } else {
@@ -1480,6 +1508,7 @@ impl App {
     }
 
     fn load_history(&mut self, channel: Uuid, events: Vec<nostr::Event>, now: u64) {
+        let history_retry = self.history_failed.remove(&channel);
         if let Some(ids) = self.aux_seen.remove(&channel) {
             for id in ids {
                 self.seen_aux.remove(&id);
@@ -1535,6 +1564,23 @@ impl App {
             .collect();
         entry.rows = rows;
         entry.loading = false;
+        if history_retry {
+            // The timeline is repaired, but an earlier failed load may have
+            // consumed the outstanding Inbox catch-up. Request it again only
+            // after the marker lookup has completed.
+            let coverage = if !self.marker_read || !self.marker_complete {
+                Coverage::UnknownMarker
+            } else {
+                Coverage::Pending
+            };
+            if let Some(entry) = self.entry_mut(&channel) {
+                entry.read.coverage = coverage;
+            }
+            if !self.catch_up_pending.contains(&channel) {
+                self.catch_up_pending.push(channel);
+            }
+            self.request_catch_up();
+        }
         // History can land after the indicator it belongs to - the channel is
         // opened over HTTP while the live feed is already running - so the
         // fetched rows end indicators on the same rule as live ones.
@@ -1549,6 +1595,7 @@ impl App {
         let _ = now;
     }
     fn history_failed(&mut self, channel: Uuid, reason: String) {
+        self.history_failed.insert(channel);
         if let Some(entry) = self.entry_mut(&channel) {
             entry.loading = false;
             entry.read.coverage = Coverage::Failed;
@@ -1567,21 +1614,33 @@ impl App {
         let author = author_name(&profiles, &me, &author_key);
         let known_author = profiles.contains_key(&author_key) || author_key == me;
         let selected = self.selected_entry().map(|e| e.id) == Some(channel);
-        let was_at_bottom = selected && self.at_bottom();
+        if !selected {
+            // A previously opened conversation may still have a timeline feed
+            // while its Inbox feed is also active. Treat that stale feed as
+            // Inbox input so it cannot mark the event seen before unread logic
+            // receives it.
+            self.apply_inbox_timeline(channel, event);
+            return;
+        }
+        let was_at_bottom = self.at_bottom();
         let Some(entry) = self.entry_mut(&channel) else {
             return;
         };
-        if entry.seen.contains(&id) || entry.rows.iter().any(|r| r.event_id == id) {
+        if entry.seen.contains(&id) || entry.rows.iter().any(|row| row.event_id == id) {
             return;
         }
         entry.live_ids.insert(id.clone());
-        entry.seen.insert(id);
+        entry.seen.insert(id.clone());
         let mut row = content::row_from_event(&event, &me);
         row.author = author;
         entry.rows.push(row);
         if was_at_bottom {
             self.focus = entry.rows.len() - 1;
         }
+        self.outbox.push(SessionCommand::AddAux {
+            channel,
+            ids: vec![id],
+        });
         // The message itself is the end of that author's indicator: typing is
         // a pre-message signal, so it never outlives the message it announced.
         // A replay of an older message leaves a live claim standing.
@@ -2589,6 +2648,50 @@ mod tests {
         );
         app.apply(ChatEvent::Timeline { channel: id, event }, 1);
         assert_eq!(app.channels[0].rows.len(), 1);
+    }
+    #[test]
+    fn a_stale_timeline_feed_cannot_hide_inbox_unread() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2)];
+        app.stub_roster();
+        let id = app.channels[1].id;
+        let event = message_event(&keys(), id, "arrived elsewhere", 10);
+
+        app.apply(
+            ChatEvent::Timeline {
+                channel: id,
+                event: event.clone(),
+            },
+            10,
+        );
+        assert!(app.channels[1].rows.is_empty());
+        assert_eq!(app.channels[1].read.unread.len(), 1);
+
+        app.apply(ChatEvent::InboxTimeline { channel: id, event }, 10);
+        assert_eq!(
+            app.channels[1].read.unread.len(),
+            1,
+            "the matching Inbox event must be a harmless duplicate"
+        );
+    }
+
+    #[test]
+    fn a_live_timeline_row_extends_the_aux_feed() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        let id = app.channels[0].id;
+        let event = message_event(&keys(), id, "needs overlays", 10);
+        let event_id = event.id.to_hex();
+
+        app.apply(ChatEvent::Timeline { channel: id, event }, 10);
+
+        assert!(take_commands(&mut app).into_iter().any(|command| {
+            matches!(
+                command,
+                SessionCommand::AddAux { channel, ids }
+                    if channel == id && ids == vec![event_id.clone()]
+            )
+        }));
     }
 
     #[test]
@@ -4401,6 +4504,7 @@ mod tests {
         app.focus = 0;
         app.handle(Action::TogglePicker, 20);
         assert!(app.picker.is_some());
+
         app.handle(Action::Dismiss, 20);
         assert_eq!(app.marker(&app.channels[0]), Marker::None);
         assert!(published(&mut app).is_some());
@@ -4444,6 +4548,154 @@ mod tests {
         assert_eq!(app.channels[0].read.coverage, Coverage::Failed);
         assert_eq!(app.marker(&app.channels[0]), Marker::Unknown);
         assert!(app.status.contains("history failed"));
+        app.apply(
+            ChatEvent::Seed {
+                channel: id,
+                latest: Some(message_event(&keys(), id, "baseline", 10)),
+                complete: true,
+            },
+            10,
+        );
+        assert_eq!(
+            app.channels[0].read.coverage,
+            Coverage::Failed,
+            "a successful seed cannot replace a failed history load"
+        );
+        app.apply(
+            ChatEvent::CatchUp {
+                channel: id,
+                events: Vec::new(),
+                complete: true,
+            },
+            10,
+        );
+        assert_eq!(app.channels[0].read.coverage, Coverage::Failed);
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![message_event(&keys(), id, "now loaded", 20)],
+            },
+            20,
+        );
+        assert_eq!(app.channels[0].read.coverage, Coverage::Pending);
+        let requests = take_commands(&mut app);
+        assert!(requests.into_iter().any(|command| {
+            matches!(command, SessionCommand::CatchUp(batch)
+                if batch.iter().any(|request| request.channel() == id))
+        }));
+        app.apply(
+            ChatEvent::Seed {
+                channel: id,
+                latest: Some(message_event(&keys(), id, "now loaded", 20)),
+                complete: true,
+            },
+            20,
+        );
+        assert_eq!(app.channels[0].read.coverage, Coverage::Complete);
+    }
+    #[test]
+    fn a_history_retry_does_not_seed_through_an_unknown_marker() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        let id = app.channels[0].id;
+        app.apply(
+            ChatEvent::ReadState {
+                contexts: HashMap::new(),
+                complete: false,
+            },
+            0,
+        );
+        app.apply(
+            ChatEvent::HistoryFailed {
+                channel: id,
+                reason: "relay refused".into(),
+            },
+            0,
+        );
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![message_event(&keys(), id, "loaded", 20)],
+            },
+            20,
+        );
+        assert_eq!(app.channels[0].read.coverage, Coverage::UnknownMarker);
+        assert!(
+            !take_commands(&mut app)
+                .into_iter()
+                .any(|command| matches!(command, SessionCommand::CatchUp(_)))
+        );
+
+        app.apply(
+            ChatEvent::Seed {
+                channel: id,
+                latest: Some(message_event(&keys(), id, "must wait", 20)),
+                complete: true,
+            },
+            20,
+        );
+        assert_eq!(app.channels[0].read.coverage, Coverage::UnknownMarker);
+
+        app.apply(
+            ChatEvent::ReadState {
+                contexts: HashMap::new(),
+                complete: true,
+            },
+            20,
+        );
+        assert_eq!(app.channels[0].read.coverage, Coverage::Pending);
+        assert!(take_commands(&mut app).into_iter().any(|command| {
+            matches!(command, SessionCommand::CatchUp(batch)
+                if batch.iter().any(|request| request.channel() == id))
+        }));
+        app.apply(
+            ChatEvent::Seed {
+                channel: id,
+                latest: Some(message_event(&keys(), id, "baseline", 20)),
+                complete: true,
+            },
+            20,
+        );
+        assert_eq!(app.channels[0].read.coverage, Coverage::Complete);
+    }
+    #[test]
+    fn an_inbox_failure_before_the_roster_stays_unknown() {
+        let mut app = app();
+        let id = channel_info(1).id;
+        app.apply(ChatEvent::Connected, 0);
+        let _ = take_commands(&mut app);
+        app.apply(
+            ChatEvent::InboxClosed {
+                channel: id,
+                reason: "refused".into(),
+            },
+            0,
+        );
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+
+        assert_eq!(app.channels[0].read.coverage, Coverage::Failed);
+        app.apply(
+            ChatEvent::ReadState {
+                contexts: HashMap::new(),
+                complete: true,
+            },
+            0,
+        );
+        assert_eq!(app.channels[0].read.coverage, Coverage::Failed);
+        assert_eq!(app.marker(&app.channels[0]), Marker::Unknown);
+        app.apply(
+            ChatEvent::Seed {
+                channel: id,
+                latest: Some(message_event(&keys(), id, "baseline", 10)),
+                complete: true,
+            },
+            10,
+        );
+        assert_eq!(
+            app.channels[0].read.coverage,
+            Coverage::Failed,
+            "a seed cannot turn a closed Inbox feed into a complete answer"
+        );
     }
 
     #[test]
