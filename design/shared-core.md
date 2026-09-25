@@ -247,9 +247,12 @@ never retried.
   array with the root first. Each is `not_found` when the id resolves to no
   event.
 - A write returns one object: `status` always; `event_id` when the write was
-  confirmed and `null` otherwise; `channel_id`; and `reply_to` for
-  `messages reply`. When the status is not `sent_confirmed`, the object also
-  carries `error` and `message`.
+  confirmed and `null` otherwise; `channel_id` when the command has a channel;
+  and `reply_to` for `messages reply`, stored or not. When the status is not
+  `sent_confirmed`, the object also carries `error` and `message`, and the
+  reason goes to stderr too. A write the command refused before submission
+  keeps this shape with the status `not_sent`, and the ids it was given:
+  `--channel` for a send, the target for a reply.
 - A read failure returns one object: `error`, `message`, and the id the
   command was given or derived from (`channel_id`, or `event_id`);
   `channels list` carries neither.
@@ -262,7 +265,8 @@ never retried.
   before anything is signed.
 - `messages reply --event <id>` is one read and one write: resolve the
   target, derive the routing, sign once. A target that does not resolve is
-  `not_found` with the target in `event_id`.
+  `not_found` with the write `not_sent` and the target in `reply_to`, never in
+  `event_id`, which names the reply that was not stored.
 
 ## Out of scope
 

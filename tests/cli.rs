@@ -364,6 +364,17 @@ fn help_lists_the_five_commands() {
     for command in ["channels", "messages", "tui", "watch"] {
         assert!(text.contains(command), "help names {command}: {text}");
     }
+    // Acceptance criterion 11: the history help separates which messages are
+    // selected from the order they come back in.
+    let output = Command::new(env!("CARGO_BIN_EXE_buzzx"))
+        .args(["messages", "get", "--help"])
+        .output()
+        .expect("the buzzx binary");
+    let get_help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        get_help.contains("latest") && get_help.contains("oldest first"),
+        "the history help names the selection and the order: {get_help}"
+    );
     // A usage error is bad input: code 1, not clap's own 2, and it stays on
     // stderr as prose.
     for args in [vec!["--nope"], vec!["messages", "nope"], vec!["channels"]] {
@@ -672,7 +683,7 @@ fn messages_reply_derives_the_channel_and_the_thread_from_the_target() {
 }
 
 #[test]
-fn a_reply_to_an_unresolved_event_is_not_found_and_writes_nothing() {
+fn a_reply_to_an_unresolved_event_is_not_sent_and_writes_nothing() {
     let relay = FakeRelay::start();
     let keys = keys();
     let missing = "ef".repeat(32);
@@ -683,8 +694,13 @@ fn a_reply_to_an_unresolved_event_is_not_found_and_writes_nothing() {
         None,
     );
     assert_eq!(code, 1, "stderr: {stderr}");
+    // The reply was never submitted, and the event id of the reply that was
+    // not stored stays null: the target is reply context, not a new event.
+    assert_eq!(json["status"], json!("not_sent"));
+    assert_eq!(json["event_id"], Value::Null);
+    assert_eq!(json["reply_to"], json!(missing));
     assert_eq!(json["error"], json!("not_found"));
-    assert_eq!(json["event_id"], json!(missing));
+    assert!(json.get("channel_id").is_none(), "{json}");
     assert!(relay.writes().is_empty(), "nothing was signed or sent");
 }
 
@@ -788,11 +804,20 @@ fn an_unreachable_relay_is_network_and_a_write_stores_nothing() {
 
 #[test]
 fn bad_input_is_rejected_before_the_relay_is_touched() {
+    /// One rejected invocation: its arguments, optional stdin, the category
+    /// it must name, and the `status` a recognized write must carry.
+    struct Rejected<'a> {
+        args: &'a [&'a str],
+        stdin: Option<&'a str>,
+        category: &'a str,
+        status: Option<&'a str>,
+    }
+
     let relay = FakeRelay::start();
     let keys = keys();
-    let cases: [(&[&str], Option<&str>, &str); 6] = [
-        (
-            &[
+    let cases = [
+        Rejected {
+            args: &[
                 "messages",
                 "get",
                 "--channel",
@@ -800,12 +825,18 @@ fn bad_input_is_rejected_before_the_relay_is_touched() {
                 "--event",
                 &"cd".repeat(32),
             ],
-            None,
-            "invalid_input",
-        ),
-        (&["messages", "get"], None, "invalid_input"),
-        (
-            &[
+            stdin: None,
+            category: "invalid_input",
+            status: None,
+        },
+        Rejected {
+            args: &["messages", "get"],
+            stdin: None,
+            category: "invalid_input",
+            status: None,
+        },
+        Rejected {
+            args: &[
                 "messages",
                 "get",
                 "--event",
@@ -813,30 +844,66 @@ fn bad_input_is_rejected_before_the_relay_is_touched() {
                 "--limit",
                 "5",
             ],
-            None,
-            "invalid_input",
-        ),
-        (
-            &["messages", "send", "--channel", CHANNEL],
-            None,
-            "invalid_input",
-        ),
-        (
-            &["messages", "send", "--channel", "nope", "--content", "hi"],
-            None,
-            "invalid_input",
-        ),
-        (
-            &["messages", "send", "--channel", CHANNEL, "--content", "-"],
-            Some(""),
-            "invalid_input",
-        ),
+            stdin: None,
+            category: "invalid_input",
+            status: None,
+        },
+        Rejected {
+            args: &["messages", "send", "--channel", CHANNEL],
+            stdin: None,
+            category: "invalid_input",
+            status: Some("not_sent"),
+        },
+        Rejected {
+            args: &["messages", "send", "--content", "hi"],
+            stdin: None,
+            category: "invalid_input",
+            status: Some("not_sent"),
+        },
+        Rejected {
+            args: &["messages", "send", "--channel", "nope", "--content", "hi"],
+            stdin: None,
+            category: "invalid_input",
+            status: Some("not_sent"),
+        },
+        Rejected {
+            args: &["messages", "send", "--channel", CHANNEL, "--content", "-"],
+            stdin: Some(""),
+            category: "invalid_input",
+            status: Some("not_sent"),
+        },
+        Rejected {
+            args: &["messages", "reply", "--content", "hi"],
+            stdin: None,
+            category: "invalid_input",
+            status: Some("not_sent"),
+        },
+        Rejected {
+            args: &["messages", "reply", "--event", "nope", "--content", "hi"],
+            stdin: None,
+            category: "invalid_input",
+            status: Some("not_sent"),
+        },
+        Rejected {
+            args: &["messages", "reply", "--event", &"cd".repeat(32)],
+            stdin: None,
+            category: "invalid_input",
+            status: Some("not_sent"),
+        },
     ];
-    for (args, stdin, category) in cases {
-        let (code, json, stderr) = run(&relay.url, &keys, args, stdin);
+    for case in cases {
+        let (code, json, stderr) = run(&relay.url, &keys, case.args, case.stdin);
+        let args = case.args;
         assert_eq!(code, 1, "{args:?} stderr: {stderr}");
-        assert_eq!(json["error"], json!(category), "{args:?}: {json}");
+        assert_eq!(json["error"], json!(case.category), "{args:?}: {json}");
         assert!(json["message"].is_string(), "{args:?}: {json}");
+        match case.status {
+            Some(status) => {
+                assert_eq!(json["status"], json!(status), "{args:?}: {json}");
+                assert_eq!(json["event_id"], Value::Null, "{args:?}: {json}");
+            }
+            None => assert!(json.get("status").is_none(), "{args:?}: {json}"),
+        }
     }
     assert!(
         relay.writes().is_empty(),
@@ -847,6 +914,56 @@ fn bad_input_is_rejected_before_the_relay_is_touched() {
         0,
         "bad input is rejected before the first read"
     );
+}
+
+#[test]
+fn a_failed_write_names_the_ids_the_caller_gave() {
+    let relay = FakeRelay::start();
+    let keys = keys();
+    // A send that never resolved its channel names the one it was given.
+    let (_, json, _) = run(
+        &relay.url,
+        &keys,
+        &["messages", "send", "--channel", "nope", "--content", "hi"],
+        None,
+    );
+    assert_eq!(json["channel_id"], json!("nope"));
+    assert!(json.get("reply_to").is_none(), "{json}");
+
+    // A reply names its target in `reply_to` and never in `event_id`.
+    let target = "ab".repeat(32);
+    let (_, json, _) = run(
+        &relay.url,
+        &keys,
+        &["messages", "reply", "--event", &target, "--content", "hi"],
+        None,
+    );
+    assert_eq!(json["reply_to"], json!(target));
+    assert_eq!(json["event_id"], Value::Null);
+    assert!(json.get("channel_id").is_none(), "{json}");
+
+    // A reply to an event that is not channel-scoped resolves but cannot
+    // route: it is bad input, with the target still named.
+    let relay_event = event(&Keys::generate(), 1, Vec::new(), "", 10);
+    relay.seed(&relay_event);
+    let (code, json, _) = run(
+        &relay.url,
+        &keys,
+        &[
+            "messages",
+            "reply",
+            "--event",
+            &relay_event.id.to_hex(),
+            "--content",
+            "hi",
+        ],
+        None,
+    );
+    assert_eq!(code, 1);
+    assert_eq!(json["status"], json!("not_sent"));
+    assert_eq!(json["error"], json!("invalid_input"));
+    assert_eq!(json["reply_to"], json!(relay_event.id.to_hex()));
+    assert!(relay.writes().is_empty(), "nothing was signed or sent");
 }
 
 #[test]
@@ -936,24 +1053,68 @@ fn an_unreadable_relay_answer_is_not_an_empty_read() {
 
 #[test]
 fn a_startup_failure_prints_one_json_error() {
-    // No identity anywhere: the command must fail the way a failed read
-    // does, with one JSON object on stdout rather than prose alone.
-    let output = Command::new(env!("CARGO_BIN_EXE_buzzx"))
-        .args(["channels", "list"])
-        .env("BUZZ_RELAY_URL", "http://127.0.0.1:1")
-        .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
-        .env_remove("BUZZ_PRIVATE_KEY")
-        .env_remove("BUZZ_AUTH_TAG")
-        .output()
-        .expect("the buzzx binary");
-    assert_eq!(output.status.code(), Some(3), "an identity failure is 3");
-    let json: Value = serde_json::from_slice(&output.stdout).expect("one JSON object on stdout");
-    assert_eq!(json["error"], json!("forbidden"));
-    assert!(
-        json["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("identity")),
-        "{json}"
-    );
-    assert!(!output.stderr.is_empty(), "the reason is on stderr too");
+    // No identity anywhere: a read answers with its error object, and a
+    // recognized write keeps the write shape, so a caller reads `status` on
+    // every path but the parser's.
+    for (args, channel, reply_to) in [
+        (vec!["channels", "list"], None, None),
+        (vec!["messages", "get", "--channel", CHANNEL], None, None),
+        (
+            vec!["messages", "send", "--channel", CHANNEL, "--content", "hi"],
+            Some(CHANNEL),
+            None,
+        ),
+        (
+            vec![
+                "messages",
+                "reply",
+                "--event",
+                &"cd".repeat(32),
+                "--content",
+                "hi",
+            ],
+            None,
+            Some("cd".repeat(32)),
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_buzzx"))
+            .args(&args)
+            .env("BUZZ_RELAY_URL", "http://127.0.0.1:1")
+            .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
+            .env_remove("BUZZ_PRIVATE_KEY")
+            .env_remove("BUZZ_AUTH_TAG")
+            .output()
+            .expect("the buzzx binary");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{args:?}: an identity failure is 3"
+        );
+        let json: Value =
+            serde_json::from_slice(&output.stdout).expect("one JSON object on stdout");
+        assert_eq!(json["error"], json!("forbidden"), "{args:?}: {json}");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("identity")),
+            "{args:?}: {json}"
+        );
+        assert!(
+            !output.stderr.is_empty(),
+            "{args:?}: the reason is on stderr"
+        );
+        match (&channel, &reply_to) {
+            (None, None) => assert!(json.get("status").is_none(), "{args:?}: {json}"),
+            _ => {
+                assert_eq!(json["status"], json!("not_sent"), "{args:?}: {json}");
+                assert_eq!(json["event_id"], Value::Null, "{args:?}: {json}");
+                if let Some(channel) = channel {
+                    assert_eq!(json["channel_id"], json!(channel), "{args:?}: {json}");
+                }
+                if let Some(reply_to) = &reply_to {
+                    assert_eq!(json["reply_to"], json!(reply_to), "{args:?}: {json}");
+                }
+            }
+        }
+    }
 }
