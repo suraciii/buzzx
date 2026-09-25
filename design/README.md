@@ -17,6 +17,9 @@ an implementation must preserve.
   settled it.
 - [decisions/0005-shared-core.md](decisions/0005-shared-core.md) is why the
   core is a module of the one binary, and not a crate or a trait.
+- [decisions/0006-read-state.md](decisions/0006-read-state.md) records why
+  read state uses per-client encrypted slots and what that choice leaves
+  unknown or local.
 
 The product contract, which states why `buzzx` exists, lives in
 [../core.md](../core.md). The term definitions live in

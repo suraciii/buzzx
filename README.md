@@ -55,6 +55,8 @@ The desktop app makes the same split. `buzzx` mirrors it rather than
 inventing a new contract.
 
 ## Documents
+- [design/decisions/0006-read-state.md](design/decisions/0006-read-state.md) -
+  why the TUI uses encrypted per-client read-state markers and their limits.
 
 - [Core](core.md) - what buzzx is, its users, and its boundaries.
 - [design/architecture.md](design/architecture.md) - layers, ownership, and the module split.

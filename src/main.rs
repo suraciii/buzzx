@@ -12,6 +12,7 @@ mod http;
 mod keys;
 mod layout;
 mod login;
+mod read_state;
 mod session;
 mod sub;
 mod ui;
@@ -364,7 +365,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             if let Some(key) = key {
                 let action = match app.mode {
                     app::Mode::Navigation => {
-                        keys::map_navigation(key, layout, app.picker.is_some())
+                        keys::map_navigation(key, layout, app.picker.is_some(), app.help)
                     }
                     app::Mode::Composer => keys::map_composer(key),
                 };

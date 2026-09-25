@@ -15,51 +15,53 @@ The relay defaults to `http://localhost:3000`. See
 ## Layout
 
 The client picks its layout from the terminal's size and never infers a device
-type. The session is the same state in every layout: the selected channel, the
-focused row, the draft, and the reply target survive a resize.
+type. The selected conversation, focused row, draft, and reply target survive
+a resize. Read progress is tracked per conversation and shared through the
+relay; the limits are described below.
 
 | Terminal | Layout | What it shows |
 | --- | --- | --- |
-| 80 by 12 or larger | Wide | The three regions below. |
-| 40 to 79 columns, 10 rows or larger | Narrow | One column: the timeline. `c` opens the channel list over the screen, and the composer keeps a box at the bottom. |
-| 24 to 39 columns, 6 rows or larger | Minimal | One column with compact rows and a one-line composer while composing. |
-| Smaller than 24 columns or 6 rows | Too small | A size message. Resize the terminal and the session continues. |
+| At least 80 columns and 12 rows | Wide | Inbox sidebar, timeline, and composer. |
+| At least 40 columns and 10 rows, but not wide | Narrow | One-column timeline; `c` opens the full-screen conversation picker. |
+| At least 24 columns and 6 rows, but neither above | Minimal | One-column timeline with compact rows and a one-line composer while composing. |
+| Below 24 columns or 6 rows | Too small | A size message. Resize the terminal; the session continues. |
 
 ### Wide
 
 ```text diagram
-+-----------+---------------------------------------------+
-| channels  | #general                                     |
-|           |                                             |
-| 1 general | alice         2m                            |
-| 2 random  | the migration is on main                    |
-| 3 eng     |                                             |
-|           | bob           1m                            |
-|           | @tyler can you look                         |
-|           | +2 reactions                                |
-|           | Agent A typing...                           |
-|           +---------------------------------------------+
-|           | reply to bob - enter to send, esc to clear  |
+| Inbox: All | #general                                     |
+| Channels   |                                             |
+| 1 @ 2 eng  | alice         2m                            |
+| 2 * 3 rnd  | the migration is on main                    |
+| DMs        |                                             |
+| 3 * 1 Sam  | bob           1m                            |
+|            | @tyler can you look                         |
+|            | +2 reactions                                |
+|            | Agent A typing...                            |
+|            +---------------------------------------------+
+|            | reply to bob - enter to send, esc to clear  |
 +-----------+---------------------------------------------+
  status: connected https://relay.example | sent | mode: nav | ?=help
 ```
 
-The channel list on the left shows the identity's channels, the active one
-highlighted. The timeline on the right shows the selected channel's messages.
-The composer at the bottom is the text input. The typing line appears above the
+The wide sidebar lists conversations under `Channels` and `DMs`. The selected
+conversation's timeline is on the right. The typing line appears above the
 composer while another identity is composing, and takes no row when nobody is.
-The diagram's `...` is the client's single-character ellipsis; the line itself
-is documented under [typing indicators](#typing-indicators).
+The row signals and filtering rules are below.
+
+In narrow and minimal modes the list is not shown beside the timeline. Press
+`c` to open the full-screen conversation picker. It uses the same Inbox
+sections and filters as the wide sidebar; `j` and `k` move its cursor, `Enter`
+opens the conversation, and `Esc` closes it. Filtering is available at every
+layout size. Message bodies wrap to the available width. Long words and URLs
+break at character boundaries; the message itself is unchanged.
 
 ### Narrow and minimal
 
-One column: the timeline, with the channel and the connection state on the top
-line and the composer and a status hint at the bottom. The channel list is an
-overlay, because a single column has no room for a permanent sidebar. `c`
-opens it full screen, `j` and `k` move, `Enter` opens the channel, and `Esc`
-closes it. In minimal the rows carry compact markers, and the composer is one
-line while it is being used, so the timeline keeps as many rows as the
-terminal has.
+One column: the timeline, with the conversation and connection state on the top
+line and the composer and a status hint at the bottom. The full-screen
+conversation picker is opened with `c`. In minimal mode the timeline uses
+compact rows and the composer takes one line while it is being used.
 
 A message body wraps to the column's width. Long words and URLs break at
 character boundaries; the message itself is unchanged.
@@ -77,23 +79,78 @@ unrelated message at the bottom of the timeline. When a channel opens, focus is
 the newest loaded row. If there are no rows, `Enter` opens a new-message
 composer without a reply target.
 
-Unread state is not shown in the first phase. It needs a read marker on the
-relay (kind 30078) plus the events observed while a channel is not selected,
-and neither exists yet. When both do, each row gains a count.
+## Inbox and read state
+
+The conversation list has `Channels` and `DMs` sections. Hidden DMs and
+archived channels are excluded when the relay's visibility and metadata queries
+are available. DM labels use their own non-generic name; generic DM names use
+the other participants' display names, falling back to shortened public keys.
+At most three names are printed, followed by `+N more`. New messages do not
+reorder existing rows. (Sources: `src/client.rs::ChannelInfo::listed`,
+`channels_from`; `src/app.rs::merge_channels`, `label`, `refresh_views`.)
+
+Each conversation reserves five columns for its signal before the label is
+clipped. The unread count is the number of unread message candidates, not a
+total-history count. The `…` typing marker follows the label and can appear
+with any signal. (Sources: `src/ui.rs::conversation_item`;
+`src/app.rs::marker`, `unread_count`, `label`.)
+
+| Signal | Meaning |
+| --- | --- |
+| `● 3` | Three unread messages, with no unread direct mention |
+| `@ 2` | Two unread messages, at least one of which mentions this identity |
+| `?` | Read state or catch-up is unknown |
+| `Read` | A picker row retained after it stops matching the active filter |
+| `…` | Someone is typing; this is independent of the unread signal |
+| two spaces | No signal |
+
+
+Unread messages clear only after the newest loaded message has actually been
+presented: its conversation is selected, history is loaded, focus is at the
+bottom, and neither the picker nor help covers the timeline. Opening a
+conversation or reading older history does not clear unread messages. When a
+saved marker is available, the next session reads it from the relay and
+continues from that frontier. A conversation with no marker starts at the
+newest message as a local baseline; the seed is never uploaded. A message in
+the frontier's own second stays unread until shown. (Sources:
+`src/app.rs::note_presented`, `apply_seed`, `ReadTrack::unread_at`;
+`src/client.rs::CatchUp::Newest`, `read_state`; `src/session.rs::load_read_state`.)
+
+Read state is a NIP-44 encrypted kind 30078 event with one replaceable `buzzx`
+slot. Its `d` value is `read-state:` plus the hex encoding of the first 16
+bytes of SHA-256 over the public-key hex string; the `t` tag is `read-state`.
+The payload written by this client has `v: 1`, `client_id: "buzzx"`, and
+`contexts` keyed by channel UUID, each value a Unix-second frontier. The parser
+also accepts a missing `v` as version 1 and requires a `client_id` string of
+at most 64 bytes. Before writing, the client reads the identity's slots and
+merges each context by its maximum. (Sources: `src/read_state.rs::slot`,
+`builder`, `parse`; `src/client.rs::read_state`, `publish_read_state`.)
+
+A failed marker lookup or unreadable slot is unknown, not read. Failed or
+truncated catch-up is also unknown; the list can show `?` or `Checking...`
+frontier stays advanced and the list shows `Read here; not synced (<reason>)`.
+This note remains until a later publish succeeds. The session keeps working
+and does not retry the failed publish automatically; a later read advance can
+issue a new publish. If the failed read was not stored, a later session can
+show those messages as unread again. (Sources: `src/app.rs::apply_read_state`,
+`apply_catch_up`, `inbox_footer`; `src/session.rs::load_read_state`,
+`publish_read`, `run_command_pump`.)
+
 
 ## Keys
 
 Keys have two modes. The timeline starts in navigation mode.
 
 In navigation mode:
-
-- `j` or the down arrow moves to the next item. In the wide layout that is the
-  next channel, whose list is on screen; in the one-column layouts it is the
-  next row of the timeline.
-- `k` or the up arrow moves to the previous item, the same way.
-- `1` through `9` jump to the channel with that number, in every layout.
-- `c` opens the channel picker. `Enter` opens the highlighted channel and
-  `Esc` closes the picker.
+- `j` or the down arrow moves to the next conversation in the wide layout. In
+  one-column layouts, it moves through timeline rows; use `c` to open the
+  conversation picker there.
+- `k` or the up arrow moves to the previous conversation or timeline row.
+- `1` through `9` jump to the conversation with that session shortcut.
+- `f` cycles `All`, `Unread`, and `For you`. In the picker, `f` or Tab cycles
+  the same filters.
+- `c` opens the conversation picker. `j` and `k` move within it, `Enter` opens
+  the highlighted conversation, and `Esc` closes it.
 - `g` or `Home` focuses the oldest loaded message.
 - `G` or `End` focuses the newest message.
 - `PgUp` and `PgDn` move ten rows.
@@ -175,23 +232,17 @@ the last write, and the mode. The connection state is one of `connecting`,
 `connected`, `reconnecting`, or `failed`.
 
 ## What `buzzx tui` does not do
+This TUI does not render images, video, or audio. Attachments show as filename
+lines. It does not join huddles or search; voice needs the relay's separate
+audio WebSocket, and search is available through the `buzz` CLI. It does not
+configure the relay, manage members, or moderate. DMs appear as first-class
+rows in the Inbox. Read progress is shared through encrypted relay markers,
+but a marker lookup or publish can fail; see
+[Inbox and read state](#inbox-and-read-state) for the limits.
 
-- It does not render images, video, or audio. Attachments show as filename
-  lines.
-- It does not join huddles. Voice needs the relay's separate audio WebSocket,
-  which is out of scope for the first phase.
-- It does not search. Use the `buzz` CLI.
-- It does not show DMs in the channel list. DMs arrive and render, but the
-  list is channel membership. Since DMs do not appear there, an unread DM is
-  not visible until you switch to it, which is one of the things a
-  later phase fixes.
-- It does not configure the relay, manage members, or moderate. Use the
-  `buzz` CLI or the desktop app.
-- It does not show your own read state on other devices. Read
-  markers sync through the relay; the display of that state is a later phase.
-- It does not publish a typing indicator of its own. The line above the
-  composer shows other identities composing; publishing your own is a later
-  phase, and the event contract on the relay already accepts it.
+The TUI does not publish a typing indicator of its own. It shows other
+identities composing; publishing your own is a later phase, and the event
+contract on the relay already accepts it.
 
 ## Terminal requirements
 

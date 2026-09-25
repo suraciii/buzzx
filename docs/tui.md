@@ -8,10 +8,11 @@ console from using the chat client. The product needs to preserve the core
 conversation loop on narrow screens without squeezing the desktop layout into
 unreadable columns.
 
-This specification defines the TUI capability, including its responsive presentation. It changes the presentation layout only. Channel membership,
-timeline rows, focus behavior, composer semantics, relay transport, and event
-contracts remain the same as described in [tui-use.md](tui-use.md) and
-[render-contract.md](../design/render-contract.md).
+This specification defines the TUI capability, including its responsive
+presentation. It also documents the Inbox surfaces and interactions that the
+layout must preserve: conversation rows, unread filters, read-state signals,
+picker behavior, and the conversation on screen. Relay read-state behavior is
+defined in [shared-core.md](../design/shared-core.md#inbox-and-read-state).
 
 ## Layout modes
 
@@ -20,42 +21,50 @@ does not infer a device type.
 
 | Terminal size | Mode | Behavior |
 | --- | --- | --- |
-| 80 columns × 12 rows or larger | Wide | Existing three regions: channels, timeline, composer. |
-| 40–79 columns and 10 rows or larger | Narrow | One-column timeline. `c` opens a full-screen channel picker. Composer stays at the bottom. |
-| 24–39 columns and 6–9 rows | Minimal | One-column timeline with compact author, age, reaction, and status text. |
+| 80 columns × 12 rows or larger | Wide | Inbox sidebar, timeline, and composer. |
+| 40–79 columns and 10 rows or larger | Narrow | One-column timeline. `c` opens the full-screen conversation picker. Composer stays at the bottom. |
+| 24–39 columns and 6 rows or larger | Minimal | One-column timeline with compact rows and a one-line composer while composing. |
 | Below 24 columns or 6 rows | Too small | Start the session and show a size message. Keep listening for resize; switch modes automatically when the terminal is large enough. |
 
 Narrow and minimal modes never introduce horizontal scrolling. Message bodies
 wrap to the available width. Long words and URLs may break at character
 boundaries; the underlying message remains unchanged.
 
-The top line contains the current channel and the connection state. The middle
-area contains the focused timeline row and its surrounding rows. The composer
-and a one-line status/mode hint remain at the bottom. When another identity is
-composing in the open channel, one typing line sits between the timeline and
-the composer in every mode and takes no row when nobody is. Descriptions,
-connection details, and help are overlays so they do not consume permanent
-space.
+The wide layout shows `Inbox: <filter>` in the sidebar and the selected
+conversation on the right. The sidebar groups rows under `Channels` and
+`DMs`; one-column modes keep the Inbox in the picker opened with `c`. The
+picker and wide list use `All`, `Unread`, and `For you`. A row signal carries
+the unread message count when known (`● 3`, `@ 2`), `?` for unknown, `Read` for
+a picker row retained after it stops matching, or no signal. Its signal cell
+is reserved before the label is clipped; typing adds `…` after the label.
+Read-state details and limits are in
+[shared-core.md](../design/shared-core.md#inbox-and-read-state).
 
 ## Unified keys
 
-The action meaning is identical in every layout. Letter keys are the primary
-path for phone terminals; desktop keys remain aliases.
+The action meaning depends on the layout and on whether the picker or help is
+open. `j` and `k` move between conversations in the wide Inbox and between
+timeline rows in one-column modes. In one-column modes, `c` opens the
+conversation picker. `f` cycles `All`, `Unread`, and `For you` in navigation
+mode; `f` or Tab cycles them in the picker. Help opens with `?`; while open,
+`j`/`k`, `PgUp`/`PgDn`, and `g`/`G` scroll it, and `Esc` or `?` closes it.
+Help displays the full selected conversation label.
 
 | Action | Primary key | Alias |
 | --- | --- | --- |
 | Move focus / select item | `j` / `k` | Up / Down |
-| Open channel picker | `c` | `1`–`9` jump directly |
+| Open conversation picker | `c` | — |
+| Change Inbox filter | `f` | Tab in picker |
 | Compose a new message | `i` | Tab |
-| Reply to the focused row | `r` | Enter in navigation mode |
+| Reply to the focused row | Enter | — |
 | Send | Enter in composer | — |
 | Insert newline | Alt+Enter in composer | — |
 | Back / close overlay | Esc | — |
-| Help | `?` | — |
-| Quit | `q` | — |
 
-`j/k` always mean previous/next item in a selectable list. Numeric shortcuts
-remain direct channel jumps when the channel exists.
+`j` and `k` move the picker cursor. `Enter` opens the highlighted
+conversation and `Esc` closes the picker. Other navigation keys include
+`g`/`Home` for the oldest loaded message, `G`/`End` for the newest,
+`PgUp`/`PgDn` for ten rows, and `r`, `e`, and `d` for react, edit, and delete.
 
 ## Mode isolation
 
@@ -75,13 +84,12 @@ message with the appropriate layout without restarting the session.
 
 ## Acceptance criteria
 
-1. A 40×10 terminal can select a channel, scroll, send a new message, reply,
-   and quit.
+1. A 40×10 terminal can select a conversation, scroll, send, reply, and quit.
 2. A terminal below 24×6 starts, displays the size message, and recovers
    automatically after resize; focus, draft, and reply target survive.
 3. A 79-column terminal has no horizontal overflow and wraps long URLs and
    words.
-4. An 80×12 terminal keeps the current wide layout and existing key behavior.
+4. An 80×12 terminal keeps the wide layout and existing key behavior.
 5. A phone keyboard without Tab, function keys, or mouse can complete the core
    flow with `j/k`, `c`, `i`, `r`, Enter, Esc, and `q`.
 6. Help opens and closes in every mode without changing focus or draft text.

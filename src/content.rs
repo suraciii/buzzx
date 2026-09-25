@@ -8,9 +8,22 @@ use nostr::{Event, Tag};
 pub const TIMELINE_KINDS: [u32; 5] = [9, 40002, 40008, 45001, 45003];
 /// Kinds that never render their own row; they overlay a target row.
 pub const AUX_KINDS: [u32; 4] = [7, 40003, 5, 9005];
+/// An edit of an existing message.
+pub const EDIT_KIND: u32 = 40003;
+/// NIP-09 deletion. The Buzz-native tombstone is [`TOMBSTONE_KIND`].
+pub const DELETE_KIND: u32 = 5;
+/// Buzz's own deletion tombstone.
+pub const TOMBSTONE_KIND: u32 = 9005;
 /// Membership roster (kind 39002) and channel metadata (kind 39000).
 pub const MEMBERSHIP_KIND: u32 = 39002;
 pub const CHANNEL_METADATA_KIND: u32 = 39000;
+/// The relay's replaceable snapshot of the DMs one identity hid (kind 30622).
+/// The newest event carries the whole hidden set; a DM it does not name is not
+/// hidden.
+pub const DM_VISIBILITY_KIND: u32 = 30622;
+/// The identity's own read state (kind 30078, NIP-78). Parameterized
+/// replaceable, keyed by a `read-state:` slot, NIP-44 encrypted to itself.
+pub const READ_STATE_KIND: u32 = 30078;
 pub const PROFILE_KIND: u32 = 0;
 /// The ephemeral typing indicator. The relay never stores it; it exists only
 /// on the live connection, so a missed one is a missed one.
@@ -132,14 +145,30 @@ pub fn imeta_filename(parts: &[String]) -> Option<String> {
     })
 }
 
-/// Build a row from a timeline event. `me` is the identity's own pubkey, used
-/// for the mention highlight only.
-pub fn row_from_event(event: &Event, me: &str) -> Row {
-    let mentions_me = event.tags.iter().any(|t| {
+/// Whether an event directly mentions one identity: a `p` tag that names it.
+/// Broadcast alone does not qualify.
+pub fn mentions_me(event: &Event, me: &str) -> bool {
+    event.tags.iter().any(|t| {
         let parts = tag_strings(t);
         parts.first().map(String::as_str) == Some("p")
             && parts.get(1).map(String::as_str) == Some(me)
-    });
+    })
+}
+
+/// The kinds an Inbox watch carries: the timeline, plus the two overlays that
+/// change unread work. An edit can change a message's mention classification;
+/// a deletion removes the message an unread candidate points at. Reactions are
+/// excluded: one never creates or changes a candidate.
+pub fn inbox_kinds() -> Vec<u32> {
+    let mut kinds = TIMELINE_KINDS.to_vec();
+    kinds.extend([EDIT_KIND, DELETE_KIND, TOMBSTONE_KIND]);
+    kinds
+}
+
+/// Build a row from a timeline event. `me` is the identity's own pubkey, used
+/// for the mention highlight only.
+pub fn row_from_event(event: &Event, me: &str) -> Row {
+    let mentions_me = mentions_me(event, me);
     let attachment = event.tags.iter().find_map(|t| {
         let parts = tag_strings(t);
         (parts.first().map(String::as_str) == Some("imeta"))

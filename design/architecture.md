@@ -66,20 +66,19 @@ against a fake relay in `tests/cli.rs` and against the live relay by hand.
 |---|---|---|
 | `main.rs` | Raw mode, alternate screen, the loop that polls input and drains events | Hold relay state or decide behavior |
 | `config.rs` | Identity, relay URL, and auth-tag resolution; the config file | Open a connection or sign |
-| `app.rs` | Channel list, per-channel rows, composer, selection, scroll offset, quit | Sign, send, parse frames, or draw |
-| `ui.rs` | Layout and drawing | Mutate `app.rs` state or call the network |
+| `app.rs` | Conversations, rows, composer, filters, unread tracking, read frontiers, selection, and quit | Sign, send, parse frames, or draw |
+| `ui.rs` | Layout and rendering of the Inbox, timeline, picker, and help | Mutate `app.rs` state or call the network |
 | `keys.rs` | `KeyEvent` to `Action` | Read terminal state |
 | `layout.rs` | The layout mode a terminal size selects | Hold state, draw, or read `App` |
-| `content.rs` | `Event` to `Row`, thread refs, reaction merging | Fetch or send |
+| `content.rs` | `Event` to `Row`, thread refs, reaction merging, and event kind lists | Fetch or send |
 | `login.rs` | The login flow: key input from flag, file, stdin, environment, or wizard; one-shot relay verification; the atomic config write | Hold session state, render the TUI, or stay in the process after the config is written |
 | `cli.rs` | The one-shot commands: argument validation, the JSON projection, stdin content, exit codes | Hold state between calls, or decide the relay protocol |
-| `client.rs` | The relay operations both front ends perform: channel list, timeline, thread, one event, profiles, and every write | Render, word a message, or choose an exit code |
+| `client.rs` | Relay queries, read-state slot encryption and merge, channel list, timeline, thread, profiles, and writes | Render, word a message, or choose an exit code |
+| `read_state.rs` | Read-state slot id, encrypted payload construction, and merge of owned slots | Query or publish events |
 | `failure.rs` | The failure categories both front ends branch on | Format a user-facing message |
-| `session.rs` | The live session: subscriptions, reconnect, and the translation from one core call to one `ChatEvent` | Render, decide UI state, or sign |
+| `session.rs` | The live session: subscriptions, reconnect, catch-up, delayed read publication, and translation into `ChatEvent`s | Render, decide UI state, or sign |
 | `http.rs` | NIP-98 signing, request building, response parsing, write classification | Hold UI state |
-| `sub.rs` | The WebSocket connection, REQ lifecycle, frame decoding | Decide what a row means |
-
-## Session: two one-way channels
+| `sub.rs` | The WebSocket connection, REQ lifecycle, frame decoding, and live Inbox feeds | Decide what a row means |
 
 `session.rs` owns two channels:
 
@@ -96,10 +95,10 @@ against a fake relay in `tests/cli.rs` and against the live relay by hand.
    |  ChatEvent  <-------------------     |  WebSocket pump (tokio task)
    |                                     |     - Connected / Disconnected
    |                                     |     - Channels / History / Profiles
-   |                                     |     - Timeline / Overlay / Typing
-   |                                     |     - ChannelGone / TypingClosed
-   |                                     |     - WriteOk / WriteFailed
-   |                                     |     - WriteUncertain / Status
+   |                                     |     - Timeline / InboxTimeline / Overlay / Typing
+   |                                     |     - ReadState / CatchUp / Seed / ReadPublished
+   |                                     |     - ChannelGone / InboxClosed / TypingClosed
+   |                                     |     - WriteOk / WriteFailed / WriteUncertain / Status
 ```
 
 The UI never awaits a network call. It sends a command and keeps rendering.
@@ -111,18 +110,16 @@ render loop runs on a fixed tick, drains every queued `ChatEvent`, and draws
 once. If the relay is slow, the interface still responds to keys.
 
 ## State
+`app.rs` holds one `ChannelEntry` per listed conversation, with its timeline
+rows and a `ReadTrack` containing its frontier, unread message candidates, and
+coverage state. `Filter` derives the `All`, `Unread`, and `For you` views; the
+picker retains its cursor conversation if a filter change would hide it. The
+wide UI groups rows into `Channels` and `DMs`. `●` and `@` rows carry unread
+candidate counts in the reserved signal cell; `?` means unknown coverage. The
+`Read` marker applies to a picker row retained after it stops matching.
 
-`app.rs` holds one `ChannelEntry` per channel:
-
-```text literal
-ChannelEntry {
-    id:       channel UUID
-    name:     display name
-    rows:     Vec<Row>        // append only; overlays mutate rows in place
-    unread:   usize           // present, not yet populated; read markers are a later phase
-}
-```
-
+The read-state event and its limits are described in
+[shared-core.md#inbox-and-read-state](shared-core.md#inbox-and-read-state).
 `rows` is append-only in the common case. An edit replaces the content of the
 row with the target id. A deletion removes the row. A reaction adds or
 decrements a counter on the row with the target id. There is no reorder: the

@@ -175,15 +175,23 @@ impl HttpTransport {
     /// wrapped in an array, the same REQ shape the bridge accepts. A read
     /// changes nothing, so a lost answer is repeated once.
     pub async fn query(&self, filter: &Value) -> Result<Vec<Event>, Failure> {
-        match self.query_once(filter).await {
-            Err(failure) if failure.category == Category::Network => self.query_once(filter).await,
+        self.query_all(std::slice::from_ref(filter)).await
+    }
+
+    /// Several filters in one REQ. The bridge answers with their union, and the
+    /// relay accepts a bounded number of filters per REQ, so a caller that
+    /// needs one filter per conversation batches them. A read changes nothing,
+    /// so a lost answer is repeated once.
+    pub async fn query_all(&self, filters: &[Value]) -> Result<Vec<Event>, Failure> {
+        match self.query_once(filters).await {
+            Err(failure) if failure.category == Category::Network => self.query_once(filters).await,
             result => result,
         }
     }
 
-    async fn query_once(&self, filter: &Value) -> Result<Vec<Event>, Failure> {
+    async fn query_once(&self, filters: &[Value]) -> Result<Vec<Event>, Failure> {
         let url = format!("{}/query", self.base);
-        let body = serde_json::to_vec(&serde_json::json!([filter]))
+        let body = serde_json::to_vec(&serde_json::json!(filters))
             .map_err(|e| Failure::invalid_input(format!("query body: {e}")))?;
         let header = self.auth_header("POST", &url, Some(&body));
         let mut request = self

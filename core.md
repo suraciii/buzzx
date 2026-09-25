@@ -46,10 +46,11 @@ operating a relay.
 2. A timeline on the right. It shows the messages of the selected channel.
 3. A composer at the bottom. It sends, replies, reacts, edits, and deletes.
 
-The channel list carries no unread count in the first phase. Unread is
-computed from a read marker (kind 30078) plus events observed while a channel
-is not selected, and that combination is not available before both halves
-exist. Claiming it before then shows a number the client cannot know.
+The channel list groups channels and direct conversations and carries a
+lightweight Inbox view. Unread is computed from a read marker (kind 30078)
+plus events observed while a conversation is not selected. If either lookup
+is incomplete, the client shows an unknown/checking state rather than claiming
+that everything is read.
 
 The session is live. A message that arrives appears without a refresh. A
 message that the user sends appears at once.
@@ -140,5 +141,5 @@ A typing indicator (kind 20002) from another identity appears as one line
 between the timeline and the composer, and expires on its own. buzzx consumes
 indicators; it does not publish its own yet.
 
-Presence, read markers, and media come later. They are real, and they are not
-required to prove the product.
+Presence and media come later. Read markers and the Inbox are part of the
+current terminal workflow; they track reading, not task completion.
