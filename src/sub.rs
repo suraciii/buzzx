@@ -235,20 +235,27 @@ impl PumpState {
         let _ = conn.send_raw(&frame).await;
     }
 
-    async fn subscribe_timeline(&mut self, conn: &mut NostrWsConnection, channel: Uuid) {
+    /// Claim this connection's timeline subscription for `channel`: the REQ it
+    /// still owes, or None when this connection has already asked for it.
+    /// Subscription ids belong to a connection, so what this returns depends on
+    /// which connection is asking.
+    fn claim_timeline(&mut self, channel: Uuid, since: u64) -> Option<(String, serde_json::Value)> {
         let sub_id = format!("t:{channel}");
         if self.sub_ids.contains_key(&sub_id) {
-            return;
+            return None;
         }
-        Self::req_raw(
-            conn,
-            &sub_id,
-            &timeline_filter(&channel, now_secs().saturating_sub(LIVE_OVERLAP_SECS)),
-        )
-        .await;
-        self.sub_ids.insert(sub_id, SubKind::Timeline(channel));
+        self.sub_ids
+            .insert(sub_id.clone(), SubKind::Timeline(channel));
         if !self.timeline_channels.contains(&channel) {
             self.timeline_channels.push(channel);
+        }
+        Some((sub_id, timeline_filter(&channel, since)))
+    }
+
+    async fn subscribe_timeline(&mut self, conn: &mut NostrWsConnection, channel: Uuid) {
+        let since = now_secs().saturating_sub(LIVE_OVERLAP_SECS);
+        if let Some((sub_id, filter)) = self.claim_timeline(channel, since) {
+            Self::req_raw(conn, &sub_id, &filter).await;
         }
     }
 
@@ -299,17 +306,28 @@ impl PumpState {
         }
     }
 
-    async fn resubscribe_all(&mut self, conn: &mut NostrWsConnection) {
-        // A subscription id belongs to the socket that opened it. The socket
-        // that just died took all of them with it, so this connection starts
-        // from nothing: the REQs below are first REQs, not duplicates, and
-        // `subscribe_timeline`'s own guard no longer sees an id that no live
-        // subscription has.
+    /// The timeline REQs a new connection owes: every channel the session
+    /// retained, each with a window of its own. A subscription id belongs to
+    /// the socket that opened it - the socket that died took every id with it -
+    /// so this connection starts from nothing and asks again. That includes the
+    /// channel on screen, whose silence a reader notices first, and it holds
+    /// whatever the feed's state was when the socket went down.
+    fn plan_resubscribe(&mut self, since: u64) -> Vec<(String, serde_json::Value)> {
         self.sub_ids.clear();
         let channels = self.timeline_channels.clone();
-        for channel in channels {
-            self.subscribe_timeline(conn, channel).await;
+        channels
+            .into_iter()
+            .filter_map(|channel| self.claim_timeline(channel, since))
+            .collect()
+    }
+
+    async fn resubscribe_all(&mut self, conn: &mut NostrWsConnection) {
+        let since = now_secs().saturating_sub(LIVE_OVERLAP_SECS);
+        for (sub_id, filter) in self.plan_resubscribe(since) {
+            Self::req_raw(conn, &sub_id, &filter).await;
         }
+        // The reaction and typing feeds have no guard to defeat: they are
+        // replaced unconditionally, so they rebuild on this connection too.
         let aux = self.aux_ids.clone();
         for (channel, ids) in aux {
             self.subscribe_aux(conn, channel, ids).await;
@@ -451,6 +469,59 @@ async fn handle_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sub-ids of a plan, in order.
+    fn ids(plan: &[(String, serde_json::Value)]) -> Vec<String> {
+        plan.iter().map(|(sub_id, _)| sub_id.clone()).collect()
+    }
+
+    #[test]
+    fn a_new_connection_is_owed_the_channels_the_session_kept() {
+        let (open, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut state = PumpState::default();
+        assert!(
+            state.claim_timeline(open, 100).is_some(),
+            "the open channel is asked for"
+        );
+        assert!(state.claim_timeline(other, 100).is_some());
+
+        // The connection ends; the session keeps its channels. Every one of
+        // them is owed a REQ again - an id from the socket that died must not
+        // read as a live subscription - and each carries a window of its own.
+        let owed = state.plan_resubscribe(200);
+        assert_eq!(ids(&owed), vec![format!("t:{open}"), format!("t:{other}")]);
+        assert_eq!(owed[0].1["since"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn a_connection_asks_for_a_channel_once() {
+        let channel = Uuid::new_v4();
+        let mut state = PumpState::default();
+        assert!(state.claim_timeline(channel, 100).is_some());
+        assert!(
+            state.claim_timeline(channel, 130).is_none(),
+            "opening the same channel twice on one connection is one REQ"
+        );
+
+        // The guard counts this connection's asks, nothing else.
+        assert_eq!(state.plan_resubscribe(200).len(), 1);
+    }
+
+    #[test]
+    fn a_feed_the_relay_refused_is_not_owed_again() {
+        let channel = Uuid::new_v4();
+        let mut state = PumpState::default();
+        state.claim_timeline(channel, 100);
+        assert!(matches!(
+            close_subscription(&mut state, &format!("t:{channel}")),
+            Some(Closed::Timeline(refused)) if refused == channel
+        ));
+
+        assert!(
+            state.plan_resubscribe(200).is_empty(),
+            "the relay refused this feed; the next connection does not repeat it"
+        );
+    }
 
     fn indicator(tags: Vec<Vec<&str>>) -> nostr::Event {
         let keys = Keys::generate();
