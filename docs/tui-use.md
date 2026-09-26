@@ -257,3 +257,159 @@ it switches to a layout as soon as the terminal grows.
 
 Raw mode is entered at start and restored at exit, including on error. A
 terminal that is left in raw mode after a crash is a bug.
+
+
+## Agents overview
+
+`a` opens this view. It answers which Agents the signed-in user owns, which
+have observed active work, and which accessible conversation to open. It does
+not add an Agent management console. The boundary is in
+[decision 0006](../design/decisions/0006-agent-summary.md).
+
+### Entry and navigation
+
+In navigation mode, `a` opens an Agents overlay; Esc returns to the prior
+conversation with its focus, draft and reply target intact. In composer mode
+`a` remains text. Opening the overlay does not mark messages read.
+
+Use one stable list, with name and status per Agent. No Working filter,
+search, sorting settings, purpose editor or new top-level navigation system.
+Order by display name and public key on load; live updates never move focus.
+Keep names stable in position until the overlay is reopened. The selected
+item can reveal its full name and short public key to distinguish duplicates.
+
+`j/k` select an Agent; Enter opens its detail. Detail contains the status,
+last signal age and a list of observed working contexts. `j/k` select a
+context and Enter opens its channel. Esc goes back one level. A context with
+no accessible channel is not actionable. Opening a channel does not send,
+create a DM, add members, or change ownership. With no known work, detail
+says so and offers Back, not an invented destination.
+
+```text diagram
+Agents                         Agent A
+> Agent A       Working        Last signal: 3s ago
+  Agent B       Typing         Contexts:
+  Agent C       Unknown        > #engineering
+                                 #support
+Enter details   Esc back       Enter channel   Esc back
+```
+
+At 80 by 12 or larger, list and selected detail may share the overlay. At
+40 by 10, 79 by 12 and 24 by 6, use full-screen list then detail, not squeezed
+columns. Reserve space for status and a key hint before clipping names;
+detail can scroll long labels. Resize and returning from a channel preserve
+the selected Agent identity. If it is removed, choose the next surviving
+item or the previous item at the end. An empty list retains the exit key.
+
+### Whose Agents
+
+My Agents is the current login identity's verified owned roster, excluding
+archived entries. Channel bot membership or a matching name is not proof of
+ownership. Do not substitute a delegated identity's owner for the login or
+borrow another client's private key. Unsupported identity access says
+`Agent overview unavailable for this identity`; chat remains usable.
+
+A complete empty query says `No agents`. Failed, partial and unverified
+results remain distinguishable: `Cannot load agents`, `List incomplete`,
+or `Ownership unverified`. Unverified records cannot be actionable owned
+Agents. Identity or relay changes clear the roster and private summary state.
+
+### Status meaning
+
+- `Working`: a fresh, authenticated active-turn signal exists. Aggregate
+  independent turns per Agent; ending one does not end its other turns.
+- `Typing`: only channel typing is observed. This is not evidence of tools
+  running or a request being accepted. It does not override known Working.
+- `No active turn observed`: the current observation has no active turn.
+  This does not promise that the Agent is idle or has no background work.
+- `Unknown`: observation is not established, disconnected, stale or unreadable.
+  Previously observed work can be described as last seen, never current.
+
+Online presence is not a work signal. Do not show a separate presence column,
+running duration, global running total, percentage, history or notification.
+Detail shows last received signal age so the evidence is inspectable.
+An explicit failed terminal signal may show `Last observed turn failed`
+for the current session, alongside any remaining work; no automatic retry.
+Ordinary messages do not finish a turn. Late stale liveness cannot revive a
+completed turn. Typing keeps its existing expiry independently of work.
+
+During a missing stream, do not infer success or failure. Reconnection starts
+with unknown state until fresh evidence arrives. Late join must accept a
+valid active-turn liveness signal without requiring a previously seen start;
+when that source cannot recover activity, remain Unknown. Implementation must
+use a bounded freshness rule grounded in the deployed producer's heartbeat
+cadence, document it, and test the exact expiry boundary. No new setting or
+protocol is added to tune that rule.
+
+Only accessible channel names and destinations appear. For a private context
+outside the user's membership, show `Unavailable context` without its name,
+id or content. If only a channel is known, label the action `Open channel`;
+only a verified message reference permits exact message navigation.
+
+### Acceptance
+
+A roster-only or typing-only delivery does not fulfill the working-state goal.
+
+1. Two owners, same-name Agents and an archived Agent produce the correct
+   owned list without cross-owner disclosure. Empty, partial, failed and
+   unverified roster states remain distinct.
+2. A turn running a long tool without typing remains Working with fresh
+   liveness; typing alone remains Typing. Mere online presence proves neither.
+3. Two simultaneous turns survive one completion or failure independently.
+   A progress message does not end work; terminal events do.
+4. Late join, duplicate and out-of-order events, producer restart, missing
+   terminal, stale heartbeat and reconnect never leave a permanent false busy
+   badge or invent success. Test the documented freshness threshold.
+5. All four terminal sizes support Agent selection, detail, channel entry and
+   return without changing drafts, reply targets or read state merely by
+   opening the overlay. Revoked access removes inaccessible destinations.
+6. No private observer payload, tool argument, secret or transcript is rendered,
+   logged, persisted or published as an ordinary channel message.
+
+Creation, configuration, stop/restart, tool transcripts, Waiting for you,
+recent results, task completion, cost and model switching are excluded. Add
+none of them as placeholders or extension points in this slice.
+
+### Verification
+
+The relay rules this view depends on were checked against the deployed relay
+`https://buzz.surac.cloud` with a delegated Agent identity: the identity that
+would receive the frames is the identity that made the request. Both the
+roster read and the observer feed answered, and both stayed inside the owner
+boundary. The roster read was made with the identity that signed the
+deployment's three agent records too, read-only: one `POST /query`, one
+observer `REQ` answered with `EOSE`, and nothing published. The records that
+came back were then fed through this module and the overlay renderer.
+
+- `POST /query` for kind 30177 authored by the identity answered HTTP 200 and
+  delivered only records that identity had signed. On a delegated Agent
+  identity with no Agent the page was empty, and an empty roster is an answer,
+  not a refusal. On the deployment's owner identity the same read answered the
+  three records that identity owns: each one verified, each carried its Agent
+  key in the `d` tag and its name in the record content, and the classifier
+  read them as `Bumble`, `Fizz` and `Honey` sorted by name, with nothing
+  counted as foreign, unverified or unreadable.
+- The overlay rendered those three records as `Agents (3)`, one row per Agent,
+  each with `No active turn observed`, at the full width and at 40x10.
+- `REQ` for kind 24200 with `#p` set to the identity's own pubkey was answered
+  with `EOSE` and never with `CLOSED`, and delivered no frame: the
+  subscription is legal, live-only, and quiet. The owner identity's feed
+  behaved the same way in a twenty-second window, which is what makes `No
+  active turn observed` the tested state rather than an assumed one.
+- The same `REQ` naming another identity was closed with `restricted: p-gated
+  events require #p matching your pubkey`. A client can only subscribe to its
+  own observer feed, which is what lets a frame be read as evidence about the
+  Agents this identity owns and no others.
+- A kind-24200 telemetry frame signed by a key this identity does not own was
+  refused at the WebSocket: `invalid: event pubkey does not match
+  authenticated identity`. A frame cannot be planted by a client that is not
+  the Agent it claims to be, and the owner/agent check sits behind that.
+
+Not verified: no Agent owned by an identity reachable from this workspace had
+a turn running while the feed was open, so a live `Working` signal was not
+observed on the deployed relay. The states driven by frames are covered by the
+module and render tests, which use the deployed producer's field names
+(`kind`, `turnId`, `channelId`, `seq`) and its `batch` envelope. Confirm them
+once against a deployment where an owned Agent has a turn running. `Unknown`
+is the answer for a feed that is refused, closed, or not yet established; `No
+active turn observed` follows only a feed the relay has answered with `EOSE`.

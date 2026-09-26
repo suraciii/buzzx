@@ -27,6 +27,14 @@ pub enum Action {
     PickerConfirm,
     /// `f`: the next Inbox filter.
     FilterNext,
+    /// `a`: open the Agents overlay, or close it when it is open.
+    ToggleAgents,
+    /// `j` and `k` inside the Agents overlay.
+    AgentsNext,
+    AgentsPrev,
+    /// Enter inside the Agents overlay: open the selected Agent, or the
+    /// selected working conversation.
+    AgentsConfirm,
     /// Scroll the help text by this many lines. At the minimum size the text
     /// is taller than the screen, and the whole of it must stay reachable.
     HelpScroll(isize),
@@ -66,11 +74,21 @@ pub enum Action {
     Ignored,
 }
 
+/// Which overlay is on screen. The overlays are exclusive: help draws over
+/// everything, and each open overlay isolates the navigation keys it does not
+/// use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    Picker,
+    Help,
+    Agents,
+}
+
 /// Map a key press to an action in navigation mode. `layout` selects the
-/// list that `j` and `k` move; `picker` routes keys to the open conversation
-/// picker, and `help` to the help text drawn over everything else. Each
-/// overlay isolates the rest of the navigation keys.
-pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool, help: bool) -> Action {
+/// list that `j` and `k` move; `overlay` routes keys to the overlay that is
+/// open.
+pub fn map_navigation(key: KeyEvent, layout: LayoutMode, overlay: Overlay) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
@@ -84,7 +102,7 @@ pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool, help: boo
             _ => Action::Ignored,
         };
     }
-    if help {
+    if overlay == Overlay::Help {
         return match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::HelpScroll(1),
             KeyCode::Char('k') | KeyCode::Up => Action::HelpScroll(-1),
@@ -95,7 +113,19 @@ pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool, help: boo
             _ => Action::Ignored,
         };
     }
-    if picker {
+    if overlay == Overlay::Agents {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::AgentsNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::AgentsPrev,
+            KeyCode::Enter => Action::AgentsConfirm,
+            KeyCode::Esc => Action::Dismiss,
+            KeyCode::Char('a') => Action::ToggleAgents,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
+    if overlay == Overlay::Picker {
         return match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::PickerNext,
             KeyCode::Char('k') | KeyCode::Up => Action::PickerPrev,
@@ -124,6 +154,7 @@ pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool, help: boo
         KeyCode::Char('i') => Action::ComposeNew,
         KeyCode::Enter => Action::ComposeReply,
         KeyCode::Char('c') => Action::TogglePicker,
+        KeyCode::Char('a') => Action::ToggleAgents,
         KeyCode::Char('f') => Action::FilterNext,
         KeyCode::Char('r') => Action::React,
         KeyCode::Char('e') => Action::EditRow,
@@ -180,8 +211,7 @@ mod tests {
         map_navigation(
             key(code, KeyModifiers::NONE),
             LayoutMode::Wide,
-            false,
-            false,
+            Overlay::None,
         )
     }
 
@@ -189,8 +219,16 @@ mod tests {
         map_navigation(
             key(code, KeyModifiers::NONE),
             LayoutMode::Narrow,
-            false,
-            false,
+            Overlay::None,
+        )
+    }
+
+    /// A key press in the Agents overlay.
+    fn agents(code: KeyCode) -> Action {
+        map_navigation(
+            key(code, KeyModifiers::NONE),
+            LayoutMode::Wide,
+            Overlay::Agents,
         )
     }
 
@@ -220,8 +258,7 @@ mod tests {
             map_navigation(
                 key(code, KeyModifiers::NONE),
                 LayoutMode::Narrow,
-                true,
-                false,
+                Overlay::Picker,
             )
         };
         assert_eq!(picker(KeyCode::Char('j')), Action::PickerNext);
@@ -240,7 +277,7 @@ mod tests {
     #[test]
     fn a_too_small_terminal_only_answers_q_and_ctrl_c() {
         let small = |code: KeyCode, modifiers| {
-            map_navigation(key(code, modifiers), LayoutMode::TooSmall, false, false)
+            map_navigation(key(code, modifiers), LayoutMode::TooSmall, Overlay::None)
         };
         assert_eq!(small(KeyCode::Char('q'), KeyModifiers::NONE), Action::Quit);
         assert_eq!(
@@ -269,8 +306,7 @@ mod tests {
             map_navigation(
                 key(KeyCode::Char('G'), KeyModifiers::SHIFT),
                 LayoutMode::Wide,
-                false,
-                false
+                Overlay::None
             ),
             Action::Bottom
         );
@@ -290,8 +326,7 @@ mod tests {
             map_navigation(
                 key(code, KeyModifiers::NONE),
                 LayoutMode::Minimal,
-                false,
-                true,
+                Overlay::Help,
             )
         };
         assert_eq!(help(KeyCode::Char('j')), Action::HelpScroll(1));
@@ -310,13 +345,34 @@ mod tests {
     }
 
     #[test]
+    fn a_opens_the_agents_view_in_either_layout() {
+        assert_eq!(wide(KeyCode::Char('a')), Action::ToggleAgents);
+        assert_eq!(narrow(KeyCode::Char('a')), Action::ToggleAgents);
+    }
+
+    #[test]
+    fn an_open_agents_view_takes_the_selection_keys_and_isolates_the_rest() {
+        assert_eq!(agents(KeyCode::Char('j')), Action::AgentsNext);
+        assert_eq!(agents(KeyCode::Down), Action::AgentsNext);
+        assert_eq!(agents(KeyCode::Char('k')), Action::AgentsPrev);
+        assert_eq!(agents(KeyCode::Up), Action::AgentsPrev);
+        assert_eq!(agents(KeyCode::Enter), Action::AgentsConfirm);
+        assert_eq!(agents(KeyCode::Esc), Action::Dismiss);
+        assert_eq!(agents(KeyCode::Char('a')), Action::ToggleAgents);
+        assert_eq!(agents(KeyCode::Char('q')), Action::Quit);
+        // A conversation sits behind the overlay: none of its keys fire.
+        assert_eq!(agents(KeyCode::Char('i')), Action::Ignored);
+        assert_eq!(agents(KeyCode::Char('r')), Action::Ignored);
+        assert_eq!(agents(KeyCode::Char('3')), Action::Ignored);
+    }
+
+    #[test]
     fn the_picker_cycles_the_filter_and_the_sidebar_does_too() {
         let picker = |code: KeyCode| {
             map_navigation(
                 key(code, KeyModifiers::NONE),
                 LayoutMode::Narrow,
-                true,
-                false,
+                Overlay::Picker,
             )
         };
         assert_eq!(picker(KeyCode::Char('f')), Action::FilterNext);
@@ -330,8 +386,7 @@ mod tests {
             map_navigation(
                 key(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 LayoutMode::Wide,
-                false,
-                false
+                Overlay::None
             ),
             Action::Quit
         );

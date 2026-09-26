@@ -7,9 +7,10 @@ use std::collections::{HashMap, HashSet};
 use nostr::Keys;
 use uuid::Uuid;
 
+use crate::agents;
 use crate::client::{CatchUp, ChannelInfo, ChannelKind, Roster};
 use crate::content::{self, Row};
-use crate::keys::{Action, PAGE_ROWS};
+use crate::keys::{self, Action, PAGE_ROWS};
 use crate::session::{ChatEvent, SessionCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,6 +438,50 @@ struct TypingEntry {
     expires_at: u64,
 }
 
+/// What one Agent's row says. The four states stay separate on purpose: only
+/// one of them is evidence that work is running, and only one of them is
+/// evidence that it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// This many turns are observed running.
+    Working(usize),
+    /// Only channel typing is observed, in this channel.
+    Typing(Uuid),
+    /// The feed is live and no turn is observed. Never a claim of idleness.
+    NoTurn,
+    /// Nothing is observed at all: no connection, no feed, no fresh evidence.
+    Unknown,
+}
+
+/// One observed working context of the selected Agent. Only a context the user
+/// can already open names its channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Context {
+    Channel {
+        id: Uuid,
+        name: String,
+    },
+    /// Observed work in a conversation this identity is not in. The name, the
+    /// id and the content stay hidden; the fact of the work does not.
+    Unavailable,
+    /// The frame carried no conversation: a scheduled turn, not a reply.
+    Unknown,
+}
+
+/// The Agents overlay: the owned roster, the observed work behind it, and the
+/// cursor. The state outlives the overlay, so reopening it is instant.
+#[derive(Debug, Default)]
+pub struct AgentView {
+    pub roster: agents::Load,
+    pub work: agents::Work,
+    pub cursor: agents::View,
+    /// Whether the observer feed is live on this connection. False means
+    /// `Unknown`: with no observation there is no absence to report.
+    pub observed: bool,
+    /// Whether the overlay is on screen.
+    pub open: bool,
+}
+
 pub struct App {
     pub me: String,
     pub relay_label: String,
@@ -486,6 +531,8 @@ pub struct App {
     pub conn: ConnState,
     pub status: String,
     pub composer: Composer,
+    /// The owned Agents and what the observer feed says about their work.
+    pub agents: AgentView,
     pub quit: bool,
     pub exit_code: i32,
     profiles: HashMap<String, String>,
@@ -528,6 +575,7 @@ impl App {
             conn: ConnState::Connecting,
             status: "connecting".to_owned(),
             composer: Composer::new(),
+            agents: AgentView::default(),
             quit: false,
             exit_code: 0,
             profiles: HashMap::new(),
@@ -544,6 +592,19 @@ impl App {
 
     pub fn take_outbox(&mut self) -> Vec<SessionCommand> {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Which overlay is on screen, for the key map.
+    pub fn overlay(&self) -> keys::Overlay {
+        if self.help {
+            keys::Overlay::Help
+        } else if self.picker.is_some() {
+            keys::Overlay::Picker
+        } else if self.agents.open {
+            keys::Overlay::Agents
+        } else {
+            keys::Overlay::None
+        }
     }
 
     /// Drop typing entries whose 8-second TTL has passed. Reads filter on the
@@ -577,6 +638,105 @@ impl App {
         self.typing
             .get(&channel)
             .is_some_and(|entries| entries.values().any(|entry| entry.expires_at > now))
+    }
+
+    /// Retire turns no frame has refreshed inside the freshness bound. Work
+    /// has no terminating event when its host dies, so the frame tick is what
+    /// ends it, exactly like a typing indicator nobody refreshed.
+    pub fn expire_agents(&mut self, now: u64) {
+        if self.agents.work.expire(now) {
+            self.clamp_agents();
+        }
+    }
+
+    /// What one Agent's row says.
+    pub fn agent_status(&self, agent: &str, now: u64) -> AgentStatus {
+        if !self.agents.observed {
+            return AgentStatus::Unknown;
+        }
+        let working = self.agents.work.working(agent).len();
+        if working > 0 {
+            return AgentStatus::Working(working);
+        }
+        match self.typing_channel_of(agent, now) {
+            Some(channel) => AgentStatus::Typing(channel),
+            None => AgentStatus::NoTurn,
+        }
+    }
+
+    /// The selected Agent's observed working contexts, ordered the way the
+    /// frames arrived: newest activity first. A context outside this identity's
+    /// channels keeps its place in the list without giving up its name.
+    pub fn agent_contexts(&self, agent: &str) -> Vec<Context> {
+        self.agents
+            .work
+            .working(agent)
+            .into_iter()
+            .map(|(_, turn)| match turn.channel.as_deref() {
+                Some(id) => match Uuid::parse_str(id)
+                    .ok()
+                    .and_then(|id| self.channels.iter().find(|entry| entry.id == id))
+                {
+                    Some(entry) => Context::Channel {
+                        id: entry.id,
+                        name: entry.name.clone(),
+                    },
+                    None => Context::Unavailable,
+                },
+                None => Context::Unknown,
+            })
+            .collect()
+    }
+
+    /// When the last frame from this Agent arrived, on this machine's clock.
+    pub fn agent_last_signal(&self, agent: &str) -> Option<u64> {
+        self.agents.work.last_signal(agent)
+    }
+
+    /// When this Agent's last observed turn failed, if any did.
+    pub fn agent_last_failure(&self, agent: &str) -> Option<u64> {
+        self.agents.work.last_failure(agent)
+    }
+
+    /// How many Agents the loaded roster holds.
+    pub fn agent_count(&self) -> usize {
+        match &self.agents.roster {
+            agents::Load::Loaded(roster) => roster.agents.len(),
+            _ => 0,
+        }
+    }
+
+    /// The roster entry the cursor is on.
+    pub fn selected_agent(&self) -> Option<agents::OwnedAgent> {
+        match &self.agents.roster {
+            agents::Load::Loaded(roster) => roster.agents.get(self.agents.cursor.cursor).cloned(),
+            _ => None,
+        }
+    }
+
+    /// The channel one identity is composing in, if it composes at all.
+    fn typing_channel_of(&self, pubkey: &str, now: u64) -> Option<Uuid> {
+        self.channels
+            .iter()
+            .find(|entry| {
+                self.typing.get(&entry.id).is_some_and(|entries| {
+                    entries
+                        .get(pubkey)
+                        .is_some_and(|entry| entry.expires_at > now)
+                })
+            })
+            .map(|entry| entry.id)
+    }
+
+    /// Keep the overlay's cursor on an entry that still exists. The list is
+    /// loaded once and the work under it churns, so both levels can shrink.
+    fn clamp_agents(&mut self) {
+        let agents = self.agent_count();
+        let contexts = self
+            .selected_agent()
+            .map(|agent| self.agent_contexts(&agent.pubkey).len())
+            .unwrap_or(0);
+        self.agents.cursor.clamp(agents, contexts);
     }
 
     /// One message from this author ends the signal it announced. Only a
@@ -666,6 +826,12 @@ impl App {
             ChatEvent::Connected => {
                 self.inbox_failed.clear();
                 self.conn = ConnState::Connected;
+                // The observer feed has to be established on this connection
+                // before a quiet Agent means anything: until then this client
+                // has not been told the relay is listening, and work seen on
+                // the previous connection went with it.
+                self.agents.observed = false;
+                self.agents.work.clear();
                 self.status = format!("connected {}", self.relay_label);
                 if !self.opened_once {
                     self.outbox.push(SessionCommand::LoadChannels);
@@ -681,6 +847,11 @@ impl App {
                     if let Some(id) = opening {
                         self.outbox.push(SessionCommand::OpenChannel(id));
                     }
+                    // The roster read is a plain query, and an owner can add
+                    // an Agent while this client is away.
+                    if self.agents.open {
+                        self.outbox.push(SessionCommand::LoadAgents);
+                    }
                 }
             }
             ChatEvent::Disconnected(reason) => {
@@ -689,6 +860,10 @@ impl App {
                 // ended. Until catch-up completes again, a quiet row is not a
                 // claim that no message arrived while it was away.
                 self.typing.clear();
+                // The observer feed ended with the same connection: with no
+                // live feed, an Agent that was working is unknown, not idle.
+                self.agents.observed = false;
+                self.agents.work.clear();
                 for entry in &mut self.channels {
                     entry.read.coverage = Coverage::Failed;
                 }
@@ -817,6 +992,26 @@ impl App {
                     let id = entry.id;
                     self.outbox.push(SessionCommand::OpenChannel(id));
                 }
+            }
+            ChatEvent::Agents(load) => {
+                self.agents.roster = load;
+                self.clamp_agents();
+            }
+            ChatEvent::ObserverReady => self.agents.observed = true,
+            ChatEvent::ObserverFrame(frame) => {
+                // A frame is the feed working too: it is the same observation,
+                // and it stands on its own if the relay's confirmation is lost.
+                self.agents.observed = true;
+                self.agents.work.apply(&frame, now);
+                self.clamp_agents();
+            }
+            ChatEvent::ObserverClosed { reason } => {
+                // No frame observed after this point is evidence that an Agent
+                // is idle, so nothing observed before it is current either.
+                self.agents.observed = false;
+                self.agents.work.clear();
+                self.clamp_agents();
+                self.status = format!("agent observer feed closed: {reason}");
             }
             ChatEvent::Status(message) => self.status = message,
             ChatEvent::WriteOk { local, event_id } => self.complete_write(local, event_id),
@@ -1048,7 +1243,7 @@ impl App {
     /// and sitting at its latest message. Reading older history, previewing the
     /// picker and a failed load all leave it where it was.
     pub fn note_presented(&mut self) {
-        if self.picker.is_some() || self.help {
+        if self.picker.is_some() || self.help || self.agents.open {
             // The list covers the conversation: nothing is being read.
             return;
         }
@@ -1865,6 +2060,7 @@ impl App {
                     // it opens at its top: the full label of the selected
                     // conversation is part of it.
                     self.picker = None;
+                    self.agents.open = false;
                     self.help_scroll = 0;
                 }
             }
@@ -1877,6 +2073,8 @@ impl App {
                     self.note_presented();
                 } else if self.picker.take().is_some() {
                     self.note_presented();
+                } else {
+                    self.dismiss_agents();
                 }
             }
             Action::NextChannel => self.step_channel(1),
@@ -1891,6 +2089,10 @@ impl App {
                 }
             }
             Action::FilterNext => self.set_filter(self.filter.next()),
+            Action::ToggleAgents => self.toggle_agents(),
+            Action::AgentsNext => self.move_agents(1),
+            Action::AgentsPrev => self.move_agents(-1),
+            Action::AgentsConfirm => self.confirm_agents(),
             Action::TogglePicker => self.toggle_picker(),
             Action::PickerNext => self.move_picker(1),
             Action::PickerConfirm => {
@@ -2035,6 +2237,7 @@ impl App {
         self.picker = if !self.channels.is_empty() {
             // Only one overlay is on screen at a time.
             self.help = false;
+            self.agents.open = false;
             self.channels.get(self.selected).map(|entry| {
                 let at = self.view().all().position(|id| id == entry.id).unwrap_or(0);
                 Picker {
@@ -2045,6 +2248,85 @@ impl App {
         } else {
             None
         };
+    }
+
+    /// `a`: open the Agents overlay, or close it when it is open. Opening it
+    /// asks for the roster: that read is one query, and a session that never
+    /// opens the overlay never spends it.
+    fn toggle_agents(&mut self) {
+        if self.agents.open {
+            self.agents.open = false;
+            return;
+        }
+        // Only one overlay is on screen at a time.
+        self.help = false;
+        self.picker = None;
+        self.agents.open = true;
+        self.agents.cursor.level = agents::Level::List;
+        self.outbox.push(SessionCommand::LoadAgents);
+    }
+
+    /// `j` and `k` inside the Agents overlay: the Agent list on the list
+    /// level, the working contexts on the detail level.
+    fn move_agents(&mut self, step: isize) {
+        if !self.agents.open {
+            return;
+        }
+        let len = match self.agents.cursor.level {
+            agents::Level::List => self.agent_count(),
+            agents::Level::Detail => self
+                .selected_agent()
+                .map(|agent| self.agent_contexts(&agent.pubkey).len())
+                .unwrap_or(0),
+        };
+        self.agents.cursor.move_by(step, len);
+    }
+
+    /// Enter inside the Agents overlay: the list opens the selected Agent's
+    /// detail, and the detail opens the selected working conversation. An
+    /// Agent that cannot be read, or a context this identity is not in, opens
+    /// nothing.
+    fn confirm_agents(&mut self) {
+        if !self.agents.open {
+            return;
+        }
+        match self.agents.cursor.level {
+            agents::Level::List => {
+                if self.selected_agent().is_none() {
+                    return;
+                }
+                self.agents.cursor.level = agents::Level::Detail;
+                self.agents.cursor.context = 0;
+            }
+            agents::Level::Detail => {
+                let Some(Context::Channel { id, .. }) = self.selected_context() else {
+                    return;
+                };
+                self.agents.open = false;
+                if let Some(index) = self.index_of(id) {
+                    self.switch_channel(index);
+                }
+            }
+        }
+    }
+
+    /// Esc inside the Agents overlay: the detail back to the list, and the
+    /// list back to the timeline.
+    fn dismiss_agents(&mut self) {
+        if !self.agents.open {
+            return;
+        }
+        if !self.agents.cursor.back() {
+            self.agents.open = false;
+        }
+    }
+
+    /// The context the detail level's cursor is on.
+    fn selected_context(&self) -> Option<Context> {
+        let agent = self.selected_agent()?;
+        self.agent_contexts(&agent.pubkey)
+            .into_iter()
+            .nth(self.agents.cursor.context)
     }
 
     /// Move the picker's cursor one row through the view it shows.
@@ -4970,5 +5252,220 @@ mod tests {
             vec!["old", "in flight"],
             "a reload keeps optimistic rows"
         );
+    }
+
+    const ADA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BUILD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn owned(names: &[(&str, &str)]) -> agents::Load {
+        agents::Load::Loaded(agents::Roster {
+            agents: names
+                .iter()
+                .map(|(name, pubkey)| agents::OwnedAgent {
+                    pubkey: (*pubkey).to_owned(),
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+            ..agents::Roster::default()
+        })
+    }
+
+    fn frame(kind: agents::Kind, agent: &str, channel: Option<Uuid>, turn: &str) -> agents::Frame {
+        agents::Frame {
+            agent: agent.to_owned(),
+            kind,
+            channel: channel.map(|id| id.to_string()),
+            turn: Some(turn.to_owned()),
+            seq: 1,
+        }
+    }
+
+    /// An open overlay with a roster and a live observer feed.
+    fn watching(names: &[(&str, &str)]) -> App {
+        let mut app = app();
+        app.handle(Action::ToggleAgents, 0);
+        app.apply(ChatEvent::Agents(owned(names)), 0);
+        app.apply(ChatEvent::Connected, 0);
+        app.apply(ChatEvent::ObserverReady, 0);
+        // Opening the overlay and the first connection both ask; the tests
+        // here are about what the keys and events do after that.
+        let _ = app.take_outbox();
+        app
+    }
+
+    #[test]
+    fn a_opens_the_agents_overlay_and_asks_for_the_roster_once() {
+        let mut app = app();
+        app.handle(Action::ToggleAgents, 0);
+        assert!(app.agents.open);
+        assert!(matches!(
+            take_commands(&mut app)[..],
+            [SessionCommand::LoadAgents]
+        ));
+        app.handle(Action::ToggleAgents, 1);
+        assert!(!app.agents.open, "a closes it again");
+        assert!(take_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn the_agents_overlay_leaves_the_composer_alone_until_enter() {
+        let mut app = watching(&[("Ada", ADA)]);
+        app.handle(Action::AgentsConfirm, 1);
+        assert_eq!(app.agents.cursor.level, agents::Level::Detail);
+        assert!(
+            take_commands(&mut app).is_empty(),
+            "detail opens no conversation"
+        );
+        app.handle(Action::Dismiss, 2);
+        assert_eq!(app.agents.cursor.level, agents::Level::List);
+        assert!(app.agents.open, "the list stays open behind the detail");
+    }
+
+    #[test]
+    fn the_agents_list_moves_and_clamps_to_the_roster_it_has() {
+        let mut app = watching(&[("Ada", ADA), ("build", BUILD)]);
+        app.handle(Action::AgentsNext, 1);
+        assert_eq!(app.agents.cursor.cursor, 1);
+        app.handle(Action::AgentsNext, 2);
+        assert_eq!(app.agents.cursor.cursor, 1, "the cursor stops at the end");
+        app.apply(ChatEvent::Agents(owned(&[("Ada", ADA)])), 3);
+        assert_eq!(app.agents.cursor.cursor, 0, "a shorter roster clamps it");
+    }
+
+    #[test]
+    fn enter_on_a_working_context_opens_that_conversation() {
+        let mut app = watching(&[("Ada", ADA)]);
+        let target = channel(2);
+        let id = target.id;
+        app.channels = vec![channel(1), target];
+        app.apply(
+            ChatEvent::ObserverFrame(frame(agents::Kind::Started, ADA, Some(id), "t1")),
+            1,
+        );
+        assert_eq!(app.agent_status(ADA, 1), AgentStatus::Working(1));
+        app.handle(Action::AgentsConfirm, 2);
+        app.handle(Action::AgentsConfirm, 3);
+        assert!(!app.agents.open, "opening a channel leaves the overlay");
+        assert_eq!(app.channels[app.selected].id, id);
+        assert!(matches!(
+            take_commands(&mut app)[..],
+            [SessionCommand::OpenChannel(opened)] if opened == id
+        ));
+    }
+
+    #[test]
+    fn work_in_a_conversation_the_user_is_not_in_is_not_a_destination() {
+        let mut app = watching(&[("Ada", ADA)]);
+        let elsewhere = Uuid::from_u64_pair(9, 0);
+        app.channels = vec![channel(1)];
+        app.apply(
+            ChatEvent::ObserverFrame(frame(agents::Kind::Started, ADA, Some(elsewhere), "t1")),
+            1,
+        );
+        assert_eq!(app.agent_contexts(ADA), vec![Context::Unavailable]);
+        app.handle(Action::AgentsConfirm, 2);
+        app.handle(Action::AgentsConfirm, 3);
+        assert!(app.agents.open, "an unreachable context opens nothing");
+        assert!(take_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn the_four_work_states_stay_separate() {
+        let mut app = app();
+        app.handle(Action::ToggleAgents, 0);
+        app.apply(ChatEvent::Agents(owned(&[("Ada", ADA)])), 0);
+        assert_eq!(
+            app.agent_status(ADA, 0),
+            AgentStatus::Unknown,
+            "no connection has said anything yet"
+        );
+        app.apply(ChatEvent::Connected, 0);
+        assert_eq!(
+            app.agent_status(ADA, 0),
+            AgentStatus::Unknown,
+            "connected is not yet listening"
+        );
+        app.apply(ChatEvent::ObserverReady, 0);
+        assert_eq!(app.agent_status(ADA, 0), AgentStatus::NoTurn);
+        let id = channel(1).id;
+        app.channels = vec![channel(1)];
+        app.apply(
+            ChatEvent::Typing {
+                channel: id,
+                pubkey: ADA.to_owned(),
+                at: 0,
+            },
+            0,
+        );
+        let _ = app.take_outbox();
+        assert_eq!(app.agent_status(ADA, 0), AgentStatus::Typing(id));
+        app.apply(
+            ChatEvent::ObserverFrame(frame(agents::Kind::Started, ADA, Some(id), "t1")),
+            0,
+        );
+        assert_eq!(
+            app.agent_status(ADA, 0),
+            AgentStatus::Working(1),
+            "a fresh turn outranks typing"
+        );
+        app.apply(ChatEvent::Disconnected("socket".into()), 0);
+        assert_eq!(
+            app.agent_status(ADA, 0),
+            AgentStatus::Unknown,
+            "a lost connection is not a quiet Agent"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_stops_reporting_retires_and_says_so() {
+        let mut app = watching(&[("Ada", ADA)]);
+        let id = channel(1).id;
+        app.apply(
+            ChatEvent::ObserverFrame(frame(agents::Kind::Started, ADA, Some(id), "t1")),
+            100,
+        );
+        app.expire_agents(100 + crate::agents::TURN_FRESH_SECS);
+        assert_eq!(
+            app.agent_status(ADA, 100 + crate::agents::TURN_FRESH_SECS),
+            AgentStatus::Working(1),
+            "the boundary second is still fresh"
+        );
+        app.expire_agents(101 + crate::agents::TURN_FRESH_SECS);
+        assert_eq!(
+            app.agent_status(ADA, 101 + crate::agents::TURN_FRESH_SECS),
+            AgentStatus::NoTurn
+        );
+    }
+
+    #[test]
+    fn a_closed_observer_feed_clears_the_work_and_says_why() {
+        let mut app = watching(&[("Ada", ADA)]);
+        let id = channel(1).id;
+        app.apply(
+            ChatEvent::ObserverFrame(frame(agents::Kind::Started, ADA, Some(id), "t1")),
+            1,
+        );
+        app.apply(
+            ChatEvent::ObserverClosed {
+                reason: "restricted".into(),
+            },
+            2,
+        );
+        assert_eq!(app.agent_status(ADA, 2), AgentStatus::Unknown);
+        assert!(app.agent_last_signal(ADA).is_none());
+        assert!(app.status.contains("observer feed closed"));
+        assert!(app.status.contains("restricted"));
+    }
+
+    #[test]
+    fn a_failed_roster_read_is_not_an_empty_roster() {
+        let mut app = app();
+        app.handle(Action::ToggleAgents, 0);
+        app.apply(
+            ChatEvent::Agents(agents::Load::Unavailable("no owner roster".into())),
+            0,
+        );
+        assert_eq!(app.agent_count(), 0);
+        assert!(app.selected_agent().is_none());
     }
 }

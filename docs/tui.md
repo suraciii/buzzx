@@ -54,6 +54,7 @@ Help displays the full selected conversation label.
 | --- | --- | --- |
 | Move focus / select item | `j` / `k` | Up / Down |
 | Open conversation picker | `c` | — |
+| Open the Agents overlay | `a` | — |
 | Change Inbox filter | `f` | Tab in picker |
 | Compose a new message | `i` | Tab |
 | Reply to the focused row | Enter | — |
@@ -66,14 +67,25 @@ conversation and `Esc` closes the picker. Other navigation keys include
 `g`/`Home` for the oldest loaded message, `G`/`End` for the newest,
 `PgUp`/`PgDn` for ten rows, and `r`, `e`, and `d` for react, edit, and delete.
 
+`a` opens the Agents overlay: the Agents the signed-in identity owns, one row
+per Agent with its working state. `j`/`k` select, `Enter` opens the selected
+Agent's detail, `Esc` goes back a level and then closes the overlay, and `a`
+closes it from either level. In the detail, `j`/`k` select one observed
+working context and `Enter` opens that conversation. The overlay takes the
+whole terminal in every layout mode, because a status word and its meaning
+must not be swapped for a squeezed second column. What each state means is in
+[tui-use.md](tui-use.md#agents-overview).
+
 ## Mode isolation
 
-Key handling is mode-dependent. In navigation mode and the channel picker,
-the keys above perform actions. In composer mode every printable character,
-including `j`, `k`, `c`, `i`, `r`, `q`, and `?`, is inserted into the draft.
-The composer reserves only Enter (send), Alt+Enter (newline), cursor keys,
-Home/End, Backspace, and Esc (leave while retaining the draft). The bottom
-hint identifies the current mode.
+Key handling is mode-dependent. In navigation mode, the channel picker, and
+the Agents overlay, the keys above perform actions, and an open overlay
+isolates the keys it does not use: no conversation action fires behind it. In
+composer mode every printable character, including `j`, `k`, `c`, `a`, `i`,
+`r`, `q`, and `?`, is inserted into the draft. The composer reserves only
+Enter (send), Alt+Enter (newline), cursor keys, Home/End, Backspace, and Esc
+(leave while retaining the draft). The bottom hint identifies the current
+mode.
 
 ## Resize and failure behavior
 
@@ -93,7 +105,10 @@ message with the appropriate layout without restarting the session.
 5. A phone keyboard without Tab, function keys, or mouse can complete the core
    flow with `j/k`, `c`, `i`, `r`, Enter, Esc, and `q`.
 6. Help opens and closes in every mode without changing focus or draft text.
-7. Existing event rendering, optimistic sends, and relay error behavior remain
+7. A 24×6, 40×10, 79×12, and 80×12 terminal can open the Agents overlay,
+   select an Agent, open an observed working conversation, and return, with
+   the draft, reply target, and read state unchanged.
+8. Existing event rendering, optimistic sends, and relay error behavior remain
    unchanged.
 
 ## Delivery order

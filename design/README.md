@@ -27,3 +27,6 @@ The product contract, which states why `buzzx` exists, lives in
 
 `design/decisions/` holds durable decision records. Each record carries a
 Status line and an Alternatives considered section.
+
+[Decision 0006](decisions/0006-agent-summary.md) narrows the former owner-plane
+exclusion to permit a read-only Agent summary.

@@ -3,12 +3,14 @@
 //! one-column modes reuse the same state as the wide one.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{App, ConnState, Marker, Mode, Sections};
+use crate::agents;
+use crate::app::{AgentStatus, App, ConnState, Context, Marker, Mode, Sections};
+use crate::content::short_pubkey;
 use crate::layout::{self, LayoutMode};
 use uuid::Uuid;
 
@@ -240,6 +242,9 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
         LayoutMode::Wide => draw_wide(frame, app, now, area),
         LayoutMode::Narrow => draw_narrow(frame, app, now, area),
         LayoutMode::Minimal => draw_minimal(frame, app, now, area),
+    }
+    if app.agents.open {
+        draw_agents(frame, app, now, area);
     }
     if app.picker.is_some() {
         draw_picker(frame, app, now, area);
@@ -719,6 +724,328 @@ fn draw_picker(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// The Agents overlay: the owned roster on the list level, one Agent's
+/// observed work on the detail level. Both take the whole terminal at every
+/// size: a squeezed second column would clip the status words, and those words
+/// are the whole answer.
+fn draw_agents(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    frame.render_widget(Clear, area);
+    if app.agents.cursor.level == agents::Level::Detail {
+        draw_agent_detail(frame, app, now, area);
+    } else {
+        draw_agent_list(frame, app, now, area);
+    }
+}
+
+/// How much of a row a name may take before the status it carries stops
+/// fitting. The status words carry the meaning of the row, so they are the
+/// part that is never clipped.
+const AGENT_NAME_MIN: usize = 8;
+
+fn draw_agent_list(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let width = list_row_width(area);
+    let roster = match &app.agents.roster {
+        agents::Load::Loaded(roster) => Some(roster),
+        _ => None,
+    };
+    let mut items: Vec<ListItem<'static>> = Vec::new();
+    if let Some(roster) = roster
+        && !roster.agents.is_empty()
+    {
+        for agent in &roster.agents {
+            let status = app.agent_status(&agent.pubkey, now);
+            items.push(ListItem::new(Text::from(agent_row(
+                &agent.name,
+                &status,
+                width,
+            ))));
+        }
+    }
+    // A roster that could not be read, and one that could but cannot be
+    // promised whole, say which of the two they are: the list shows its own
+    // incompleteness rather than a shorter list.
+    let states = roster_state_lines(&app.agents.roster);
+    if !states.is_empty() {
+        items.push(ListItem::new(Text::from(
+            states
+                .into_iter()
+                .map(|line| Line::styled(line, pending_style()))
+                .collect::<Vec<Line<'static>>>(),
+        )));
+    }
+    let count = app.agent_count();
+    let title = if roster.is_some() {
+        format!("Agents ({count})")
+    } else {
+        "Agents".to_owned()
+    };
+    // The selected Agent is the one a duplicate name can be told apart from:
+    // the list shows its short key while its row is the selected one.
+    let selected = app
+        .selected_agent()
+        .map(|agent| format!("{} {}", agent.name, short_pubkey(&agent.pubkey)))
+        .filter(|label| (label.chars().count() + title.chars().count() + 4) as u16 <= area.width);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(Line::raw(agents_hint(area.width, false)));
+    if let Some(label) = selected {
+        block = block.title_top(Line::raw(label).alignment(Alignment::Right));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style())
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select((count > 0).then_some(app.agents.cursor.cursor));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_agent_detail(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let Some(agent) = app.selected_agent() else {
+        // The roster moved under the cursor: the list level says why.
+        draw_agent_list(frame, app, now, area);
+        return;
+    };
+    let width = area.width.saturating_sub(2) as usize;
+    let status = app.agent_status(&agent.pubkey, now);
+    let mut body: Vec<Line<'static>> = Vec::new();
+    body.push(Line::from(vec![
+        Span::styled("name         ", pending_style()),
+        Span::raw(clip(&agent.name, width.saturating_sub(13))),
+    ]));
+    body.push(Line::from(vec![
+        Span::styled("key          ", pending_style()),
+        Span::raw(clip(&short_pubkey(&agent.pubkey), width.saturating_sub(13))),
+    ]));
+    body.push(Line::from(vec![
+        Span::styled("status       ", pending_style()),
+        Span::styled(
+            clip(&agent_status_word(&status), width.saturating_sub(13)),
+            agent_status_style(&status),
+        ),
+    ]));
+    if let Some(at) = app.agent_last_signal(&agent.pubkey) {
+        // The age of the evidence, so the claim can be inspected instead of
+        // believed.
+        body.push(Line::from(vec![
+            Span::styled("last signal  ", pending_style()),
+            Span::raw(format!("{} ago", age(at, now))),
+        ]));
+    }
+    if let Some(at) = app.agent_last_failure(&agent.pubkey) {
+        body.push(Line::styled(
+            format!("Last observed turn failed {} ago", age(at, now)),
+            pending_style(),
+        ));
+    }
+    let contexts = app.agent_contexts(&agent.pubkey);
+    let mut focus = None;
+    match &status {
+        AgentStatus::Working(_) => {
+            body.push(Line::raw(""));
+            body.push(Line::raw("contexts"));
+            for (at, context) in contexts.iter().enumerate() {
+                let (text, actionable) = context_row(context);
+                let selected = at == app.agents.cursor.context;
+                if selected {
+                    focus = Some(body.len());
+                }
+                let line = match (selected, actionable) {
+                    (true, _) => Line::styled(format!("> {text}"), highlight_style()),
+                    (false, true) => Line::raw(format!("  {text}")),
+                    // Work outside the user's channels is still evidence of
+                    // work; it is just not a destination.
+                    (false, false) => Line::styled(format!("  {text}"), pending_style()),
+                };
+                body.push(line);
+            }
+        }
+        AgentStatus::Typing(channel) => {
+            let name = app
+                .entry(*channel)
+                .map(|entry| app.label(entry))
+                .unwrap_or_else(|| short_pubkey(&channel.to_string()));
+            body.push(Line::from(vec![
+                Span::styled("typing in    ", pending_style()),
+                Span::raw(clip(&name, width.saturating_sub(13))),
+            ]));
+        }
+        AgentStatus::NoTurn => body.push(Line::styled(
+            "no turn is observed in this feed; background work is not ruled out",
+            pending_style(),
+        )),
+        AgentStatus::Unknown => body.push(Line::styled(
+            "no live observation: a quiet Agent is unknown here, not idle",
+            pending_style(),
+        )),
+    }
+    let actionable = matches!(app.agents.cursor.level, agents::Level::Detail)
+        && matches!(
+            contexts.get(app.agents.cursor.context),
+            Some(Context::Channel { .. })
+        )
+        && matches!(status, AgentStatus::Working(_));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(clip(&format!("Agent {}", agent.name), width))
+        .title_bottom(Line::raw(agents_hint(area.width, actionable)));
+    let rows = area.height.saturating_sub(2) as usize;
+    let window = scroll_window(body.len(), rows, focus.unwrap_or(0));
+    let visible: Vec<Line<'static>> = body
+        .into_iter()
+        .take(window.end)
+        .skip(window.start)
+        .collect();
+    frame.render_widget(
+        Paragraph::new(visible)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// One observed context: the text the detail shows, and whether opening it is
+/// something the user may do.
+fn context_row(context: &Context) -> (String, bool) {
+    match context {
+        Context::Channel { name, .. } => (name.clone(), true),
+        // The name, the id and the content of a conversation the user is not
+        // in stay hidden; the fact of the work does not.
+        Context::Unavailable => ("Unavailable context".to_owned(), false),
+        Context::Unknown => ("Location unknown".to_owned(), false),
+    }
+}
+
+/// The status of one Agent in the words the contract names the states with.
+fn agent_status_word(status: &AgentStatus) -> String {
+    match status {
+        AgentStatus::Working(1) => "Working".to_owned(),
+        AgentStatus::Working(turns) => format!("Working ({turns})"),
+        AgentStatus::Typing(_) => "Typing".to_owned(),
+        AgentStatus::NoTurn => "No active turn observed".to_owned(),
+        AgentStatus::Unknown => "Unknown".to_owned(),
+    }
+}
+
+/// Only the strongest evidence is highlighted: a working turn is a claim about
+/// execution, typing is a weaker one, and the two quiet states are not claims
+/// at all.
+fn agent_status_style(status: &AgentStatus) -> Style {
+    match status {
+        AgentStatus::Working(_) => author_style(),
+        AgentStatus::Typing(_) => mention_style(),
+        AgentStatus::NoTurn | AgentStatus::Unknown => pending_style(),
+    }
+}
+
+/// One row of the Agent list: the name, and the status it carries. The status
+/// is placed first and the name is clipped around it, because a clipped name
+/// is still a name while a clipped status is a different state.
+fn agent_row(name: &str, status: &AgentStatus, width: usize) -> Vec<Line<'static>> {
+    let text = agent_status_word(status);
+    let style = agent_status_style(status);
+    let budget = width.saturating_sub(text.chars().count() + 1);
+    if budget >= AGENT_NAME_MIN {
+        let name = clip(name, budget);
+        let pad = budget - name.chars().count() + 1;
+        return vec![Line::from(vec![
+            Span::raw(format!("{name}{}", " ".repeat(pad))),
+            Span::styled(text, style),
+        ])];
+    }
+    vec![
+        Line::raw(clip(name, width)),
+        Line::from(vec![Span::styled(format!("  {text}"), style)]),
+    ]
+}
+
+/// What the Agents list says about the roster it does not show as rows. The
+/// contract's words, one state per sentence: an empty answer, a refusal, a
+/// failed read and an answer that is not the whole roster are not the same
+/// result.
+fn roster_state_lines(load: &agents::Load) -> Vec<String> {
+    let roster = match load {
+        agents::Load::Unknown => return vec!["Loading agents".to_owned()],
+        agents::Load::Unavailable(reason) => {
+            return vec![
+                "Agent overview unavailable for this identity".to_owned(),
+                reason.clone(),
+            ];
+        }
+        agents::Load::Failed(reason) => {
+            return vec!["Cannot load agents".to_owned(), reason.clone()];
+        }
+        agents::Load::Loaded(roster) => roster,
+    };
+    let mut lines = Vec::new();
+    if roster.agents.is_empty() {
+        lines.push("No agents".to_owned());
+    }
+    if !roster.incomplete() {
+        return lines;
+    }
+    if roster.unverified > 0 {
+        lines.push(format!(
+            "Ownership unverified: {} record(s) naming you did not verify",
+            roster.unverified
+        ));
+    }
+    if roster.foreign > 0 {
+        lines.push(format!(
+            "List incomplete: {} record(s) signed by someone else",
+            roster.foreign
+        ));
+    }
+    if roster.unreadable > 0 {
+        lines.push(format!(
+            "List incomplete: {} record(s) could not be read",
+            roster.unreadable
+        ));
+    }
+    if roster.truncated {
+        lines.push("List incomplete: the read stopped at its page limit".to_owned());
+    }
+    lines
+}
+
+/// The key hint in the overlay's bottom border. It gives up words before
+/// actions: a clipped hint reads as a missing key.
+fn agents_hint(width: u16, open_channel: bool) -> String {
+    let inner = width.saturating_sub(2);
+    if open_channel {
+        if inner >= 42 {
+            "enter open channel · j k select · esc back".to_owned()
+        } else if inner >= 24 {
+            "enter open · esc back".to_owned()
+        } else {
+            "enter · esc".to_owned()
+        }
+    } else if inner >= 34 {
+        "j k select · enter detail · esc back".to_owned()
+    } else if inner >= 18 {
+        "enter · esc back".to_owned()
+    } else {
+        "esc back".to_owned()
+    }
+}
+
+/// Cut a label to the cells a row has for it.
+fn clip(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// The lines of a body that a box of `rows` shows, centered on the line that
+/// must stay visible.
+fn scroll_window(len: usize, rows: usize, focus: usize) -> std::ops::Range<usize> {
+    let rows = rows.min(len);
+    if rows == 0 {
+        return 0..0;
+    }
+    let start = focus.saturating_sub(rows / 2).min(len - rows);
+    start..start + rows
+}
+
 /// The key help. The wide layout has the room for the detailed text; the
 /// one-column layouts get the terse one, sized to what they can show. The
 /// selected conversation's full label is part of it: a row clipped to the
@@ -751,6 +1078,7 @@ const WIDE_HELP: &str = "\
 navigation
   j k up down    switch conversation   1-9 jump
   c              conversation picker   Esc close
+  a              Agents: owned roster, working now
   f              Inbox filter
   g G PgUp PgDn  move the focused row
   i              compose new           Enter  reply
@@ -761,14 +1089,18 @@ composer
   Esc leaves the composer, keeps the text
 picker
   j k move  f Tab filter  enter open  esc close
+agents
+  j k select  enter detail  enter open channel
+  esc back    ? help        a close
 signals
   ● unread   @ unread mention   ? unknown   … typing";
 
 const COMPACT_HELP: &str = "\
 i compose  Enter send
 j k move row  c picker
-f filter  Enter reply
-r react  e edit  d delete
+a agents  f filter
+Enter reply  r react
+e edit  d delete
 1-9 jump  g G start/end
 PgUp/PgDn move ten rows
 ? help  j k scroll  q quit
@@ -1363,6 +1695,145 @@ mod tests {
         assert!(header.starts_with("*alice 10s"), "{header}");
         assert!(header.contains(" <"), "{header}");
         assert!(header.contains("@you"), "{header}");
+    }
+
+    fn agent_frame(agent: &str, channel: Option<Uuid>, turn: &str) -> crate::agents::Frame {
+        crate::agents::Frame {
+            agent: agent.to_owned(),
+            kind: crate::agents::Kind::Started,
+            channel: channel.map(|id| id.to_string()),
+            turn: Some(turn.to_owned()),
+            seq: 1,
+        }
+    }
+
+    /// An open Agents overlay. `observed` is whether the observer feed is live.
+    fn agent_app(observed: bool, names: &[(&str, &str)]) -> App {
+        let mut app = chat_app(Vec::new());
+        app.agents.roster = crate::agents::Load::Loaded(crate::agents::Roster {
+            agents: names
+                .iter()
+                .map(|(name, pubkey)| crate::agents::OwnedAgent {
+                    pubkey: (*pubkey).to_owned(),
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+            ..crate::agents::Roster::default()
+        });
+        app.agents.observed = observed;
+        app.agents.open = true;
+        app
+    }
+
+    #[test]
+    fn the_agents_list_shows_a_name_and_a_status_word_at_every_size() {
+        let app = agent_app(true, &[("Ada", "aa")]);
+        for (width, height) in [(24, 6), (40, 10), (79, 12), (80, 12)] {
+            let text = frame_text(&app, width, height);
+            assert!(text.contains("Ada"), "{width}x{height}: {text}");
+            assert!(
+                text.contains("No active turn"),
+                "the state is named at {width}x{height}: {text}"
+            );
+            assert!(
+                text.contains("esc"),
+                "the way out is on screen at {width}x{height}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unobserved_agent_reads_unknown_rather_than_idle() {
+        let app = agent_app(false, &[("Ada", "aa")]);
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Unknown"), "{text}");
+        assert!(
+            !text.contains("No active turn"),
+            "no live feed is no quiet Agent: {text}"
+        );
+    }
+
+    #[test]
+    fn the_agent_detail_shows_the_evidence_behind_its_status() {
+        let mut app = agent_app(true, &[("Ada", "aa")]);
+        let id = app.channels[0].id;
+        app.agents
+            .work
+            .apply(&agent_frame("aa", Some(id), "t1"), 127);
+        app.agents.cursor.level = crate::agents::Level::Detail;
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Agent Ada"), "{text}");
+        assert!(text.contains("Working"), "{text}");
+        assert!(text.contains("last signal"), "{text}");
+        assert!(text.contains("3s ago"), "the age of the evidence: {text}");
+        assert!(text.contains("general"), "the context names it: {text}");
+        assert!(text.contains("esc"), "the way back is on screen: {text}");
+    }
+
+    #[test]
+    fn a_context_the_user_is_not_in_hides_its_identity() {
+        let mut app = agent_app(true, &[("Ada", "aa")]);
+        let elsewhere = Uuid::from_u64_pair(0xdead_beef, 0xfeed);
+        app.agents
+            .work
+            .apply(&agent_frame("aa", Some(elsewhere), "t1"), 130);
+        app.agents.cursor.level = crate::agents::Level::Detail;
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Unavailable context"), "{text}");
+        assert!(
+            !text.contains(&elsewhere.to_string()),
+            "no id, no name of a conversation outside the user's channels: {text}"
+        );
+    }
+
+    #[test]
+    fn a_row_gives_up_its_name_before_the_status_it_carries() {
+        let working = crate::app::AgentStatus::Working(1);
+        let line = agent_row("a-very-long-agent-name", &working, 20)[0].to_string();
+        assert!(line.ends_with("Working"), "{line}");
+        assert_eq!(line.chars().count(), 20, "{line}");
+        // Too little room for both: the name takes a line, the status the next.
+        let rows = agent_row("Ada", &working, 10);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].to_string(), "Ada");
+        assert_eq!(rows[1].to_string().trim(), "Working");
+    }
+
+    #[test]
+    fn the_roster_states_keep_their_own_words() {
+        assert_eq!(
+            roster_state_lines(&crate::agents::Load::Failed("x".into()))[0],
+            "Cannot load agents"
+        );
+        assert_eq!(
+            roster_state_lines(&crate::agents::Load::Unavailable("x".into()))[0],
+            "Agent overview unavailable for this identity"
+        );
+        let empty = crate::agents::Load::Loaded(crate::agents::Roster::default());
+        assert_eq!(roster_state_lines(&empty), vec!["No agents".to_owned()]);
+        let partial = crate::agents::Load::Loaded(crate::agents::Roster {
+            unverified: 1,
+            ..crate::agents::Roster::default()
+        });
+        let lines = roster_state_lines(&partial);
+        assert!(
+            lines.iter().any(|line| line.starts_with("No agents")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Ownership unverified")),
+            "an unverified record is not an owned Agent: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_detail_window_follows_the_selected_context() {
+        assert_eq!(scroll_window(3, 10, 0), 0..3);
+        assert_eq!(scroll_window(10, 4, 0), 0..4);
+        assert_eq!(scroll_window(10, 4, 9), 6..10);
+        assert_eq!(scroll_window(10, 0, 5), 0..0);
     }
 
     #[test]

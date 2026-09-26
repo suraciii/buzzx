@@ -60,6 +60,30 @@ offline. It is never stored: it exists only while it is fresh.
 The kind 20002 ephemeral event that states an identity is composing a message
 in a channel or a thread. It is never stored.
 
+**Agent**:
+An identity that works on someone's behalf. In Buzz an Agent signs its own
+events and belongs to one owner who delegates to it. An Agent that posts in a
+channel looks like any other member: bot membership or a matching name is not
+proof of ownership.
+
+**owner**:
+The identity an Agent belongs to. `buzzx` reads the login identity's own
+Agent roster and that identity's own observer frames. It never borrows another
+identity's ownership, and it never substitutes a delegated identity's owner
+for the login.
+
+**observer frame**:
+The kind 24200 event an Agent publishes while it works. It carries the owner's
+public key in a `p` tag, the Agent's in an `agent` tag, its direction in a
+`frame` tag, and a NIP-44 payload encrypted to the owner. The relay delivers a
+frame only to the owner's own subscription; `buzzx` keeps the Agent, the turn
+and the terminal state, and drops the rest of the payload.
+
+**turn**:
+One unit of work an Agent runs. A turn belongs to a conversation when the
+frame names one. Frames report a turn starting, staying alive, ending, or
+failing. A turn whose frames stop is not known to have ended.
+
 **NIP-42**:
 The relay authentication handshake. The relay sends a challenge; the client
 replies with a signed event that cites the relay URL and the challenge. No
