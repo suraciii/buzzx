@@ -992,7 +992,11 @@ impl App {
                 }
                 return;
             }
-            _ => {}
+            kind if content::inbox_kinds().contains(&kind) => {}
+            // The feed asked for these kinds and no others. A relay that sends
+            // something else does not get to invent an unread message: a
+            // reaction is not a timeline event and never becomes a candidate.
+            _ => return,
         }
         if event.pubkey.to_hex() == me {
             return;
@@ -1092,6 +1096,14 @@ impl App {
         if advanced {
             entry.read.frontier = latest;
             entry.read.presented.clear();
+        } else if claim {
+            // A conversation with no marker starts from a seed at the newest
+            // message the feed named, which is not on screen until its own
+            // history loads. A claim that starts from a seed therefore reaches
+            // only as far as the newest row the reader was shown: anything the
+            // baseline knows about and the timeline did not deliver stays
+            // unread, because nothing presented it.
+            entry.read.frontier = entry.read.frontier.min(latest);
         }
         for id in presented {
             if entry.read.unread_at(&id, latest) {
@@ -3764,6 +3776,73 @@ mod tests {
             Some(&10),
             "the frontier is the newest message that was on screen"
         );
+    }
+
+    #[test]
+    fn a_seed_claim_reaches_only_as_far_as_the_rows_that_were_shown() {
+        let mut app = app();
+        let keys = keys();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        let id = app.channels[0].id;
+        caught_up(&mut app);
+        // The feed names the conversation's newest message, which is all a
+        // conversation without a marker has: a baseline at second 100.
+        app.apply(
+            ChatEvent::Seed {
+                channel: id,
+                latest: Some(message_event(&keys, id, "newest", 100)),
+                complete: true,
+            },
+            0,
+        );
+        // The history this terminal loaded reaches second 91, and that row is
+        // the one on screen.
+        app.channels[0].rows = vec![row("a", 90, "p"), row("b", 91, "p")];
+        app.channels[0].loading = false;
+        app.focus = 1;
+        app.note_presented();
+        let claim = published(&mut app).expect("the presented rows are a read claim");
+        assert_eq!(
+            claim.get(&id.to_string()),
+            Some(&91),
+            "a baseline reaches no further than the newest row the reader saw"
+        );
+    }
+
+    #[test]
+    fn a_kind_the_inbox_feed_did_not_ask_for_is_not_an_unread_message() {
+        let mut app = app();
+        let keys = keys();
+        app.channels = vec![channel(1), channel(2)];
+        app.stub_roster();
+        let (open, other) = (app.channels[0].id, app.channels[1].id);
+        caught_up(&mut app);
+        app.focus = 0;
+        let reaction = EventBuilder::new(Kind::Custom(content::AUX_KINDS[0] as u16), "+")
+            .tags(vec![nostr::Tag::parse(["h", &other.to_string()]).unwrap()])
+            .sign_with_keys(&keys)
+            .unwrap();
+        app.apply(
+            ChatEvent::InboxTimeline {
+                channel: other,
+                event: reaction,
+            },
+            0,
+        );
+        assert!(
+            app.channels[1].read.unread.is_empty(),
+            "a reaction on the feed is not a message"
+        );
+        app.apply(
+            ChatEvent::InboxTimeline {
+                channel: other,
+                event: message_event(&keys, other, "hello", 30),
+            },
+            0,
+        );
+        assert_eq!(app.channels[1].read.unread.len(), 1);
+        assert_ne!(open, other);
     }
 
     #[test]

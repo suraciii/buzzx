@@ -186,6 +186,10 @@ pub enum SessionCommand {
 pub struct Session {
     pub commands: mpsc::Sender<SessionCommand>,
     pub started: oneshot::Receiver<Result<(), (i32, String)>>,
+    /// Resolves when the command pump has finished, including the read it owes
+    /// a quitting session. A process that exits on its own must wait for this,
+    /// or the last write is cut off mid-flight.
+    pub finished: oneshot::Receiver<()>,
 }
 
 /// Start the session: one WebSocket pump and one command pump, both feeding
@@ -194,6 +198,7 @@ pub fn spawn(resolved: &Resolved, events: mpsc::Sender<ChatEvent>) -> Session {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (sub_tx, sub_rx) = mpsc::channel(64);
     let (started_tx, started_rx) = oneshot::channel();
+    let (finished_tx, finished_rx) = oneshot::channel();
 
     let (_http_url, ws_url) =
         crate::config::split_relay_url(&resolved.http_url).expect("a resolved URL always splits");
@@ -215,11 +220,13 @@ pub fn spawn(resolved: &Resolved, events: mpsc::Sender<ChatEvent>) -> Session {
         cmd_rx,
         sub_tx,
         events,
+        finished_tx,
     ));
 
     Session {
         commands: cmd_tx,
         started: started_rx,
+        finished: finished_rx,
     }
 }
 
@@ -239,6 +246,7 @@ async fn run_command_pump(
     mut commands: mpsc::Receiver<SessionCommand>,
     subs: mpsc::Sender<SubControl>,
     events: mpsc::Sender<ChatEvent>,
+    finished: oneshot::Sender<()>,
 ) {
     // What this terminal has read, waiting for its window to close.
     let mut pending_read: Option<HashMap<String, u64>> = None;
@@ -258,7 +266,10 @@ async fn run_command_pump(
             None => commands.recv().await,
         };
         let Some(command) = command else {
-            return;
+            // The command channel closing is the other way a session ends, and
+            // it owes the same flush as a shutdown command.
+            flush_read(&client, &mut pending_read, &events).await;
+            break;
         };
         match command {
             SessionCommand::LoadChannels => {
@@ -345,8 +356,25 @@ async fn run_command_pump(
                 };
                 report(outcome, local, &events).await;
             }
-            SessionCommand::Shutdown => return,
+            SessionCommand::Shutdown => {
+                flush_read(&client, &mut pending_read, &events).await;
+                break;
+            }
         }
+    }
+    let _ = finished.send(());
+}
+
+/// Publish a read that is still inside its window. A session that ends must not
+/// drop it: the next session would read a marker that never learned about it and
+/// show as unread what this one had already shown.
+async fn flush_read(
+    client: &Client,
+    pending: &mut Option<HashMap<String, u64>>,
+    events: &mpsc::Sender<ChatEvent>,
+) {
+    if let Some(contexts) = pending.take() {
+        publish_read(client, &contexts, events).await;
     }
 }
 

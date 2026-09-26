@@ -287,6 +287,9 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// How long a quitting session may spend finishing the read it owes.
+const QUIT_FLUSH: Duration = Duration::from_secs(2);
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -377,6 +380,10 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
                     .commands
                     .send(session::SessionCommand::Shutdown)
                     .await;
+                // The session may still owe a read that is inside its publish
+                // window. Wait for it to finish that write, bounded so a wedged
+                // relay cannot hold the exit.
+                let _ = tokio::time::timeout(QUIT_FLUSH, session.finished).await;
                 return Ok(app.exit_code);
             }
         }

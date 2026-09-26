@@ -28,6 +28,18 @@ const NAME_TAG: &str = "name";
 /// The tag that names a channel's type on metadata events: `stream`, `forum`,
 /// `workflow`, or `dm`.
 const TYPE_TAG: &str = "t";
+
+/// The identity's own marker lookup. Bounded to the window the contract names:
+/// the window is a query bound, not marker expiry.
+fn read_state_filter(me: &str, now: u64) -> Value {
+    json!({
+        "kinds": [content::READ_STATE_KIND],
+        "authors": [me],
+        "#t": [READ_STATE_TAG],
+        "since": now.saturating_sub(READ_STATE_WINDOW_SECS),
+        "limit": READ_STATE_LIMIT,
+    })
+}
 /// The metadata tag the relay sets on a DM, as a hint not to show it in a
 /// public group list. It is not the viewer's hidden state.
 const DM_HINT_TAG: &str = "hidden";
@@ -43,6 +55,10 @@ const DM_TYPE: &str = "dm";
 const CHANNEL_QUERY_LIMIT: u64 = 500;
 /// How many marker slots one answer may carry.
 const READ_STATE_LIMIT: u64 = 500;
+/// How far back the marker lookup reaches. The window is a query bound, not
+/// marker expiry: an identity that has read nothing in a week starts from a
+/// seed rather than from a frontier nobody has refreshed.
+const READ_STATE_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 /// The second tag every read-state slot carries.
 const READ_STATE_TAG: &str = "read-state";
 /// How many events one conversation's catch-up asks for. A full page is a
@@ -326,12 +342,7 @@ impl Client {
         let me = self.keys.public_key().to_hex();
         let events = self
             .transport
-            .query(&json!({
-                "kinds": [content::READ_STATE_KIND],
-                "authors": [me],
-                "#t": [READ_STATE_TAG],
-                "limit": READ_STATE_LIMIT,
-            }))
+            .query(&read_state_filter(&me, crate::sub::now_secs()))
             .await?;
         Ok(read_state::parse(&self.keys, &events))
     }
@@ -875,6 +886,24 @@ mod tests {
         let filter = CatchUp::Newest { channel: channel() }.filter();
         assert_eq!(filter["limit"], 1);
         assert!(filter.get("since").is_none(), "a baseline is not a window");
+    }
+
+    #[test]
+    fn the_marker_lookup_is_bounded_to_the_window_the_contract_names() {
+        let now = 1_000_000_000;
+        let filter = read_state_filter("me", now);
+        assert_eq!(filter["since"], now - READ_STATE_WINDOW_SECS);
+        assert_eq!(filter["limit"], READ_STATE_LIMIT);
+        assert_eq!(filter["#t"], json!([READ_STATE_TAG]));
+        assert_eq!(filter["authors"], json!(["me"]));
+        assert_eq!(
+            filter["since"],
+            now - 7 * 24 * 60 * 60,
+            "seven days, as the decision states"
+        );
+
+        // A clock near the epoch cannot ask for a window that starts before it.
+        assert_eq!(read_state_filter("me", 10)["since"], 0);
     }
 
     #[test]
