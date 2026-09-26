@@ -139,7 +139,7 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
                 Err(failure) => return refuse(&failure, Some(&channel.to_string()), None),
             };
             write_result(
-                client.send_message(channel, &content, None).await,
+                client.send_message(channel, &content, None, &[]).await,
                 Some(&channel.to_string()),
                 None,
             )

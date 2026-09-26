@@ -13,6 +13,7 @@ mod http;
 mod keys;
 mod layout;
 mod login;
+mod mentions;
 mod read_state;
 mod session;
 mod sub;

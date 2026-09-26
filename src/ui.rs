@@ -1063,6 +1063,15 @@ fn help_text(app: &App, mode: LayoutMode) -> String {
     if let Some(entry) = app.focused_entry() {
         text.push_str(&format!("selected: {}\n", app.label(entry)));
     }
+    if let Some(block) = &app.mention_block {
+        // The last send never reached the relay: the full references stay
+        // here, where the text scrolls, until the draft is sent again.
+        text.push_str("\nthe last send was blocked by the mention check\n");
+        text.push_str(&format!("  {}\n", block.summary));
+        for detail in &block.details {
+            text.push_str(&format!("  {detail}\n"));
+        }
+    }
     text.push_str(
         "read state is shared with other terminals through the relay.\n\
          if a publish fails this terminal keeps its place and shows\n\
@@ -1119,6 +1128,23 @@ fn help_lines(text: &str, width: usize) -> Vec<String> {
         }
         let mut current = String::new();
         for word in line.split(' ') {
+            // A word wider than the terminal - a full `nostr:npub1…`
+            // reference - breaks across lines rather than being clipped, so
+            // every character of the help text stays reachable by scrolling.
+            if word.chars().count() > width {
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                }
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    chunk.push(ch);
+                    if chunk.chars().count() == width {
+                        lines.push(std::mem::take(&mut chunk));
+                    }
+                }
+                current = chunk;
+                continue;
+            }
             let mut piece = current.clone();
             if !piece.is_empty() {
                 piece.push(' ');
@@ -1399,6 +1425,37 @@ mod tests {
         assert!(
             !text.contains("#alice"),
             "an octothorpe would claim a DM is a channel: {text}"
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_carries_the_blocked_mention_reference() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.mention_block = Some(crate::app::MentionBlock {
+            summary: "mention \"@buzzx build\" matches 2 members; replace it with one exact reference (? for identities)".into(),
+            details: vec![
+                "@buzzx build -> nostr:npub1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ],
+        });
+        app.help = true;
+        app.help_scroll = 0;
+
+        // At the smallest size the reference is below the fold, and scrolling
+        // reaches it: it is longer than the terminal is wide.
+        let mut seen = frame_text(&app, 24, 6);
+        for _ in 0..40 {
+            app.handle(crate::keys::Action::HelpScroll(1), 0);
+            seen.push_str(&frame_text(&app, 24, 6));
+        }
+        assert!(
+            seen.contains("mention"),
+            "the block is named: {}",
+            &seen[seen.len().saturating_sub(400)..]
+        );
+        assert!(
+            seen.contains("nostr:npub1"),
+            "the exact reference is reachable: {}",
+            &seen[seen.len().saturating_sub(400)..]
         );
     }
 

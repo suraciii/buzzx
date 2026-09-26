@@ -19,8 +19,10 @@ The design documents, which state the boundaries and the contracts to
 preserve, live in [../design/](../design/). The product contract, which states
 why `buzzx` exists, lives in [../core.md](../core.md).
 
-The planned [Agents overview](tui-use.md#agents-overview) is the next
-read-only Agent capability; it is not implemented yet.
+The [Agents overview](tui-use.md#agents-overview) lists the Agents the signed-in
+identity owns and what the owner-private observer feed says about their work.
 
-The planned [send-time mention resolution](tui-use.md#planned-resolve-mentions-when-sending)
-is the minimal recipient-correctness slice for Build.
+[Resolving mentions when sending](tui-use.md#mentions-when-sending) is the
+recipient-correctness rule for the composer: a complete `@member name` in a new
+message or reply becomes a signed recipient, and a draft that cannot be resolved
+is not published.
