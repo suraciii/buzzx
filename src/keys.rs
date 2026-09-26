@@ -25,6 +25,11 @@ pub enum Action {
     PickerNext,
     PickerPrev,
     PickerConfirm,
+    /// `f`: the next Inbox filter.
+    FilterNext,
+    /// Scroll the help text by this many lines. At the minimum size the text
+    /// is taller than the screen, and the whole of it must stay reachable.
+    HelpScroll(isize),
     /// Esc: close the topmost overlay. The composer keeps its own escape.
     Dismiss,
     /// `g` or Home: focus the oldest loaded row.
@@ -33,7 +38,7 @@ pub enum Action {
     Bottom,
     PageUp,
     PageDown,
-    /// `i` or Tab: compose a new message.
+    /// `i`: compose a new message.
     ComposeNew,
     /// Enter: compose a reply to the focused row, or a new message when the
     /// timeline is empty.
@@ -62,9 +67,10 @@ pub enum Action {
 }
 
 /// Map a key press to an action in navigation mode. `layout` selects the
-/// list that `j` and `k` move; `picker` routes keys to the open channel
-/// picker, which isolates the rest of the navigation keys.
-pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool) -> Action {
+/// list that `j` and `k` move; `picker` routes keys to the open conversation
+/// picker, and `help` to the help text drawn over everything else. Each
+/// overlay isolates the rest of the navigation keys.
+pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool, help: bool) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
@@ -78,10 +84,22 @@ pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool) -> Action
             _ => Action::Ignored,
         };
     }
+    if help {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::HelpScroll(1),
+            KeyCode::Char('k') | KeyCode::Up => Action::HelpScroll(-1),
+            KeyCode::PageDown => Action::HelpScroll(PAGE_ROWS as isize),
+            KeyCode::PageUp => Action::HelpScroll(-(PAGE_ROWS as isize)),
+            KeyCode::Esc | KeyCode::Char('?') => Action::Dismiss,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
     if picker {
         return match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::PickerNext,
             KeyCode::Char('k') | KeyCode::Up => Action::PickerPrev,
+            KeyCode::Char('f') | KeyCode::Tab => Action::FilterNext,
             KeyCode::Enter => Action::PickerConfirm,
             KeyCode::Esc | KeyCode::Char('c') => Action::Dismiss,
             KeyCode::Char('?') => Action::ToggleHelp,
@@ -103,9 +121,10 @@ pub fn map_navigation(key: KeyEvent, layout: LayoutMode, picker: bool) -> Action
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
-        KeyCode::Char('i') | KeyCode::Tab => Action::ComposeNew,
+        KeyCode::Char('i') => Action::ComposeNew,
         KeyCode::Enter => Action::ComposeReply,
         KeyCode::Char('c') => Action::TogglePicker,
+        KeyCode::Char('f') => Action::FilterNext,
         KeyCode::Char('r') => Action::React,
         KeyCode::Char('e') => Action::EditRow,
         KeyCode::Char('d') => Action::DeleteRow,
@@ -158,11 +177,21 @@ mod tests {
     }
 
     fn wide(code: KeyCode) -> Action {
-        map_navigation(key(code, KeyModifiers::NONE), LayoutMode::Wide, false)
+        map_navigation(
+            key(code, KeyModifiers::NONE),
+            LayoutMode::Wide,
+            false,
+            false,
+        )
     }
 
     fn narrow(code: KeyCode) -> Action {
-        map_navigation(key(code, KeyModifiers::NONE), LayoutMode::Narrow, false)
+        map_navigation(
+            key(code, KeyModifiers::NONE),
+            LayoutMode::Narrow,
+            false,
+            false,
+        )
     }
 
     #[test]
@@ -187,8 +216,14 @@ mod tests {
 
     #[test]
     fn an_open_picker_takes_the_selection_keys_and_isolates_the_rest() {
-        let picker =
-            |code: KeyCode| map_navigation(key(code, KeyModifiers::NONE), LayoutMode::Narrow, true);
+        let picker = |code: KeyCode| {
+            map_navigation(
+                key(code, KeyModifiers::NONE),
+                LayoutMode::Narrow,
+                true,
+                false,
+            )
+        };
         assert_eq!(picker(KeyCode::Char('j')), Action::PickerNext);
         assert_eq!(picker(KeyCode::Up), Action::PickerPrev);
         assert_eq!(picker(KeyCode::Enter), Action::PickerConfirm);
@@ -205,7 +240,7 @@ mod tests {
     #[test]
     fn a_too_small_terminal_only_answers_q_and_ctrl_c() {
         let small = |code: KeyCode, modifiers| {
-            map_navigation(key(code, modifiers), LayoutMode::TooSmall, false)
+            map_navigation(key(code, modifiers), LayoutMode::TooSmall, false, false)
         };
         assert_eq!(small(KeyCode::Char('q'), KeyModifiers::NONE), Action::Quit);
         assert_eq!(
@@ -214,6 +249,10 @@ mod tests {
         );
         assert_eq!(
             small(KeyCode::Char('i'), KeyModifiers::NONE),
+            Action::Ignored
+        );
+        assert_eq!(
+            small(KeyCode::Char('f'), KeyModifiers::NONE),
             Action::Ignored
         );
         assert_eq!(
@@ -230,6 +269,7 @@ mod tests {
             map_navigation(
                 key(KeyCode::Char('G'), KeyModifiers::SHIFT),
                 LayoutMode::Wide,
+                false,
                 false
             ),
             Action::Bottom
@@ -245,11 +285,52 @@ mod tests {
     }
 
     #[test]
+    fn an_open_help_text_scrolls_and_keeps_its_exit() {
+        let help = |code: KeyCode| {
+            map_navigation(
+                key(code, KeyModifiers::NONE),
+                LayoutMode::Minimal,
+                false,
+                true,
+            )
+        };
+        assert_eq!(help(KeyCode::Char('j')), Action::HelpScroll(1));
+        assert_eq!(help(KeyCode::Down), Action::HelpScroll(1));
+        assert_eq!(help(KeyCode::Char('k')), Action::HelpScroll(-1));
+        assert_eq!(
+            help(KeyCode::PageDown),
+            Action::HelpScroll(PAGE_ROWS as isize)
+        );
+        assert_eq!(help(KeyCode::Esc), Action::Dismiss);
+        assert_eq!(help(KeyCode::Char('q')), Action::Quit);
+        // Everything the help text does not use is inert: no key reaches a
+        // conversation behind it.
+        assert_eq!(help(KeyCode::Char('i')), Action::Ignored);
+        assert_eq!(help(KeyCode::Enter), Action::Ignored);
+    }
+
+    #[test]
+    fn the_picker_cycles_the_filter_and_the_sidebar_does_too() {
+        let picker = |code: KeyCode| {
+            map_navigation(
+                key(code, KeyModifiers::NONE),
+                LayoutMode::Narrow,
+                true,
+                false,
+            )
+        };
+        assert_eq!(picker(KeyCode::Char('f')), Action::FilterNext);
+        assert_eq!(picker(KeyCode::Tab), Action::FilterNext);
+        assert_eq!(wide(KeyCode::Char('f')), Action::FilterNext);
+    }
+
+    #[test]
     fn ctrl_c_quits_from_either_mode() {
         assert_eq!(
             map_navigation(
                 key(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 LayoutMode::Wide,
+                false,
                 false
             ),
             Action::Quit

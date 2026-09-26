@@ -1,8 +1,9 @@
 //! The WebSocket pump: one task that owns the NIP-42 connection, the REQ
 //! lifecycle, frame decoding, and reconnects. The contract is
 //! design/relay-transport.md. Nothing here decides what a row means; it
-//! forwards typed `ChatEvent`s.
-
+//! forwards typed `ChatEvent`s. The Inbox feed watches every listed conversation
+//! so unread remains visible outside the conversation on screen, which keeps its
+//! own Timeline feed.
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,15 +30,23 @@ const AUX_CHUNK: usize = 100;
 /// What the UI asks the pump to subscribe to.
 #[derive(Debug)]
 pub enum SubControl {
-    /// The live timeline feed for one channel.
+    /// The live timeline feed for one channel on screen.
     Timeline(Uuid),
     /// The overlay feed for one channel's loaded ids, replacing the previous
     /// feed for that channel.
     Aux { channel: Uuid, ids: Vec<String> },
+    /// Add ids to one channel's aux feed without dropping ids learned from a
+    /// live timeline event.
+    AuxAdd { channel: Uuid, ids: Vec<String> },
     /// The typing feed for every channel the identity belongs to, replacing
     /// the previous feed. The list is per-connection state: an empty list
     /// closes the feed.
     Typing(Vec<Uuid>),
+    /// The live timeline feed for every listed conversation, replacing the
+    /// previous feed. One REQ per conversation: the relay indexes live
+    /// fan-out by a single `#h` value, and a filter naming several receives
+    /// nothing. This makes unread visible for conversations that are not open.
+    Inbox(Vec<Uuid>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +54,7 @@ enum SubKind {
     Timeline(Uuid),
     Aux(#[allow(dead_code)] Uuid),
     Typing(Uuid),
+    Inbox(Uuid),
 }
 
 /// What a `CLOSED` from the relay ended, for a subscription this client
@@ -53,6 +63,7 @@ enum SubKind {
 enum Closed {
     Timeline(Uuid),
     Typing(Uuid),
+    Inbox(Uuid),
 }
 
 fn close_subscription(state: &mut PumpState, sub_id: &str) -> Option<Closed> {
@@ -62,6 +73,7 @@ fn close_subscription(state: &mut PumpState, sub_id: &str) -> Option<Closed> {
             Some(Closed::Timeline(channel))
         }
         SubKind::Typing(channel) => Some(Closed::Typing(channel)),
+        SubKind::Inbox(channel) => Some(Closed::Inbox(channel)),
         SubKind::Aux(_) => None,
     }
 }
@@ -97,6 +109,15 @@ fn typing_filter(channel: &Uuid) -> serde_json::Value {
     })
 }
 
+fn inbox_filter(channel: &Uuid, since: u64) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": crate::content::inbox_kinds(),
+        "#h": [channel.to_string()],
+        "limit": 1000,
+        "since": since,
+    })
+}
+
 /// The channel a typing indicator names. An indicator without a usable `h`
 /// tag cannot be placed on screen, so the pump drops it.
 fn typing_channel(event: &nostr::Event) -> Option<Uuid> {
@@ -109,7 +130,7 @@ fn typing_channel(event: &nostr::Event) -> Option<Uuid> {
     })
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -218,6 +239,7 @@ struct PumpState {
     timeline_channels: Vec<Uuid>,
     aux_ids: HashMap<Uuid, Vec<String>>,
     typing_channels: Vec<Uuid>,
+    inbox_channels: Vec<Uuid>,
 }
 
 impl PumpState {
@@ -281,6 +303,19 @@ impl PumpState {
             self.sub_ids.insert(sub_id, SubKind::Aux(channel));
         }
     }
+    async fn add_aux(&mut self, conn: &mut NostrWsConnection, channel: Uuid, ids: Vec<String>) {
+        let mut merged = self.aux_ids.get(&channel).cloned().unwrap_or_default();
+        let mut changed = false;
+        for id in ids {
+            if !merged.contains(&id) {
+                merged.push(id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.subscribe_aux(conn, channel, merged).await;
+        }
+    }
 
     /// Replace the typing feed with one covering exactly these channels. Every
     /// subscription is replaced rather than added to: the channel list is the
@@ -304,6 +339,47 @@ impl PumpState {
             Self::req_raw(conn, &sub_id, &typing_filter(&channel)).await;
             self.sub_ids.insert(sub_id, SubKind::Typing(channel));
         }
+    }
+
+    /// Replace the Inbox feed with one `#h`-scoped REQ per listed conversation.
+    /// The open conversation already has its own Timeline feed; this feed keeps
+    /// unread state live for conversations that are not on screen.
+    async fn subscribe_inbox(&mut self, conn: &mut NostrWsConnection, channels: Vec<Uuid>) {
+        let since = now_secs().saturating_sub(LIVE_OVERLAP_SECS);
+        let (close, subscriptions) = self.plan_inbox(channels, since);
+        for sub_id in close {
+            Self::close(conn, &sub_id).await;
+        }
+        for (sub_id, filter) in subscriptions {
+            Self::req_raw(conn, &sub_id, &filter).await;
+        }
+    }
+
+    /// Replace connection-local Inbox ids while retaining the session's channel
+    /// list for reconnect. Returned close ids must be sent before the new REQs.
+    fn plan_inbox(
+        &mut self,
+        channels: Vec<Uuid>,
+        since: u64,
+    ) -> (Vec<String>, Vec<(String, serde_json::Value)>) {
+        let close = self
+            .sub_ids
+            .keys()
+            .filter(|sub_id| sub_id.starts_with("i:"))
+            .cloned()
+            .collect();
+        self.sub_ids.retain(|sub_id, _| !sub_id.starts_with("i:"));
+        self.inbox_channels = channels.clone();
+        let subscriptions = channels
+            .into_iter()
+            .map(|channel| {
+                let sub_id = format!("i:{channel}");
+                let filter = inbox_filter(&channel, since);
+                self.sub_ids.insert(sub_id.clone(), SubKind::Inbox(channel));
+                (sub_id, filter)
+            })
+            .collect();
+        (close, subscriptions)
     }
 
     /// The timeline REQs a new connection owes: every channel the session
@@ -336,6 +412,12 @@ impl PumpState {
             let typing = self.typing_channels.clone();
             self.subscribe_typing(conn, typing).await;
         }
+        // The Inbox feed has the same replacement semantics as typing: the
+        // session's retained channel list is authoritative on each connection.
+        if !self.inbox_channels.is_empty() {
+            let inbox = self.inbox_channels.clone();
+            self.subscribe_inbox(conn, inbox).await;
+        }
     }
 }
 
@@ -363,10 +445,11 @@ async fn apply_control(conn: &mut NostrWsConnection, state: &mut PumpState, cont
     match control {
         SubControl::Timeline(channel) => state.subscribe_timeline(conn, channel).await,
         SubControl::Aux { channel, ids } => state.subscribe_aux(conn, channel, ids).await,
+        SubControl::AuxAdd { channel, ids } => state.add_aux(conn, channel, ids).await,
         SubControl::Typing(channels) => state.subscribe_typing(conn, channels).await,
+        SubControl::Inbox(channels) => state.subscribe_inbox(conn, channels).await,
     }
 }
-
 /// Apply every queued control message. A closed channel means shutdown.
 async fn drain_control(
     conn: &mut NostrWsConnection,
@@ -398,6 +481,14 @@ async fn handle_message(
             Some(SubKind::Timeline(channel)) => {
                 let _ = events
                     .send(ChatEvent::Timeline {
+                        channel: *channel,
+                        event: *event,
+                    })
+                    .await;
+            }
+            Some(SubKind::Inbox(channel)) => {
+                let _ = events
+                    .send(ChatEvent::InboxTimeline {
                         channel: *channel,
                         event: *event,
                     })
@@ -440,6 +531,14 @@ async fn handle_message(
                     })
                     .await;
             }
+            Some(Closed::Inbox(channel)) => {
+                let _ = events
+                    .send(ChatEvent::InboxClosed {
+                        channel,
+                        reason: message,
+                    })
+                    .await;
+            }
             None => {}
         },
         RelayMessage::Notice { message } => {
@@ -465,7 +564,6 @@ async fn handle_message(
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +687,82 @@ mod tests {
         // Ephemeral: nothing is stored, so a window could only hide a live one.
         assert!(filter.get("since").is_none());
         assert!(filter.get("limit").is_none());
+    }
+
+    #[test]
+    fn replacing_inbox_closes_old_i_subscriptions_and_retains_other_feeds() {
+        let (old_a, old_b, new, timeline) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut state = PumpState {
+            inbox_channels: vec![old_a, old_b],
+            ..PumpState::default()
+        };
+        state
+            .sub_ids
+            .insert(format!("i:{old_a}"), SubKind::Inbox(old_a));
+        state
+            .sub_ids
+            .insert(format!("i:{old_b}"), SubKind::Inbox(old_b));
+        state
+            .sub_ids
+            .insert(format!("t:{timeline}"), SubKind::Timeline(timeline));
+
+        let (close, subscriptions) = state.plan_inbox(vec![new], 123);
+
+        assert_eq!(close.len(), 2);
+        assert!(close.contains(&format!("i:{old_a}")));
+        assert!(close.contains(&format!("i:{old_b}")));
+        assert_eq!(ids(&subscriptions), vec![format!("i:{new}")]);
+        assert!(!state.sub_ids.contains_key(&format!("i:{old_a}")));
+        assert!(!state.sub_ids.contains_key(&format!("i:{old_b}")));
+        assert!(state.sub_ids.contains_key(&format!("t:{timeline}")));
+        assert_eq!(state.inbox_channels, vec![new]);
+    }
+
+    #[test]
+    fn inbox_plan_opens_one_single_channel_req_per_conversation() {
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut state = PumpState::default();
+
+        let (_, subscriptions) = state.plan_inbox(vec![first, second], 100);
+
+        assert_eq!(subscriptions.len(), 2);
+        for (sub_id, filter) in subscriptions {
+            let channel = if sub_id == format!("i:{first}") {
+                first
+            } else {
+                assert_eq!(sub_id, format!("i:{second}"));
+                second
+            };
+            assert_eq!(filter["#h"], serde_json::json!([channel.to_string()]));
+            assert_eq!(filter["#h"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn inbox_filter_matches_the_channel_timeline_shape() {
+        let channel = Uuid::new_v4();
+        let since = 456;
+        let mut state = PumpState::default();
+
+        let (_, subscriptions) = state.plan_inbox(vec![channel], since);
+
+        let filter = &subscriptions[0].1;
+        assert_eq!(filter, &inbox_filter(&channel, since));
+        assert_eq!(filter["limit"], serde_json::json!(1000));
+        assert_eq!(filter["since"], serde_json::json!(since));
+    }
+
+    #[test]
+    fn inbox_filter_includes_edit_and_deletion_kinds_without_reactions() {
+        let filter = inbox_filter(&Uuid::new_v4(), 456);
+        let kinds = filter["kinds"].as_array().expect("kind list");
+        assert!(kinds.contains(&serde_json::json!(40003)));
+        assert!(kinds.contains(&serde_json::json!(5)));
+        assert!(!kinds.contains(&serde_json::json!(7)));
     }
 }

@@ -12,6 +12,7 @@ mod http;
 mod keys;
 mod layout;
 mod login;
+mod read_state;
 mod session;
 mod sub;
 mod ui;
@@ -286,6 +287,9 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// How long a quitting session may spend finishing the read it owes.
+const QUIT_FLUSH: Duration = Duration::from_secs(2);
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -364,7 +368,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             if let Some(key) = key {
                 let action = match app.mode {
                     app::Mode::Navigation => {
-                        keys::map_navigation(key, layout, app.picker.is_some())
+                        keys::map_navigation(key, layout, app.picker.is_some(), app.help)
                     }
                     app::Mode::Composer => keys::map_composer(key),
                 };
@@ -376,6 +380,10 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
                     .commands
                     .send(session::SessionCommand::Shutdown)
                     .await;
+                // The session may still owe a read that is inside its publish
+                // window. Wait for it to finish that write, bounded so a wedged
+                // relay cannot hold the exit.
+                let _ = tokio::time::timeout(QUIT_FLUSH, session.finished).await;
                 return Ok(app.exit_code);
             }
         }

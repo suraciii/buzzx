@@ -49,12 +49,11 @@ reach a builder.
 
 Reads, each returning a typed value:
 
-- `channels()` - the membership roster (kind 39002, `#p` the identity), then
-  metadata (kind 39000, `#d` the ids). One `ChannelInfo { id, name }` per
-  roster id, the name from the metadata event when there is one and the id
-  when there is not. A metadata failure fails the call instead of shortening
-  the list: today a failed metadata query empties the TUI's channel list, and
-  that is a bug this fixes.
+- `channels()` returns the membership roster, its metadata, and hidden-DM
+  visibility. Classification-query failures produce an incomplete roster;
+  membership-query failure fails the call. Rows with no metadata are marked
+  unknown, not silently assigned a kind. (Sources: `Client::channels`,
+  `channels_from`, `Roster::complete`.)
 - `history(channel, limit)` - the timeline kinds, `#h` the channel, oldest
   first. An unknown channel UUID is an empty array; the bridge has no
   channel-existence query, so "no such channel" and "no messages" cannot be
@@ -120,17 +119,73 @@ Invariants:
   `invalid_input`, and no event is signed.
 - One retry rule, owned by [relay-transport.md](relay-transport.md). A read
   may be retried once after a connect failure or a lost answer, because a
-  read changes nothing. A write is retried only while it is certain that the
-  request never left the client; after that a retry can duplicate an event.
+  read changes nothing. A write is not automatically retried by the client;
+  an uncertain publish is not resent because it may have been admitted. A later
+  read advance may issue a new publish; that is a new read update, not a retry.
 - No rendering, no wording, no exit code.
+
+## Inbox and read state
+
+`app.rs` owns the conversation sections, filters, unread candidates, and the
+read frontier. `client.rs` reads and publishes markers; `session.rs` schedules
+the read-back and turns failures into events; `sub.rs` watches listed
+conversations under `Channels` and `DMs`. Hidden DMs and archived channels are
+excluded by `ChannelInfo::listed`; if the visibility or metadata query fails,
+the roster is incomplete and the list is not authoritative. Missing metadata
+also sets `Roster::complete` false. Generic DM labels use other participants'
+profile names or shortened public keys, name at most three, and then add
+`+N more`. (Sources: `src/client.rs::ChannelInfo::listed`, `Client::channels`,
+`channels_from`; `src/app.rs::label`, `author_name`, `merge_channels`.)
+
+A row's signal is `●` for unread, `@` for an unread direct mention, `?` for
+unknown state, `Read` only for a picker row retained after it stops matching,
+and two spaces for no signal. `●` and `@` include the count of unread
+message candidates, such as `● 3` or `@ 2`. The five-column minimum signal
+cell is reserved before the label is clipped. Typing adds `…` after the label
+and can coexist with a signal. `All`, `Unread`, and `For you` are filters on
+the same list; `For you` includes every DM and channels with unread direct
+mentions. New messages do not reorder rows. (Sources: `src/app.rs::Filter`,
+`refresh_views`, `marker`, `unread_count`, `picker_view`;
+`src/ui.rs::conversation_item`, `list_rows`; `src/sub.rs::inbox_filter`.)
+
+Read progress advances only after history has loaded, the conversation is
+selected and visible, focus is at its newest loaded message, and neither the
+picker nor help covers the timeline. A conversation without a stored context
+starts from a local baseline at its newest message. That seed is not proof of
+reading and is never uploaded. A message timestamp equal to the frontier
+remains unread until that event is shown, because frontiers have second
+resolution. (Sources: `src/app.rs::note_presented`, `apply_seed`,
+`ReadTrack::unread_at`; `src/client.rs::CatchUp::Newest`.)
+
+The marker is a NIP-44 encrypted kind 30078 event. Its `d` tag is
+`read-state:` plus the hex encoding of the first 16 bytes of SHA-256 over the
+public-key hex text. Its `t` tag is `read-state`. The payload written by this
+client has `v: 1`, `client_id: "buzzx"`, and `contexts`, whose keys are channel
+UUID strings and whose values are Unix seconds. The parser also accepts a
+missing `v` as version 1 and requires a `client_id` string of at most 64
+bytes. Read-back merges every matching slot authored by this identity using
+the per-context maximum before writing this client's slot. The lookup covers
+the last seven days and up to 500 events. (Sources: `src/read_state.rs::slot`,
+`builder`, `parse`; `src/client.rs::read_state`, `publish_read_state`.)
+
+
+A failed marker lookup or an unreadable owned slot is unknown, not read. Failed
+or truncated conversation catch-up is also unknown. A failed publish leaves
+the local frontier advanced and shows `Read here; not synced (<reason>)`; the
+current publish is not retried automatically. Later read updates can issue new
+publishes. The session continues. (Sources: `src/app.rs::apply_read_state`,
+`apply_catch_up`, `inbox_footer`; `src/session.rs::publish_read`,
+`run_command_pump`.)
+
 
 ## What each front end keeps
 
-The TUI (`session.rs` and the modules under it) keeps what a held session
-needs: subscriptions, reconnect, optimistic rows, typing, presence, read
-markers, overlay backfill, key mapping, and the choice of when to ask. The
-command pump becomes a translation: call the core, turn the result into a
-`ChatEvent`.
+The TUI (`app.rs`, `session.rs`, `sub.rs`, and `ui.rs`) keeps the held-session
+state: subscriptions, reconnect, conversations, unread tracking, typing,
+overlays, key mapping, and rendering. `client.rs` owns the relay queries,
+read-state encryption and merge, and writes. The command pump calls the core
+and translates results into `ChatEvent`s.
+
 
 The CLI (`src/cli.rs` and the clap tree in `main.rs`) keeps the one-shot
 concerns: argument parsing, the JSON projection, stdin content, stderr
@@ -236,9 +291,13 @@ never retried.
 
 - stdout carries one JSON value: an array for a channel read, an object for
   one event, one object for a write. Diagnostics go to stderr.
-- Event objects carry all seven fields of the spec, `null` when a value is
-  unknown, so a caller never branches on presence.
-- `channels list` returns one object per channel: `channel_id` and `name`.
+- `channels list` returns an array of `{channel_id, name}` objects on stdout.
+  It also writes an incomplete-roster warning to stderr when a classification
+  query fails or a roster row has no metadata. It projects every roster item;
+  the TUI separately excludes hidden DMs and archived channels from its list
+  when their classification queries succeed. (Sources:
+  `src/cli.rs::run_channels`, `src/client.rs::Client::channels`,
+  `ChannelInfo::listed`.)
 - `messages get --channel` returns the newest `--limit` messages (default 20,
   minimum 1) in timeline order, oldest first. An empty channel is an empty
   array. `--limit` belongs to a channel read: with `--event` it is

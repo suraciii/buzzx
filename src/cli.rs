@@ -67,8 +67,11 @@ pub async fn run_channels(resolved: &Resolved, action: ChannelsCommand) -> i32 {
     let client = Client::new(resolved);
     match action {
         ChannelsCommand::List => match client.channels().await {
-            Ok(channels) => {
-                let list: Vec<Value> = channels
+            Ok(roster) => {
+                // The documented shape is one object per channel with the id
+                // and the name, and stdout carries that one value.
+                let list: Vec<Value> = roster
+                    .items
                     .iter()
                     .map(|channel| {
                         json!({
@@ -77,7 +80,15 @@ pub async fn run_channels(resolved: &Resolved, action: ChannelsCommand) -> i32 {
                         })
                     })
                     .collect();
-                print(&Value::Array(list));
+                if !roster.complete {
+                    // A list that may be missing rows says so, on stderr,
+                    // where the diagnostics belong.
+                    eprintln!(
+                        "warning: the channel list may be incomplete: a query it \
+                         depends on failed, or a row carried no metadata"
+                    );
+                }
+                print(&json!(list));
                 0
             }
             // The channel list is the identity's own: there is no id to name.
