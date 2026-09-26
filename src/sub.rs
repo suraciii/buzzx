@@ -168,6 +168,12 @@ fn frame_tag(event: &nostr::Event, name: &str) -> Option<String> {
 /// comes back is the reduced `agents::Frame` - the payload itself never leaves
 /// this function.
 fn observer_frames(keys: &Keys, me: &str, event: &nostr::Event) -> Vec<crate::agents::Frame> {
+    // The relay carries this frame, and the relay is not the authority on who
+    // sent it: the signature is. A frame that does not verify is not evidence,
+    // whatever its tags say.
+    if event.verify().is_err() {
+        return Vec::new();
+    }
     let Some(owner) = frame_tag(event, "p") else {
         return Vec::new();
     };
@@ -656,6 +662,45 @@ async fn handle_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{EventBuilder, Kind};
+
+    #[test]
+    fn an_observer_frame_that_does_not_verify_is_not_evidence() {
+        let me = Keys::generate();
+        let agent = Keys::generate();
+        let payload = serde_json::json!({
+            "kind": "turn_started",
+            "channelId": "chan-a",
+            "turnId": "t1",
+            "seq": 1,
+        });
+        let ciphertext =
+            buzz_core::observer::encrypt_observer_payload(&agent, &me.public_key(), &payload)
+                .expect("encryption");
+        let event = EventBuilder::new(Kind::Custom(crate::agents::KIND_OBSERVER_FRAME), ciphertext)
+            .tags([
+                Tag::parse(["p", &me.public_key().to_hex()]).unwrap(),
+                Tag::parse(["agent", &agent.public_key().to_hex()]).unwrap(),
+                Tag::parse(["frame", "telemetry"]).unwrap(),
+            ])
+            .sign_with_keys(&agent)
+            .unwrap();
+        assert_eq!(
+            observer_frames(&me, &me.public_key().to_hex(), &event).len(),
+            1,
+            "a signed frame from the Agent is read"
+        );
+
+        // The relay holds the event and can rewrite what the signature covers
+        // without touching the ciphertext, so the fields alone cannot be the
+        // proof that this is the frame the Agent sent.
+        let mut rewritten = event.clone();
+        rewritten.created_at = nostr::Timestamp::from(event.created_at.as_secs() + 60);
+        assert!(
+            observer_frames(&me, &me.public_key().to_hex(), &rewritten).is_empty(),
+            "an event whose signature does not cover its fields is not a frame"
+        );
+    }
 
     /// The sub-ids of a plan, in order.
     fn ids(plan: &[(String, serde_json::Value)]) -> Vec<String> {

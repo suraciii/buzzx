@@ -8,6 +8,7 @@
 //! carried is dropped here. Nothing in this module renders, persists, logs, or
 //! forwards a payload.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use nostr::{Event, PublicKey};
@@ -80,6 +81,8 @@ impl Roster {
             truncated: events.len() as u64 >= ROSTER_LIMIT,
             ..Roster::default()
         };
+        // One Agent, one record: the newest record that claims a `d` tag.
+        let mut claimed: HashMap<String, (u64, String, String)> = HashMap::new();
         for event in events {
             if event.kind.as_u16() as u32 != KIND_MANAGED_AGENT as u32 {
                 continue;
@@ -106,8 +109,29 @@ impl Roster {
                 roster.unreadable += 1;
                 continue;
             };
-            roster.agents.push(OwnedAgent { pubkey, name });
+            // A managed-agent record is parameterized replaceable, keyed by its
+            // `d` tag: one Agent has one record. A relay that answers with more
+            // than one is answered with the newest, the way a replaceable event
+            // is read (newest `created_at`, and the lowest id when two claim the
+            // same second), rather than with a row per record.
+            let created = event.created_at.as_secs();
+            let id = event.id.to_hex();
+            match claimed.entry(pubkey) {
+                Entry::Vacant(slot) => {
+                    slot.insert((created, id, name));
+                }
+                Entry::Occupied(mut slot) => {
+                    let current = slot.get();
+                    if created > current.0 || (created == current.0 && id < current.1) {
+                        slot.insert((created, id, name));
+                    }
+                }
+            }
         }
+        roster.agents = claimed
+            .into_iter()
+            .map(|(pubkey, (_, _, name))| OwnedAgent { pubkey, name })
+            .collect();
         roster.agents.sort_by(|a, b| {
             a.name
                 .to_lowercase()
@@ -219,18 +243,30 @@ fn frame_of(value: &Value, agent: &str) -> Option<Frame> {
     Some(Frame {
         agent: agent.to_owned(),
         kind,
-        channel: string_field(value, "channelId"),
-        turn: string_field(value, "turnId"),
-        seq: value.get("seq").and_then(Value::as_u64).unwrap_or(0),
+        channel: frame_field(value, "channelId")?,
+        turn: frame_field(value, "turnId")?,
+        seq: frame_seq(value)?,
     })
 }
 
-fn string_field(value: &Value, name: &str) -> Option<String> {
-    value
-        .get(name)
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
+/// A field the producer may leave out. `null` is how it says it has none; any
+/// other non-string is a payload this reader cannot read, and a frame it cannot
+/// read is dropped rather than guessed at - a `turnId` of `7` must not become
+/// the identity of a turn nobody can end.
+fn frame_field(value: &Value, name: &str) -> Option<Option<String>> {
+    match value.get(name) {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(text)) => Some((!text.is_empty()).then(|| text.clone())),
+        Some(_) => None,
+    }
+}
+
+/// The producer's process-local sequence number, when it carries one.
+fn frame_seq(value: &Value) -> Option<u64> {
+    match value.get("seq") {
+        None | Some(Value::Null) => Some(0),
+        Some(number) => number.as_u64(),
+    }
 }
 
 /// One observed turn of one Agent.
@@ -504,6 +540,18 @@ mod tests {
         .unwrap()
     }
 
+    /// The same record, dated: a replaceable event is decided by its second.
+    fn record_at(keys: &Keys, agent: &str, name: &str, at: u64) -> Event {
+        EventBuilder::new(
+            NostrKind::Custom(KIND_MANAGED_AGENT),
+            serde_json::json!({ "name": name }).to_string(),
+        )
+        .tags([Tag::parse(["d", agent]).unwrap()])
+        .custom_created_at(nostr::Timestamp::from(at))
+        .sign_with_keys(keys)
+        .unwrap()
+    }
+
     #[test]
     fn the_roster_holds_only_records_this_identity_signed() {
         let me = Keys::generate();
@@ -705,6 +753,76 @@ mod tests {
             .filter(|index| !work.working(&format!("{index:064x}")).is_empty())
             .count();
         assert_eq!(kept, AGENTS);
+    }
+
+    #[test]
+    fn a_second_record_for_one_agent_replaces_the_first() {
+        let me = Keys::generate();
+        let older = record_at(&me, AGENT, "Old Name", 1_000);
+        let newer = record_at(&me, AGENT, "New Name", 1_005);
+        let roster = Roster::from_events(&[older, newer], &me.public_key().to_hex());
+        assert_eq!(roster.agents.len(), 1, "one Agent is one row");
+        assert_eq!(roster.agents[0].name, "New Name");
+        assert!(!roster.incomplete(), "a replaced record is not a gap");
+    }
+
+    #[test]
+    fn two_records_that_claim_the_same_second_do_not_depend_on_answer_order() {
+        let me = Keys::generate();
+        let first = record_at(&me, AGENT, "First", 1_000);
+        let second = record_at(&me, AGENT, "Second", 1_000);
+        let forward =
+            Roster::from_events(&[first.clone(), second.clone()], &me.public_key().to_hex());
+        let backward = Roster::from_events(&[second, first], &me.public_key().to_hex());
+        assert_eq!(forward.agents.len(), 1);
+        assert_eq!(
+            forward.agents[0].name, backward.agents[0].name,
+            "the same two records name the same Agent in either order"
+        );
+    }
+
+    #[test]
+    fn a_frame_field_of_the_wrong_type_is_not_read_as_a_frame() {
+        for payload in [
+            serde_json::json!({ "kind": "turn_started", "channelId": "chan-a", "turnId": 7, "seq": 1 }),
+            serde_json::json!({ "kind": "turn_started", "channelId": 7, "turnId": "t1", "seq": 1 }),
+            serde_json::json!({ "kind": "turn_started", "channelId": "chan-a", "turnId": "t1", "seq": "1" }),
+        ] {
+            assert!(
+                frames(&payload, AGENT).is_empty(),
+                "a malformed field must not become a turn: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_that_leaves_a_field_out_still_names_its_turn() {
+        // The producer serializes a field it has no value for as null.
+        let payload = serde_json::json!({
+            "kind": "turn_started",
+            "channelId": null,
+            "turnId": "t1",
+            "seq": null,
+        });
+        let reduced = frames(&payload, AGENT);
+        assert_eq!(reduced.len(), 1);
+        assert_eq!(reduced[0].turn.as_deref(), Some("t1"));
+        assert_eq!(reduced[0].channel, None);
+        assert_eq!(reduced[0].seq, 0);
+    }
+
+    #[test]
+    fn a_batch_keeps_the_frames_it_can_read_and_drops_the_rest() {
+        let payload = serde_json::json!({
+            "kind": "batch",
+            "events": [
+                { "kind": "turn_started", "channelId": "chan-a", "turnId": "t1", "seq": 1 },
+                { "kind": "turn_started", "channelId": "chan-a", "turnId": 7, "seq": 2 },
+            ],
+        });
+        let reduced = frames(&payload, AGENT);
+        assert_eq!(reduced.len(), 1);
+        assert_eq!(reduced[0].turn.as_deref(), Some("t1"));
     }
 
     #[test]
