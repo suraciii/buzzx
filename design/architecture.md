@@ -30,6 +30,7 @@ That core is `client.rs`, and this map records where it sits.
    |         +-----> layout.rs  terminal size -> layout mode (pure)
    |         +-----> keys.rs    KeyEvent -> Action (pure)
    |         +-----> content.rs Event -> Row (pure)
+   |         +-----> agents.rs  roster and observer frames -> work (pure)
    |
    +-----> session.rs    the live session: subscriptions and ChatEvents
              |

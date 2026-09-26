@@ -13,6 +13,7 @@ use nostr::{Event, EventBuilder, EventId, Keys, Tag};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::agents;
 use crate::config::Resolved;
 use crate::content;
 use crate::failure::{Category, Failure};
@@ -317,6 +318,23 @@ impl Client {
             && hidden.is_ok()
             && items.iter().all(|item| item.kind != ChannelKind::Unknown);
         Ok(Roster { items, complete })
+    }
+
+    /// The managed-agent records this identity owns, read as a roster. Ownership
+    /// is the record's author: only the owner's own key signs one, so the query
+    /// is scoped to it and `from_events` re-checks the author before claiming
+    /// anything. A read that fails is an error, never an empty roster.
+    pub async fn managed_agents(&self) -> Result<agents::Roster, Failure> {
+        let me = self.keys.public_key().to_hex();
+        let events = self
+            .transport
+            .query(&json!({
+                "kinds": [agents::KIND_MANAGED_AGENT],
+                "authors": [me],
+                "limit": agents::ROSTER_LIMIT,
+            }))
+            .await?;
+        Ok(agents::Roster::from_events(&events, &me))
     }
 
     /// The channels this identity hid from its direct list, from the relay's

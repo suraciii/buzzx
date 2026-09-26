@@ -49,12 +49,14 @@ pub enum SubControl {
     Inbox(Vec<Uuid>),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubKind {
     Timeline(Uuid),
     Aux(#[allow(dead_code)] Uuid),
     Typing(Uuid),
     Inbox(Uuid),
+    /// The owner's observer feed. One per connection, never replaced.
+    Observer,
 }
 
 /// What a `CLOSED` from the relay ended, for a subscription this client
@@ -64,6 +66,7 @@ enum Closed {
     Timeline(Uuid),
     Typing(Uuid),
     Inbox(Uuid),
+    Observer,
 }
 
 fn close_subscription(state: &mut PumpState, sub_id: &str) -> Option<Closed> {
@@ -74,6 +77,7 @@ fn close_subscription(state: &mut PumpState, sub_id: &str) -> Option<Closed> {
         }
         SubKind::Typing(channel) => Some(Closed::Typing(channel)),
         SubKind::Inbox(channel) => Some(Closed::Inbox(channel)),
+        SubKind::Observer => Some(Closed::Observer),
         SubKind::Aux(_) => None,
     }
 }
@@ -130,6 +134,62 @@ fn typing_channel(event: &nostr::Event) -> Option<Uuid> {
     })
 }
 
+/// The observer feed's subscription id. One per connection: it is scoped to the
+/// login identity, not to a channel, so nothing replaces it.
+const OBSERVER_SUB: &str = "o:observer";
+
+/// The owner's observer feed: every frame the relay holds for this identity.
+/// The relay refuses a kind-24200 filter that does not name the authenticated
+/// identity's own pubkey, so the `p` tag is what makes the subscription legal.
+fn observer_filter(me: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [crate::agents::KIND_OBSERVER_FRAME],
+        "#p": [me],
+    })
+}
+
+/// One frame's tag value, when the tag appears exactly once. A duplicated tag
+/// is ambiguous, and an ambiguous frame is not evidence.
+fn frame_tag(event: &nostr::Event, name: &str) -> Option<String> {
+    let mut values = event.tags.iter().filter_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.first().map(String::as_str) == Some(name))
+            .then(|| parts.get(1).cloned())
+            .flatten()
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+/// Decode one observer frame into the summary this client keeps.
+///
+/// The frame is owner-private: the payload is decrypted only after the
+/// addressee, the sender and the frame direction are all confirmed, and what
+/// comes back is the reduced `agents::Frame` - the payload itself never leaves
+/// this function.
+fn observer_frames(keys: &Keys, me: &str, event: &nostr::Event) -> Vec<crate::agents::Frame> {
+    let Some(owner) = frame_tag(event, "p") else {
+        return Vec::new();
+    };
+    let Some(agent) = frame_tag(event, "agent") else {
+        return Vec::new();
+    };
+    let Some(direction) = frame_tag(event, "frame") else {
+        return Vec::new();
+    };
+    // Telemetry is agent-to-owner, and the agent must be the signer: a frame
+    // that fails either test is not this client's to read.
+    if owner != me || direction != "telemetry" || event.pubkey.to_hex() != agent {
+        return Vec::new();
+    }
+    let Ok(payload) =
+        buzz_core::observer::decrypt_observer_payload::<serde_json::Value>(keys, event)
+    else {
+        return Vec::new();
+    };
+    crate::agents::frames(&payload, &agent)
+}
+
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -170,7 +230,8 @@ pub async fn run_ws_pump(
                 }
                 attempt = 0;
                 let _ = events.send(ChatEvent::Connected).await;
-                state.resubscribe_all(&mut conn).await;
+                let me = keys.public_key().to_hex();
+                state.resubscribe_all(&mut conn, &me).await;
                 for control in queued.drain(..) {
                     apply_control(&mut conn, &mut state, control).await;
                 }
@@ -397,11 +458,17 @@ impl PumpState {
             .collect()
     }
 
-    async fn resubscribe_all(&mut self, conn: &mut NostrWsConnection) {
+    async fn resubscribe_all(&mut self, conn: &mut NostrWsConnection, me: &str) {
         let since = now_secs().saturating_sub(LIVE_OVERLAP_SECS);
         for (sub_id, filter) in self.plan_resubscribe(since) {
             Self::req_raw(conn, &sub_id, &filter).await;
         }
+        // The observer feed is per identity, so every connection opens it
+        // again: observer frames are ephemeral, and the ones published while
+        // the socket was down are gone rather than replayed.
+        Self::req_raw(conn, OBSERVER_SUB, &observer_filter(me)).await;
+        self.sub_ids
+            .insert(OBSERVER_SUB.to_owned(), SubKind::Observer);
         // The reaction and typing feeds have no guard to defeat: they are
         // replaced unconditionally, so they rebuild on this connection too.
         let aux = self.aux_ids.clone();
@@ -508,9 +575,26 @@ async fn handle_message(
                         .await;
                 }
             }
-            None => {}
+            Some(SubKind::Observer)
+                if event.kind.as_u16() as u32 == crate::agents::KIND_OBSERVER_FRAME as u32 =>
+            {
+                let me = keys.public_key().to_hex();
+                for frame in observer_frames(keys, &me, &event) {
+                    let _ = events.send(ChatEvent::ObserverFrame(frame)).await;
+                }
+            }
+            // Nothing else on this subscription is evidence: a frame of another
+            // kind has not been through the checks the observer reader makes.
+            _ => {}
         },
-        RelayMessage::Eose { .. } => {}
+        RelayMessage::Eose { subscription_id } => {
+            // The relay has established the observer feed. From here on, the
+            // absence of a frame is evidence that no turn is running: before
+            // it, this client had not been told the relay was listening.
+            if state.sub_ids.get(&subscription_id) == Some(&SubKind::Observer) {
+                let _ = events.send(ChatEvent::ObserverReady).await;
+            }
+        }
         RelayMessage::Closed {
             subscription_id,
             message,
@@ -537,6 +621,11 @@ async fn handle_message(
                         channel,
                         reason: message,
                     })
+                    .await;
+            }
+            Some(Closed::Observer) => {
+                let _ = events
+                    .send(ChatEvent::ObserverClosed { reason: message })
                     .await;
             }
             None => {}

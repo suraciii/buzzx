@@ -4,8 +4,10 @@
 
 accepted
 
-Implementation and deployed-source
-validation remain pending. Partially supersedes [decision 0003](0003-owner-plane-out-of-scope.md).
+Implemented on this branch as a read-only overlay; the product contract is
+[docs/tui-use.md](../../docs/tui-use.md#agents-overview), and what was checked
+against a deployed relay is recorded there. Partially supersedes
+[decision 0003](0003-owner-plane-out-of-scope.md).
 
 ## Context
 

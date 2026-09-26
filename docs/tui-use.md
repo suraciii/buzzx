@@ -261,10 +261,9 @@ terminal that is left in raw mode after a crash is a bug.
 
 ## Agents overview
 
-Status: specified, not implemented. This is the next read-only Agent slice.
-It answers which Agents the signed-in user owns, which have observed active
-work, and which accessible conversation to open. It does not add an Agent
-management console. The boundary is in
+`a` opens this view. It answers which Agents the signed-in user owns, which
+have observed active work, and which accessible conversation to open. It does
+not add an Agent management console. The boundary is in
 [decision 0006](../design/decisions/0006-agent-summary.md).
 
 ### Entry and navigation
@@ -347,13 +346,9 @@ outside the user's membership, show `Unavailable context` without its name,
 id or content. If only a channel is known, label the action `Open channel`;
 only a verified message reference permits exact message navigation.
 
-### Acceptance and implementation handoff
+### Acceptance
 
-Implement roster, summary and channel navigation on this specification branch.
 A roster-only or typing-only delivery does not fulfill the working-state goal.
-Before wiring the UI, verify the existing deployed roster and owner observer
-with an authorized test identity. If unavailable, report that capability gap;
-do not invent a relay API or claim success using typing alone.
 
 1. Two owners, same-name Agents and an archived Agent produce the correct
    owned list without cross-owner disclosure. Empty, partial, failed and
@@ -371,10 +366,37 @@ do not invent a relay API or claim success using typing alone.
 6. No private observer payload, tool argument, secret or transcript is rendered,
    logged, persisted or published as an ordinary channel message.
 
-Run the full repository checks and real owner-session acceptance. Record the
-commit, identity role, signal sequence and visible result. Neither a design
-sketch nor source comparison establishes deployment availability.
-
 Creation, configuration, stop/restart, tool transcripts, Waiting for you,
 recent results, task completion, cost and model switching are excluded. Add
 none of them as placeholders or extension points in this slice.
+
+### Verification
+
+The relay rules this view depends on were checked against the deployed relay
+`https://buzz.surac.cloud` with a delegated Agent identity: the identity that
+would receive the frames is the identity that made the request. Both the
+roster read and the observer feed answered, and both stayed inside the owner
+boundary:
+
+- `POST /query` for kind 30177 authored by the identity answered HTTP 200 with
+  an empty page. An empty roster is an answer, not a refusal.
+- `REQ` for kind 24200 with `#p` set to the identity's own pubkey was answered
+  with `EOSE` and never with `CLOSED`, and delivered no frame: the
+  subscription is legal, live-only, and quiet.
+- The same `REQ` naming another identity was closed with `restricted: p-gated
+  events require #p matching your pubkey`. A client can only subscribe to its
+  own observer feed, which is what lets a frame be read as evidence about the
+  Agents this identity owns and no others.
+- A kind-24200 telemetry frame signed by a key this identity does not own was
+  refused at the WebSocket: `invalid: event pubkey does not match
+  authenticated identity`. A frame cannot be planted by a client that is not
+  the Agent it claims to be, and the owner/agent check sits behind that.
+
+Not verified: no identity here owns a running Agent, so a live `Working`
+signal was not observed on the deployed relay. The states driven by frames are
+covered by the module and render tests, which use the deployed producer's
+field names (`kind`, `turnId`, `channelId`, `seq`) and its `batch` envelope.
+Confirm them once against a deployment where the signed-in identity owns a
+running Agent. `Unknown` is the answer for a feed that is refused, closed, or
+not yet established; `No active turn observed` follows only a feed the relay
+has answered with `EOSE`.

@@ -2,6 +2,7 @@
 //! design/architecture.md: drain events, draw, poll a key, apply, repeat.
 
 mod account;
+mod agents;
 mod app;
 mod cli;
 mod client;
@@ -329,6 +330,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             // Ephemeral state has no terminating event, so the frame tick is
             // what retires a typing indicator nobody refreshed.
             app.expire_typing(now);
+            app.expire_agents(now);
             // The first connection decides whether the session can run at
             // all: unreachable is 2, an auth refusal is 3.
             if let Some(receiver) = started.as_mut() {
@@ -367,9 +369,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             };
             if let Some(key) = key {
                 let action = match app.mode {
-                    app::Mode::Navigation => {
-                        keys::map_navigation(key, layout, app.picker.is_some(), app.help)
-                    }
+                    app::Mode::Navigation => keys::map_navigation(key, layout, app.overlay()),
                     app::Mode::Composer => keys::map_composer(key),
                 };
                 app.handle(action, now);

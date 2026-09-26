@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::client::{Client, WriteOutcome, event_id};
 use crate::config::Resolved;
 use crate::content;
-use crate::failure::Failure;
+use crate::failure::{Category, Failure};
 use crate::sub::{self, SubControl};
 
 /// How many history events one open fetches.
@@ -114,6 +114,21 @@ pub enum ChatEvent {
         channel: Uuid,
         reason: String,
     },
+    /// The answer to an owned-roster read. The four loads are separate states:
+    /// an empty roster and a roster this identity may not read are not the
+    /// same answer.
+    Agents(crate::agents::Load),
+    /// One owner-private observer frame, already reduced to the fields the
+    /// summary keeps.
+    ObserverFrame(crate::agents::Frame),
+    /// The relay established the observer feed on this connection. Only after
+    /// this point is the absence of a frame evidence that no turn runs.
+    ObserverReady,
+    /// The relay closed the observer feed: with no feed, a quiet Agent is
+    /// unknown rather than idle. The session keeps running.
+    ObserverClosed {
+        reason: String,
+    },
     /// A relay notice or a publish answer worth showing on the status line.
     Status(String),
     WriteOk {
@@ -134,6 +149,9 @@ pub enum ChatEvent {
 #[derive(Debug)]
 pub enum SessionCommand {
     LoadChannels,
+    /// Read the managed-agent roster this identity owns. Asked for when the
+    /// Agents view opens, so a session that never opens it never reads it.
+    LoadAgents,
     /// Fetch history, subscribe live, and backfill overlays for one channel.
     OpenChannel(Uuid),
     /// Extend the selected conversation's auxiliary feed with a live row
@@ -274,6 +292,9 @@ async fn run_command_pump(
         match command {
             SessionCommand::LoadChannels => {
                 load_channels(&client, &subs, &events).await;
+            }
+            SessionCommand::LoadAgents => {
+                load_agents(&client, &events).await;
             }
             SessionCommand::AddAux { channel, ids } => {
                 let _ = subs.send(SubControl::AuxAdd { channel, ids }).await;
@@ -515,6 +536,19 @@ async fn load_channels(
     // say which conversation a frontier belongs to, and it asks for its
     // catch-up once this answer lands.
     load_read_state(client, events).await;
+}
+
+/// Read the owned roster. A refusal is its own answer: an identity that may not
+/// read an owner roster must not be shown an empty one.
+async fn load_agents(client: &Client, events: &mpsc::Sender<ChatEvent>) {
+    let load = match client.managed_agents().await {
+        Ok(roster) => crate::agents::Load::Loaded(roster),
+        Err(failure) if failure.category == Category::Forbidden => {
+            crate::agents::Load::Unavailable(failure.detail)
+        }
+        Err(failure) => crate::agents::Load::Failed(failure.detail),
+    };
+    let _ = events.send(ChatEvent::Agents(load)).await;
 }
 
 async fn open_channel(
