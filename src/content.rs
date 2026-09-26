@@ -1,7 +1,9 @@
 //! The event-to-row mapping and the overlay rules. The contract is
 //! design/render-contract.md. Everything here is pure: no I/O, no clock.
 
-use nostr::{Event, Tag};
+use std::collections::HashSet;
+
+use nostr::{Event, PublicKey, Tag};
 
 /// Kinds that become timeline rows and are requested in the history query and
 /// the live subscription.
@@ -143,6 +145,27 @@ pub fn imeta_filename(parts: &[String]) -> Option<String> {
                 .to_owned()
         })
     })
+}
+
+/// Every member a channel's roster names: the `p` tags of the kind 39002
+/// event, as lowercase hex, deduplicated. Entries that are not public keys are
+/// dropped; a roster with none is an empty membership, which the relay is
+/// authoritative about.
+pub fn member_pubkeys(event: &Event) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    event
+        .tags
+        .iter()
+        .filter_map(|t| {
+            let parts = tag_strings(t);
+            (parts.first().map(String::as_str) == Some("p"))
+                .then(|| parts.get(1))
+                .flatten()
+        })
+        .filter_map(|key| PublicKey::parse(key).ok())
+        .map(|key| key.to_hex())
+        .filter(|key| seen.insert(key.clone()))
+        .collect()
 }
 
 /// Whether an event directly mentions one identity: a `p` tag that names it.

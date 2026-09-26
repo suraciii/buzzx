@@ -18,6 +18,7 @@ use crate::config::Resolved;
 use crate::content;
 use crate::failure::{Category, Failure};
 use crate::http::HttpTransport;
+use crate::mentions;
 use crate::read_state;
 
 pub use crate::http::WriteOutcome;
@@ -485,6 +486,42 @@ impl Client {
         Ok(resolved)
     }
 
+    /// The current membership and the member profiles a mention preflight
+    /// matches names against. A failed read is an error, never an empty
+    /// directory: an incomplete roster would drop the recipients a draft
+    /// names without saying so.
+    pub async fn mention_directory(&self, channel: Uuid) -> Result<mentions::Directory, Failure> {
+        let rosters = self
+            .transport
+            .query(&json!({
+                "kinds": [content::MEMBERSHIP_KIND],
+                "#d": [channel.to_string()],
+                "limit": 1,
+            }))
+            .await?;
+        let members = rosters
+            .first()
+            .map(content::member_pubkeys)
+            .unwrap_or_default();
+        let mut profiles: Vec<(String, String)> = Vec::new();
+        for chunk in members.chunks(PROFILE_CHUNK) {
+            let found = self
+                .transport
+                .query(&json!({
+                    "kinds": [content::PROFILE_KIND],
+                    "authors": chunk,
+                    "limit": chunk.len() as u64,
+                }))
+                .await?;
+            profiles.extend(
+                found
+                    .into_iter()
+                    .map(|event| (event.pubkey.to_hex(), event.content.clone())),
+            );
+        }
+        Ok(mentions::Directory { members, profiles })
+    }
+
     /// Attach the identity's NIP-OA tag, sign, and submit. Every write the
     /// two front ends perform goes through here.
     pub async fn submit(&self, builder: EventBuilder) -> WriteOutcome {
@@ -499,30 +536,36 @@ impl Client {
         self.transport.submit(&event).await
     }
 
-    /// A top-level message, or a reply when `thread` is given.
+    /// A top-level message, or a reply when `thread` is given. `mentions` are
+    /// the recipients the caller resolved from the content; the builder turns
+    /// them into the signed `p` tags and applies its own cap.
     pub async fn send_message(
         &self,
         channel: Uuid,
         content: &str,
         thread: Option<ThreadRef>,
+        mentions: &[String],
     ) -> WriteOutcome {
         if content.is_empty() {
             return refused(Category::InvalidInput, "content is empty".to_owned());
         }
-        match build_message(channel, content, thread.as_ref(), &[], false, &[]) {
+        let mentions: Vec<&str> = mentions.iter().map(String::as_str).collect();
+        match build_message(channel, content, thread.as_ref(), &mentions, false, &[]) {
             Ok(builder) => self.submit(builder).await,
             Err(e) => refused(Category::InvalidInput, e.to_string()),
         }
     }
 
     /// Answer one event: its channel and its thread context, derived from the
-    /// event itself.
+    /// event itself. The CLI's reply has no mention input of its own, so it
+    /// carries no recipients; a TUI reply goes through `send_message` with the
+    /// thread the composer holds.
     pub async fn reply(&self, target: &Event, content: &str) -> WriteOutcome {
         let route = match routing(target) {
             Ok(route) => route,
             Err(failure) => return failure.into(),
         };
-        self.send_message(route.channel, content, Some(route.thread))
+        self.send_message(route.channel, content, Some(route.thread), &[])
             .await
     }
 
@@ -1174,7 +1217,7 @@ mod tests {
         };
         let client = Client::new(&resolved);
         for outcome in [
-            client.send_message(channel(), "", None).await,
+            client.send_message(channel(), "", None, &[]).await,
             client.edit(channel(), at(&resolved.keys, 1).id, "").await,
         ] {
             match outcome {

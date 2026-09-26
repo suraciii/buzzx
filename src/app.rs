@@ -399,6 +399,15 @@ impl Filter {
     }
 }
 
+/// A send the mention check stopped before publication. The composer holds the
+/// draft again; these lines are what the help surface shows until the next
+/// attempt, including the exact reference to paste for each ambiguous name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionBlock {
+    pub summary: String,
+    pub details: Vec<String>,
+}
+
 /// What a local pending id stands for, so a write result can be undone or
 /// completed.
 #[derive(Debug, Clone)]
@@ -517,6 +526,9 @@ pub struct App {
     /// Why the last read publish failed, until one succeeds. A publish still
     /// in flight does not clear it: the relay does not know either way yet.
     read_failed: Option<String>,
+    /// The mention check that stopped the last send attempt, until the next
+    /// one. The help surface shows the exact references it carries.
+    pub mention_block: Option<MentionBlock>,
     /// Conversations waiting for a marker answer before their catch-up can be
     /// asked for.
     catch_up_pending: Vec<Uuid>,
@@ -571,6 +583,7 @@ impl App {
             marker_complete: false,
             marker_read: false,
             read_failed: None,
+            mention_block: None,
             catch_up_pending: Vec::new(),
             conn: ConnState::Connecting,
             status: "connecting".to_owned(),
@@ -1014,6 +1027,11 @@ impl App {
                 self.status = format!("agent observer feed closed: {reason}");
             }
             ChatEvent::Status(message) => self.status = message,
+            ChatEvent::MentionBlocked {
+                local,
+                summary,
+                details,
+            } => self.block_send(local, summary, details),
             ChatEvent::WriteOk { local, event_id } => self.complete_write(local, event_id),
             ChatEvent::WriteFailed { local, reason } => self.fail_write(local, reason),
             ChatEvent::WriteUncertain { local, reason } => self.uncertain_write(local, reason),
@@ -2511,6 +2529,7 @@ impl App {
     }
 
     fn send_composer(&mut self, now: u64) {
+        self.mention_block = None;
         let text = self.composer.text();
         if text.trim().is_empty() {
             self.status = "nothing to send".to_owned();
@@ -2653,6 +2672,27 @@ impl App {
 
     fn seen_aux_insert(&mut self, event_id: &str) {
         self.seen_aux.insert(event_id.to_owned());
+    }
+
+    /// A send the relay never saw: the draft comes back to the composer with
+    /// the reason, and the exact references stay for the help surface.
+    fn block_send(&mut self, local: String, summary: String, details: Vec<String>) {
+        if let Some(PendingOp::Send {
+            channel,
+            draft,
+            reply,
+        }) = self.pending.remove(&local)
+        {
+            if let Some(entry) = self.entry_mut(&channel) {
+                entry.rows.retain(|r| r.event_id != local);
+            }
+            self.set_focus(self.focus);
+            self.composer.set_text(&draft);
+            self.composer.reply = reply;
+            self.mode = Mode::Composer;
+        }
+        self.status = summary.clone();
+        self.mention_block = Some(MentionBlock { summary, details });
     }
 
     fn fail_write(&mut self, local: String, reason: String) {
@@ -3380,6 +3420,58 @@ mod tests {
         assert_eq!(app.composer.text(), "will fail");
         assert!(app.status.contains("not a member"));
         assert_eq!(app.mode, Mode::Composer);
+    }
+
+    #[test]
+    fn a_blocked_mention_send_restores_the_draft_and_keeps_the_references() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.handle(Action::ComposeNew, 0);
+        app.composer.set_text("@Buzzx Build look");
+        app.handle(Action::ComposerSend, 100);
+        let commands = take_commands(&mut app);
+        let SessionCommand::Send { local, .. } = &commands[0] else {
+            panic!()
+        };
+
+        app.apply(
+            ChatEvent::MentionBlocked {
+                local: local.clone(),
+                summary: "mention \"@buzzx build\" matches 2 members".into(),
+                details: vec!["@buzzx build -> nostr:npub1abc".into()],
+            },
+            0,
+        );
+        assert!(
+            app.channels[0].rows.iter().all(|r| !r.pending),
+            "nothing was published, so the pending row is gone"
+        );
+        assert_eq!(app.composer.text(), "@Buzzx Build look");
+        assert_eq!(app.mode, Mode::Composer);
+        assert!(app.status.contains("matches 2 members"));
+        let block = app.mention_block.clone().expect("the block is kept");
+        assert_eq!(
+            block.details,
+            vec!["@buzzx build -> nostr:npub1abc".to_owned()]
+        );
+        assert!(
+            take_commands(&mut app).is_empty(),
+            "a blocked send is never retried"
+        );
+    }
+
+    #[test]
+    fn the_next_send_attempt_clears_the_previous_block() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.mention_block = Some(MentionBlock {
+            summary: "stale".into(),
+            details: vec!["old".into()],
+        });
+        app.handle(Action::ComposeNew, 0);
+        app.composer.set_text("plain");
+        app.handle(Action::ComposerSend, 100);
+        assert!(app.mention_block.is_none());
     }
 
     #[test]

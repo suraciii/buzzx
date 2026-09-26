@@ -13,6 +13,7 @@ use crate::client::{Client, WriteOutcome, event_id};
 use crate::config::Resolved;
 use crate::content;
 use crate::failure::{Category, Failure};
+use crate::mentions;
 use crate::sub::{self, SubControl};
 
 /// How many history events one open fetches.
@@ -131,6 +132,15 @@ pub enum ChatEvent {
     },
     /// A relay notice or a publish answer worth showing on the status line.
     Status(String),
+    /// A send the relay never saw: the draft's mention text did not resolve to
+    /// current members, or the membership read failed. Nothing was published.
+    /// `summary` is the status line; `details` are the exact references the
+    /// scrollable help surface shows.
+    MentionBlocked {
+        local: String,
+        summary: String,
+        details: Vec<String>,
+    },
     WriteOk {
         local: String,
         event_id: String,
@@ -323,8 +333,39 @@ async fn run_command_pump(
                 thread,
                 local,
             } => {
+                // A draft with no mention input is sent without reading the
+                // roster; one that names someone is resolved against the
+                // current membership first, and a draft that cannot be
+                // resolved is not published at all.
+                let planned = if mentions::needs_lookup(&content) {
+                    match client.mention_directory(channel).await {
+                        Ok(directory) => mentions::plan(&content, &directory),
+                        Err(failure) => Err(mentions::Block::LookupFailed {
+                            reason: failure.detail,
+                        }),
+                    }
+                } else {
+                    Ok(Vec::new())
+                };
+                let recipients = match planned {
+                    Ok(recipients) => recipients,
+                    Err(block) => {
+                        let _ = events
+                            .send(ChatEvent::MentionBlocked {
+                                local,
+                                summary: block.summary(),
+                                details: block.details(),
+                            })
+                            .await;
+                        continue;
+                    }
+                };
                 let outcome = match thread_ref(&thread) {
-                    Ok(thread) => client.send_message(channel, &content, thread).await,
+                    Ok(thread) => {
+                        client
+                            .send_message(channel, &content, thread, &recipients)
+                            .await
+                    }
                     Err(failure) => failure.into(),
                 };
                 report(outcome, local, &events).await;
