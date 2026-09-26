@@ -1,177 +1,129 @@
 # Planned TUI visual hierarchy
 
-Status: product review draft; not implemented. Based on main `2af8daf`.
-This slice makes existing conversation, thread, Inbox and Agents surfaces
-consistent and easier to scan. Interaction and data semantics remain in
-[tui-use.md](tui-use.md). This document owns the proposed visual treatment;
-where older layout drawings differ, these proposals apply only after this
-slice is implemented. No new navigation, themes, panels or protocol is added.
+Status: revised product review draft, not implemented. Revision 2 replaces the
+initial text-board proposal after visual review. Behavior remains owned by
+[tui-use.md](tui-use.md); no new navigation or protocol is introduced.
 
-## Direction
+![Proposed desktop and narrow terminal views](assets/tui-visual-v2.png)
 
-Use quiet structure and explicit focus. Compare two options: more bordered
-cards around each message improve separation but consume scarce terminal rows;
-a shared header, minimal separators and whitespace preserve reading space.
-Choose the latter. Keep each author's identity visible; do not group consecutive
-messages or collapse content in this slice.
+The image is a design study using sample data. Its large labels outside terminal
+frames are review annotations, not application typography. Inside the frames,
+use one monospace cell grid. Color, filled cells, thin borders and spacing must
+be rendered by the terminal; do not embed the image into the application.
 
-## Visual roles
+## References and decision
 
-Use the terminal's default background and foreground rather than forcing a dark
-RGB palette. The accompanying dark mockup illustrates roles, not fixed colors.
+The official demonstration material was visually inspected, not just the code.
 
-| Role | Treatment | Non-color cue |
+| Reference | Observed visual mechanism | Application to buzzx |
 | --- | --- | --- |
-| Body | Default foreground, normal weight | Indented under author |
-| View/conversation title | Bold default foreground | Explicit channel, Thread, Inbox, or Agents label |
-| Selected conversation | Reverse label and leading cursor | `>`; reserve unread state separately |
-| Focused message | Cyan and bold author line; body stays normal | `>` in the message gutter |
-| Other author | Bold default foreground | Author on its own line except compact rows |
-| Time, separators, key hints | Dim default foreground | Secondary position, no semantic dependence on dim |
-| Direct mention | Yellow and bold mention signal/header | Existing `@` signal; do not tint entire body |
-| Pending or uncertain | Dim pending row; normal uncertain text | Explicit Sending or Unconfirmed text |
-| Failure | Red and bold short label | Explicit Failed plus actionable reason |
-| Partial, unknown, reconnecting | Yellow short label | Partial, Unknown or Reconnecting words |
-| Agent state | Normal foreground; warning/error roles when applicable | Existing state words; no color-only online dot |
+| [gh-dash overview](https://github.com/dlvhdr/gh-dash) | Shaded selected rows, distinct overview/detail regions, strong titles and subdued metadata | Organize the chat by surfaces and aligned information |
+| [Yazi demo](https://github.com/sxyazi/yazi) | Full-width selection band, stable columns, a distinct bottom mode area | Make the selected conversation and current mode immediately identifiable |
+| [Lazygit demo](https://github.com/jesseduffield/lazygit) | Panel borders and an accent on the active editor | Keep a thin input boundary when space permits |
 
-Respect existing NO_COLOR handling: omit hue, keep markers and bold/reverse.
-Do not dim message bodies, reply targets, required errors or Agent state words.
-No blinking, animation, gradients, custom fonts, rounded chat bubbles, or emoji
-as the only status indicator. Selected conversation and focused message can
-coexist: their different treatments distinguish location from action target.
+Choose region-based composition over a flat text sheet. The first draft removed
+so much structure that it relied on punctuation and labels to explain every
+region. Restore useful boundaries, without copying a file manager's columns,
+a Git dashboard's tabs or its dense collection of panels.
 
-## Shared structure
+## Composition and density
 
-At wide sizes keep the existing sidebar allocation, but use a single quiet
-vertical separator instead of a complete surrounding box. In one-column
-layouts the conversation picker remains the entry to Inbox. A thread always
-uses its existing full-screen layout. Agents keeps its existing list/detail
-flow; no side-by-side redesign.
+The 120x30 study has a 26-cell sidebar and a single message area. The sidebar
+shows the current Inbox filter, channel/DM sections and existing shortcuts.
+The selected conversation is a filled row; other rows remain quiet. Unread and
+mention signals occupy a reserved right-aligned field. Preserve the existing
+signal meanings and numeric shortcuts. Do not add counts not already known.
 
-Use one header row for location. Keep the timeline gutter two cells wide.
-Message headers contain author, age, and existing reply/root indicators; bodies
-wrap under the header. Use one blank line between messages only when at least
-12 terminal rows are available. Below that, remove decorative gaps first.
-Never reserve blank rows that would hide the focused content or input target.
+At 80 columns retain the existing sidebar width allocation. The image's
+26-cell allocation applies to its roomy 120-column example, not every width.
+Below the existing wide breakpoint the picker replaces the sidebar. Thread
+view remains full-screen. Agents retains its list/detail flow.
 
-Navigation has no empty composer rectangle. While composing, replace the box
-and its duplicated title with one target label and the existing input area.
-A channel new message says New message; replies say Reply to <author>; editing
-says Edit own message. A thread never labels its input New message. Changing
-mode must not clear or retarget the buffer.
+Use a single thin separator or surface change between navigation and content.
+Do not build a border around every message. A focused message has a two-cell
+gutter with a slim accent rail and a `>` marker on its author line, plus a
+subtle background band. This differs from the stronger selected-conversation
+band: location and action target are distinct.
 
-Reserve the bottom row for mode and state: Nav, Reply or Edit followed by a
-short meaningful result, for example Reply | Failed: unknown name. The row
-above holds mode-specific keys. In a compact composer the explicit target,
-input, keys and status each keep one row, with one context row and one header.
-When there is no error, omit the relay URL from the main status; retain it in
-existing help. Do not repeat Connected in both header and footer.
+At 30 rows use two cells of horizontal content padding and up to one blank row
+between author and body and between message groups. At 12 rows remove the
+blank author/body row; below 12 remove inter-message gaps as well. Preserve
+focused content, target and status before spacing. Do not force the roomy
+mockup's empty space into a small terminal.
 
-Existing thread state priority remains authoritative. For other views use
-write failure/uncertainty before connection failure, then incomplete data,
-then transient success. Keep obscured details available in existing help;
-do not remove the state just because a higher-priority state is shown.
-Long text clips at cell boundaries with `...`; preserve mode/state words and
-clip names first. Help exposes full labels and actionable errors. Required
-errors must not disappear behind decorative hints.
+Keep every author identifiable. Use bold for authors, normal foreground for
+body text, and quieter age/thread metadata on the author line. A focused
+message's author is accented; its body is not recolored. Preserve existing
+relative ages; sample data is not a request for a new timestamp format.
 
-## Proposed terminal frames
+## Input and status
 
-Sample data, not screenshots. Each frame fits the named cell budget; trailing
-padding is omitted. `*` below stands for the existing unread dot, not a new
-signal. Numeric shortcuts and unread candidate counts retain their meaning.
+The input is an intentional region, not more text mixed into the timeline.
+At 80 columns and 12 rows or more, show a thin accent border around the active
+composer, with one embedded target label. Remove the old duplicate title.
+At smaller sizes use a filled input area with a left accent rail instead of a
+complete box. The existing target text and cursor remain visible.
 
-### Channel reading: 80x12
+In navigation, remove the empty composer rectangle. While typing, show the
+existing New message, Reply to <author>, or Edit own message label. A thread
+input never says New message. Channel Esc and thread Esc retain their different
+existing meanings and hints. Presentation must not alter the draft or target.
 
-```text diagram
-Inbox: All          | #buzzx-tui
- Channels           |   Alice  2m
->1 @ 2 buzzx-tui     |   Can we ship the thread view?
- 2 * 3 general      |
- 3     design       | > Buzzx Build  1m
- DMs                |   Checks passed. Ready for review.
- 4 * 1 Alice        |
- 5     Buzzx Build  |   Product  30s
-                    |   I will verify the live evidence.
-                    |
-c: chats  f: filter  | t: thread  Enter: reply  i: write  ?: help
-Nav | Connected
-```
+Place mode and highest-priority state in the bottom strip. Keep only relevant
+keys near the active region, using contrast on key names rather than a dense
+sentence of punctuation. Relay details remain in help. Connection state appears
+once, in the status strip; the header only names the context.
 
-### Reply: 40x10
+At 24x6 preserve exactly: header, one context row, target, input, keys, status
+while composing. No full border or decorative blank row fits there. Inbox and
+Agents use their existing compact row budgets; selected rows use the same
+filled treatment, and long Agent state words keep their current wrapping.
 
-```text diagram
-#buzzx-tui
-  Alice  2m
-  Can we ship the thread view?
-> Build  1m
-  Checks passed. Ready for review.
+## Color and terminal constraints
 
-Reply to Build
-> Please share the live evidence.
-Enter: send  Esc: clear target
-Reply | Connected
-```
+The image demonstrates a dark-terminal palette, not a forced application
+background or a new theme chooser. Define semantic roles rather than baking
+these RGB values into all terminals:
 
-The channel Esc hint above follows the existing channel behavior. The thread
-composer uses Esc: nav instead. Do not visually imply these are the same action.
+| Role | Dark review sample | Required non-color cue |
+| --- | --- | --- |
+| Body surface | Deep neutral blue-black | Whitespace and alignment |
+| Navigation/input surface | One neutral level above body | Section title or thin boundary |
+| Selected conversation | Muted blue fill | Leading selection marker in monochrome |
+| Focused message | Softer blue fill and bright rail | `>` on author line |
+| Active input | Accent boundary | Explicit target and cursor |
+| Text | Light neutral | Normal weight, never dimmed body |
+| Metadata | Muted neutral | Secondary position |
+| Mention/warning | Amber | Existing @ or explicit warning text |
+| Failure | Red label | Failed and actionable reason |
 
-### Thread reply: 24x6
+Use terminal-default foreground/background when a reliable contrasting surface
+is unavailable. ANSI color and NO_COLOR fallbacks retain borders, bold and
+reverse selection. A filled area must not make light-terminal text disappear.
+Verify both light and dark defaults; do not infer terminal theme from OS theme.
+No new settings or color-detection protocol is required for this slice.
 
-```text diagram
-Thread #buzzx...
-> Build: Checks passed.
-Reply to Build
-> Please share evidence
-Enter:send Esc:nav
-Reply | Connected
-```
+Only render these existing semantic states. Do not give an Agent a green
+health dot or label it Idle when the source says No active turn observed.
+No blinking, gradients, variable-size terminal text, graphical avatars, image
+preview, Nerd Font dependency, extra tabs, or clickable controls are added.
 
-### Inbox picker: 24x6
+## Acceptance
 
-```text diagram
-Inbox: For you
- Channels
->1 @ 2 buzzx-tui
- DMs
- 4 * 1 Alice
-Enter:open f:filter Esc
-```
+Implementation review compares real before/after captures using the same
+fixture at 120x30, 80x12, 79x12, 40x10 and 24x6. Capture channel, thread,
+reply/edit, Inbox and Agents. Include pending/uncertain writes, reconnect,
+unknown coverage, long names, a mention refusal and a deleted thread root.
+The comparison must show clearer regions, a visible action target, and no
+loss of body space at compact sizes. A design image is not that evidence.
 
-Picker rows scroll within this budget. When incomplete/read-sync errors exist,
-reserve the penultimate row for the short state and scroll list rows instead;
-keep the bottom action row. The empty state is shown only after lookup succeeds.
+Check dark and light defaults and NO_COLOR, using CJK, combining characters
+and emoji. Width is measured in terminal cells: no overlapping metadata,
+broken cursor or displaced footer. Full labels and errors remain in help.
+Message bodies still wrap without changing content. Error state must take
+priority over decorative hints; state priority remains in the existing spec.
 
-### Agents list: 24x6
-
-```text diagram
-My agents
-> Build     Working
-  Product   Unknown
-  Research  Working
-
-Enter:details Esc:back
-```
-
-Names above are sample display names. Preserve the existing Agent state
-vocabulary; long states may wrap and consume another list row. Do not replace
-No active turn observed with Idle, or use green to imply healthy execution.
-In failures the spare row carries the error; otherwise it remains list space.
-
-## Visual acceptance and delivery
-
-Compare actual before/after terminal captures at 80x12, 79x12, 40x10, 24x6,
-and a comfortable desktop size such as 120x30. In one review sheet show channel
-navigation, reply, thread, filtered Inbox and Agents using the same fixtures.
-Also capture unknown/read-sync failure, long names, a wrapped message, pending,
-uncertain write and a mention-resolution error. No state is proven by a mockup.
-
-Verify dark and light terminal defaults and NO_COLOR. The reviewer must be
-able to identify location, focused row, input destination and any error without
-hue. Test CJK, combining characters and emoji with a terminal-cell-aware
-renderer: no overlapping columns, clipped cursor or displaced status.
-
-No keyboard mapping, focus/viewport, read marker or recipient behavior may
-change as a side effect. Use existing regressions plus the full repository
-checks, and exercise the real TUI loop required by AGENTS.md. Final acceptance
-requires actual rendering evidence, integration and installed-version identity.
+No focus, shortcuts, read marker, draft, recipient or thread semantics change.
+Run the full repository checks and the real terminal loop required by AGENTS.md.
+Completion also requires reviewed actual screenshots, integration and a verified
+usable binary. This document currently records the visual direction for review.
