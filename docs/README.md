@@ -18,3 +18,6 @@ works with it.
 The design documents, which state the boundaries and the contracts to
 preserve, live in [../design/](../design/). The product contract, which states
 why `buzzx` exists, lives in [../core.md](../core.md).
+
+The planned [Agents overview](tui-use.md#agents-overview) is the next
+read-only Agent capability; it is not implemented yet.

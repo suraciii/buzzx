@@ -94,11 +94,11 @@ disagree the person wins.
 - **It is not an agent harness.** It does not run agents, schedule tasks, or
   approve work. Agents connect to the relay directly; `buzzx` sees their
   messages the same way it sees everyone else's.
-- **It is not the agent owner's observation console.** The private
-  telemetry-and-control plane between an agent and its owner is a separate
-  protocol surface, deliberately encrypted and never stored by the relay. It
-  belongs to desktop, and buzzx does not adopt it. See
-  [design/decisions/0003-owner-plane-out-of-scope.md](design/decisions/0003-owner-plane-out-of-scope.md).
+- **It is not an Agent control console.** The planned owner-only Agents
+  overview may read a roster and minimal runtime summaries. It does not
+  expose transcripts, tool arguments, configuration or control operations.
+  See [decision 0006](design/decisions/0006-agent-summary.md) for the narrow
+  exception to the former owner-plane exclusion.
 - **It is not a second identity store.** The identity is one Nostr keypair.
   `buzzx` reads it from the environment or a local file. It does not mint,
   rotate, or recover keys.

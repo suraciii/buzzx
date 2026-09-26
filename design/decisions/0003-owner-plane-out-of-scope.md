@@ -2,7 +2,11 @@
 
 ## Status
 
-accepted
+superseded by [decision 0006](0006-agent-summary.md)
+
+The supersession is limited to read-only summaries. The original
+reasoning below is historical; the new decision permits only a read-only
+owner roster and runtime summary. Transcripts and control remain excluded.
 
 ## Context
 
