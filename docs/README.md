@@ -30,3 +30,6 @@ is not published.
 [Focused thread reading](tui-use.md#planned-focused-thread-reading) is the next
 planned TUI slice: open one discussion, reply, and return to the channel.
 It is a product spec, not an implemented capability.
+
+[tui-visual.md](tui-visual.md) proposes the next visual hierarchy for existing
+TUI surfaces, with cell-budgeted frames and visual acceptance criteria.
