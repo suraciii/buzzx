@@ -1,10 +1,10 @@
 # Planned TUI visual hierarchy
 
-Status: revised product review draft, not implemented. Revision 2 replaces the
-initial text-board proposal after visual review. Behavior remains owned by
+Status: revised product review draft, not implemented. Revision 3 refines the
+region-based proposal with conversation-first agent TUI references. Behavior remains owned by
 [tui-use.md](tui-use.md); no new navigation or protocol is introduced.
 
-![Proposed desktop and narrow terminal views](assets/tui-visual-v2.png)
+![Proposed desktop and narrow terminal views](assets/tui-visual-v3.png)
 
 The image is a design study using sample data. Its large labels outside terminal
 frames are review annotations, not application typography. Inside the frames,
@@ -25,6 +25,34 @@ Choose region-based composition over a flat text sheet. The first draft removed
 so much structure that it relied on punctuation and labels to explain every
 region. Restore useful boundaries, without copying a file manager's columns,
 a Git dashboard's tabs or its dense collection of panels.
+
+### Conversation-first references
+
+The official [OpenCode screenshot](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/assets/lander/screenshot.png),
+[pi interactive-mode image](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/images/interactive-mode.png),
+and [Oh My Pi image](https://github.com/can1357/oh-my-pi/blob/main/assets/python.webp)
+were inspected. Here omp means Oh My Pi. These are project-published examples,
+not a claim about every theme or the latest live runtime. The pi website denied
+access; its repository image was used instead.
+
+OpenCode gives the transcript most of the area and distinguishes its input with
+a subtle surface and rail. pi uses whitespace and local content backgrounds,
+with a compact editor/footer. Oh My Pi places dense runtime detail beside its
+input boundary, below the output. These are closer to conversation reading
+than the file-manager/dashboard references above.
+
+Apply that priority to buzzx: keep the navigation selection strong, but lower
+the focused message fill to a barely distinct surface. Its marker and author
+remain explicit. Keep the input boundary thin and subdued, accenting only the
+target label or rail. The bottom status strip remains secondary during normal
+reading and gains emphasis for failures. This is a visual adjustment, not a
+new role-based message taxonomy.
+
+Do not import model selection, token/cost meters, tool-output panels or animated
+thinking into Buzzx. It is a collaboration client, not an agent runner. All
+participants keep visible author identities; local human/assistant coloring
+would misrepresent multi-person channels. Runtime claims still require the
+existing verified Agent state, never inferred from a colored message block.
 
 ## Composition and density
 
@@ -59,7 +87,7 @@ relative ages; sample data is not a request for a new timestamp format.
 ## Input and status
 
 The input is an intentional region, not more text mixed into the timeline.
-At 80 columns and 12 rows or more, show a thin accent border around the active
+At 80 columns and 12 rows or more, show a thin neutral border around the active
 composer, with one embedded target label. Remove the old duplicate title.
 At smaller sizes use a filled input area with a left accent rail instead of a
 complete box. The existing target text and cursor remain visible.
