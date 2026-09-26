@@ -357,6 +357,19 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
                 .map_err(|e| e.to_string())?;
             let layout = layout::mode(frame.area.width, frame.area.height);
 
+            // The terminal cursor is part of the composer affordance. Keep it
+            // hidden in reading, overlay, and too-small views.
+            let show_cursor = app.mode == app::Mode::Composer
+                && layout != layout::LayoutMode::TooSmall
+                && !app.help
+                && app.picker.is_none()
+                && !app.agents.open;
+            if show_cursor {
+                terminal.show_cursor().map_err(|e| e.to_string())?;
+            } else {
+                terminal.hide_cursor().map_err(|e| e.to_string())?;
+            }
+
             // 3. Poll for a key with the tick timeout, then apply it. The
             //    blocking poll only delays this frame; the session tasks run
             //    on the runtime's worker threads.
