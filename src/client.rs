@@ -214,6 +214,16 @@ pub struct Routing {
     pub thread: ThreadRef,
 }
 
+/// One bounded thread read: the root event first, then its replies, oldest
+/// first, and whether the reply query was saturated.
+pub struct ThreadRead {
+    pub events: Vec<Event>,
+    /// The reply query answered with as many events as it was allowed to
+    /// return. The thread may hold more than this read carries, so a caller
+    /// must not present the result as complete history.
+    pub partial: bool,
+}
+
 /// Parse a channel UUID from user input.
 pub fn channel_id(raw: &str) -> Result<Uuid, Failure> {
     Uuid::parse_str(raw)
@@ -424,7 +434,19 @@ impl Client {
     }
 
     /// A thread: the root event first, then its replies, oldest first.
-    pub async fn thread(&self, root: EventId) -> Result<Vec<Event>, Failure> {
+    ///
+    /// `channel` is the conversation the caller is in. When it is given, the
+    /// replies are read from that conversation only (`#h`), the root must
+    /// belong to it, and a reply counts only when its own existing root
+    /// semantics resolve to the read's root - an `e` reference alone does not
+    /// make an event part of the thread. A root that sits in another
+    /// conversation is refused rather than followed. The CLI prints a thread
+    /// with no conversation in hand and passes `None`.
+    pub async fn thread(
+        &self,
+        root: EventId,
+        channel: Option<Uuid>,
+    ) -> Result<ThreadRead, Failure> {
         let hex = root.to_hex();
         let mut found = self
             .transport
@@ -433,15 +455,35 @@ impl Client {
         let Some(root_event) = found.pop() else {
             return Err(Failure::not_found(format!("no event {hex}")));
         };
-        let replies = self
-            .transport
-            .query(&json!({
-                "kinds": content::TIMELINE_KINDS,
-                "#e": [hex],
-                "limit": THREAD_LIMIT,
-            }))
-            .await?;
-        Ok(thread_events(&root_event, replies))
+        if let Some(channel) = channel {
+            match extract_channel_id(&root_event) {
+                Some(in_channel) if in_channel == channel => {}
+                Some(_) => {
+                    return Err(Failure::invalid_input(format!(
+                        "thread root {hex} is in another conversation"
+                    )));
+                }
+                None => {
+                    return Err(Failure::invalid_input(format!(
+                        "thread root {hex} is not channel-scoped"
+                    )));
+                }
+            }
+        }
+        let mut filter = json!({
+            "kinds": content::TIMELINE_KINDS,
+            "#e": [hex],
+            "limit": THREAD_LIMIT,
+        });
+        if let Some(channel) = channel {
+            filter["#h"] = json!([channel.to_string()]);
+        }
+        let replies = self.transport.query(&filter).await?;
+        let (replies, partial) = thread_replies(replies, &hex, channel);
+        Ok(ThreadRead {
+            events: thread_events(&root_event, replies),
+            partial,
+        })
     }
 
     /// One event by id.
@@ -757,6 +799,25 @@ fn order_timeline(mut events: Vec<Event>) -> Vec<Event> {
             .then(a.id.to_hex().cmp(&b.id.to_hex()))
     });
     events
+}
+
+/// The replies of one thread out of a raw `#e` answer, and whether that answer
+/// was saturated. Saturation is decided on the raw answer - before
+/// deduplication and before the root check drops anything - because a full
+/// page of `#e` references is a possibly-partial thread, not a complete one.
+fn thread_replies(raw: Vec<Event>, root: &str, channel: Option<Uuid>) -> (Vec<Event>, bool) {
+    let partial = raw.len() as u64 >= THREAD_LIMIT;
+    let replies = raw
+        .into_iter()
+        .filter(|event| {
+            content::root_of(event).as_deref() == Some(root)
+                && match channel {
+                    Some(channel) => extract_channel_id(event) == Some(channel),
+                    None => true,
+                }
+        })
+        .collect();
+    (replies, partial)
 }
 
 /// The root first, then its replies, deduplicated by event id.
@@ -1191,6 +1252,35 @@ mod tests {
         let ordered = order_timeline(vec![second, first]);
         assert_eq!(ordered[0].id, low);
         assert_eq!(ordered[1].id, high);
+    }
+
+    #[test]
+    fn a_thread_read_rejects_replies_from_another_channel() {
+        let keys = keys();
+        let selected = channel();
+        let other = Uuid::from_u128(99);
+        let root = message(&keys, selected, "root", 10);
+        let reply = signed(
+            &keys,
+            vec![
+                Tag::parse(["h", &selected.to_string()]).unwrap(),
+                e_tag(&root.id, "root"),
+            ],
+        );
+        let wrong = signed(
+            &keys,
+            vec![
+                Tag::parse(["h", &other.to_string()]).unwrap(),
+                e_tag(&root.id, "root"),
+            ],
+        );
+        let (replies, partial) = thread_replies(
+            vec![wrong, reply.clone()],
+            &root.id.to_hex(),
+            Some(selected),
+        );
+        assert!(!partial);
+        assert_eq!(ids(&replies), vec![reply.id.to_hex()]);
     }
 
     #[test]

@@ -370,7 +370,9 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             };
             if let Some(key) = key {
                 let action = match app.mode {
-                    app::Mode::Navigation => keys::map_navigation(key, layout, app.overlay()),
+                    app::Mode::Navigation => {
+                        keys::map_navigation(key, layout, app.overlay(), app.surface())
+                    }
                     app::Mode::Composer => keys::map_composer(key),
                 };
                 app.handle(action, now);

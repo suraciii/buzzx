@@ -223,9 +223,9 @@ async fn read_thread(client: &Client, raw: Option<&str>) -> i32 {
         Ok(id) => id,
         Err(failure) => return fail(&failure, Some(("event_id", raw.unwrap_or_default()))),
     };
-    match client.thread(id).await {
-        Ok(events) => {
-            print(&Value::Array(events.iter().map(event_json).collect()));
+    match client.thread(id, None).await {
+        Ok(read) => {
+            print(&Value::Array(read.events.iter().map(event_json).collect()));
             0
         }
         Err(failure) => fail(&failure, Some(("event_id", &id.to_hex()))),

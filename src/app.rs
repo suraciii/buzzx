@@ -370,6 +370,10 @@ fn generic_dm_name(name: &str) -> bool {
     name == "DM" || name == "Direct Messages" || name.starts_with("Group DM (")
 }
 
+/// A draft that exists must never be silently retargeted or sent somewhere
+/// the reader did not aim it.
+const DRAFT_BLOCKED: &str = "Send or clear the draft first";
+
 /// How many participants a DM label names before it counts the rest.
 const DM_LABEL_LIMIT: usize = 3;
 /// How many conversations keep a numeric shortcut.
@@ -491,6 +495,87 @@ pub struct AgentView {
     pub open: bool,
 }
 
+/// The focused thread view: one conversation's root and its bounded replies.
+/// The state outlives the view, so returning to the same thread is instant.
+///
+/// Nothing here is persistent read state: reading a thread leaves the
+/// channel's own read frontier alone.
+#[derive(Debug, Default)]
+pub struct ThreadView {
+    /// Whether the view is on screen.
+    pub open: bool,
+    /// The conversation the thread belongs to. Keys that could switch the
+    /// conversation are not part of this view.
+    pub channel: Uuid,
+    /// The thread root, full hex.
+    pub root: String,
+    /// Monotonic request token. A late read from a previous view or
+    /// connection must not replace the current read.
+    request: u64,
+    /// The event the user entered from, focused once the read lands.
+    pub entered: String,
+    /// The root first, then the loaded replies, oldest first.
+    pub rows: Vec<Row>,
+    pub focus: usize,
+    /// A read is outstanding. Until the first one answers, no row is
+    /// displayed and no content-targeted action is available.
+    pub loading: bool,
+    /// Why the last read failed. The rows the view already holds stay.
+    pub failed: Option<String>,
+    /// The reply query reached its bound: the view must not claim complete
+    /// history.
+    pub partial: bool,
+    /// The root was deleted: it stays as a placeholder and root-targeted
+    /// actions are off.
+    pub root_deleted: bool,
+    /// The last write outcome, shown above the read and coverage states until
+    /// the next composition.
+    pub notice: Option<String>,
+    /// A read has answered for this thread at least once.
+    loaded: bool,
+    /// The connection dropped since the last successful read: loaded rows are
+    /// stale until a read answers again.
+    stale: bool,
+    /// Event ids a live feed delivered. They survive the read that would
+    /// otherwise replace them.
+    live_ids: HashSet<String>,
+    /// Ids deleted while this view was open: a read that lands afterwards must
+    /// not resurrect them.
+    deleted: HashSet<String>,
+    /// Ids of thread writes awaiting a relay result. This covers overlays and
+    /// deletes, which do not use a pending timeline row.
+    pending_writes: HashSet<String>,
+    /// Auxiliary events that arrive while a thread read is still materializing.
+    /// They are replayed after rows exist instead of being deduplicated away.
+    buffered_overlays: Vec<nostr::Event>,
+    /// Where to return: the channel row that was focused when the thread
+    /// opened, and its index, for a row that was deleted meanwhile.
+    saved_row: Option<String>,
+    saved_index: usize,
+}
+
+impl ThreadView {
+    /// The focused row of the loaded thread.
+    pub fn focused(&self) -> Option<&Row> {
+        self.rows.get(self.focus)
+    }
+
+    /// Whether a read has answered for this thread at least once.
+    pub fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Whether the connection dropped since the last successful read.
+    pub fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Whether a write this view started is still awaiting its result.
+    pub fn send_pending(&self) -> bool {
+        self.rows.iter().any(|row| row.pending) || !self.pending_writes.is_empty()
+    }
+}
+
 pub struct App {
     pub me: String,
     pub relay_label: String,
@@ -545,6 +630,13 @@ pub struct App {
     pub composer: Composer,
     /// The owned Agents and what the observer feed says about their work.
     pub agents: AgentView,
+    /// The focused thread view. One view at a time: it replaces the channel
+    /// timeline instead of covering it.
+    pub thread: ThreadView,
+    thread_request: u64,
+    /// A thread draft whose channel closed cannot be sent to the replacement
+    /// selection. It is cleared only after the user clears the draft.
+    draft_blocked: bool,
     pub quit: bool,
     pub exit_code: i32,
     profiles: HashMap<String, String>,
@@ -555,6 +647,9 @@ pub struct App {
     /// Auxiliary events applied to each conversation. Reloading one history
     /// invalidates only that conversation's overlay deduplication.
     aux_seen: HashMap<Uuid, HashSet<String>>,
+    /// Message ids removed by overlays before a thread was opened. A later
+    /// bounded read must not resurrect them.
+    deleted_rows: HashSet<String>,
     reaction_of: HashMap<String, (String, String)>,
     my_reaction: HashMap<(String, String), String>,
     pending: HashMap<String, PendingOp>,
@@ -589,12 +684,16 @@ impl App {
             status: "connecting".to_owned(),
             composer: Composer::new(),
             agents: AgentView::default(),
+            thread: ThreadView::default(),
+            thread_request: 0,
+            draft_blocked: false,
             quit: false,
             exit_code: 0,
             profiles: HashMap::new(),
             typing: HashMap::new(),
             seen_aux: HashSet::new(),
             aux_seen: HashMap::new(),
+            deleted_rows: HashSet::new(),
             reaction_of: HashMap::new(),
             my_reaction: HashMap::new(),
             pending: HashMap::new(),
@@ -605,6 +704,17 @@ impl App {
 
     pub fn take_outbox(&mut self) -> Vec<SessionCommand> {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Report one outcome to the reader. The thread view draws its own status
+    /// row over the channel's, so an outcome that belongs to the thread has to
+    /// reach both.
+    fn note(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self.thread.open {
+            self.thread.notice = Some(message.clone());
+        }
+        self.status = message;
     }
 
     /// Which overlay is on screen, for the key map.
@@ -752,6 +862,27 @@ impl App {
         self.agents.cursor.clamp(agents, contexts);
     }
 
+    /// The membership can change under the picker; its cursor never points at
+    /// a conversation that is gone. Its next surviving neighbor takes the row,
+    /// or the previous one at the end.
+    fn clamp_picker(&mut self) {
+        let Some(picker) = self.picker.clone() else {
+            return;
+        };
+        if picker.at == 0 && self.channels.iter().any(|entry| entry.id == picker.cursor) {
+            return;
+        }
+        let view: Vec<Uuid> = self.view().all().collect();
+        let Some(next) = view.get(picker.at.min(view.len().saturating_sub(1))) else {
+            self.picker = None;
+            return;
+        };
+        self.picker = Some(Picker {
+            cursor: *next,
+            at: picker.at,
+        });
+    }
+
     /// One message from this author ends the signal it announced. Only a
     /// message that is not older than the claim counts: a timeline replays up
     /// to 30 seconds of history on a new subscription, and an author who sent
@@ -782,6 +913,39 @@ impl App {
         self.selected_rows().get(self.focus)
     }
 
+    /// The row the content keys act on: the focused thread row while a thread
+    /// is on screen, the focused channel row otherwise.
+    fn action_row(&self) -> Option<&Row> {
+        if self.thread.open {
+            self.thread.focused()
+        } else {
+            self.focused_row()
+        }
+    }
+
+    /// The conversation the content keys act on.
+    fn action_channel(&self) -> Option<Uuid> {
+        if self.thread.open {
+            Some(self.thread.channel)
+        } else {
+            self.selected_entry().map(|entry| entry.id)
+        }
+    }
+    fn track_thread_write(&mut self, local: &str) {
+        if self.thread.open {
+            self.thread.pending_writes.insert(local.to_owned());
+        }
+    }
+
+    /// One row by event id, in the channel or in the thread on screen.
+    fn row(&self, id: &str) -> Option<&Row> {
+        self.channels
+            .iter()
+            .flat_map(|entry| entry.rows.iter())
+            .chain(self.thread.rows.iter())
+            .find(|row| row.event_id == id)
+    }
+
     fn at_bottom(&self) -> bool {
         let len = self.selected_rows().len();
         len == 0 || self.focus == len - 1
@@ -803,6 +967,18 @@ impl App {
                 row.author = author_name(&profiles, &me, &row.pubkey);
             }
         }
+        for row in &mut self.thread.rows {
+            row.author = author_name(&profiles, &me, &row.pubkey);
+        }
+    }
+
+    /// Which timeline the key map is driving, for the key map.
+    pub fn surface(&self) -> keys::Surface {
+        if self.thread.open {
+            keys::Surface::Thread
+        } else {
+            keys::Surface::Channel
+        }
     }
 
     fn missing_profiles(&self) -> Vec<String> {
@@ -820,6 +996,9 @@ impl App {
                     // short key where a name belongs.
                     .chain(entry.participants.iter().cloned())
             })
+            // A thread on screen carries authors the channel never loaded:
+            // its root may sit outside the loaded history.
+            .chain(self.thread.rows.iter().map(|row| row.pubkey.clone()))
             .filter(|pubkey| pubkey != &me && !self.profiles.contains_key(pubkey))
             .collect::<HashSet<String>>()
             .into_iter()
@@ -865,6 +1044,13 @@ impl App {
                     if self.agents.open {
                         self.outbox.push(SessionCommand::LoadAgents);
                     }
+                    // A thread that is on screen is re-read over this
+                    // connection: its rows are stale until a read answers
+                    // again, and the live feed only carries what happens from
+                    // now on.
+                    if self.thread.open {
+                        self.reread_thread();
+                    }
                 }
             }
             ChatEvent::Disconnected(reason) => {
@@ -879,6 +1065,14 @@ impl App {
                 self.agents.work.clear();
                 for entry in &mut self.channels {
                     entry.read.coverage = Coverage::Failed;
+                }
+                // A thread on screen keeps its rows, but they are stale until
+                // a read answers over the new connection.
+                if self.thread.open {
+                    self.thread_request = self.thread_request.wrapping_add(1);
+                    self.thread.request = self.thread_request;
+                    self.thread.notice = None;
+                    self.thread.stale = true;
                 }
                 self.status = format!("reconnecting: {reason}");
             }
@@ -936,6 +1130,23 @@ impl App {
             ChatEvent::HistoryFailed { channel, reason } => {
                 self.history_failed(channel, reason);
             }
+            ChatEvent::Thread {
+                channel,
+                root,
+                request,
+                events,
+                partial,
+            } => {
+                self.load_thread(channel, root, request, events, partial, now);
+            }
+            ChatEvent::ThreadFailed {
+                channel,
+                root,
+                request,
+                reason,
+            } => {
+                self.thread_failed(channel, root, request, reason);
+            }
             ChatEvent::Profiles(resolved) => {
                 for (pubkey, name) in resolved {
                     self.profiles.insert(pubkey, name);
@@ -985,6 +1196,15 @@ impl App {
             }
             ChatEvent::Overlay(event) => self.apply_overlay(event),
             ChatEvent::ChannelGone { channel, reason } => {
+                let preserve_thread_draft = self.thread.open && !self.composer.text().is_empty();
+                if preserve_thread_draft {
+                    self.draft_blocked = true;
+                }
+                // A thread of a conversation that is gone cannot stay on
+                // screen: its rows and its destination went with it.
+                if self.thread.open && self.thread.channel == channel {
+                    self.thread = ThreadView::default();
+                }
                 let at = self
                     .channels
                     .iter()
@@ -992,15 +1212,21 @@ impl App {
                     .unwrap_or(self.selected);
                 self.channels.retain(|c| c.id != channel);
                 self.typing.remove(&channel);
-                // Its cached content went with it, and so did its draft: the
-                // composer takes what the surviving conversation has, so no
-                // text can cross over.
+                // Its cached content went with it. A thread draft is the one
+                // exception: keep it visible, but block it from crossing to
+                // the replacement conversation.
                 self.selected = at.min(self.channels.len().saturating_sub(1));
-                self.adopt_draft();
+                if !preserve_thread_draft {
+                    self.adopt_draft();
+                }
                 self.refresh_views();
                 self.set_focus(self.focus);
                 self.clamp_picker();
                 self.status = format!("channel closed: {reason}");
+                if preserve_thread_draft {
+                    self.mode = Mode::Composer;
+                    self.note(format!("channel closed: {reason}; draft kept"));
+                }
                 if let Some(entry) = self.channels.get(self.selected) {
                     let id = entry.id;
                     self.outbox.push(SessionCommand::OpenChannel(id));
@@ -1182,6 +1408,29 @@ impl App {
         self.note_presented();
     }
 
+    /// A channel message arriving while its thread is on screen is still
+    /// unread channel work unless it belongs to that thread.
+    fn note_thread_unread(&mut self, channel: Uuid, event: &nostr::Event) {
+        let me = self.me.clone();
+        if event.pubkey.to_hex() == me {
+            return;
+        }
+        let id = event.id.to_hex();
+        let at = event.created_at.as_secs();
+        let mention = content::mentions_me(event, &me);
+        let Some(entry) = self.entry_mut(&channel) else {
+            return;
+        };
+        if entry.seen.contains(&id)
+            || entry.read.unread.contains_key(&id)
+            || !entry.read.unread_at(&id, at)
+        {
+            return;
+        }
+        entry.read.unread.insert(id, Candidate { at, mention });
+        self.refresh_views();
+    }
+
     /// One live message for a conversation nobody has open. The conversation on
     /// screen is owned by its own timeline feed: counting the same event here
     /// as well would mark unread what the reader is looking at.
@@ -1261,8 +1510,10 @@ impl App {
     /// and sitting at its latest message. Reading older history, previewing the
     /// picker and a failed load all leave it where it was.
     pub fn note_presented(&mut self) {
-        if self.picker.is_some() || self.help || self.agents.open {
-            // The list covers the conversation: nothing is being read.
+        if self.picker.is_some() || self.help || self.agents.open || self.thread.open {
+            // The list covers the conversation: nothing is being read. A
+            // thread on screen is a different conversation's sub-discussion:
+            // reading it says nothing about the channel's own frontier.
             return;
         }
         let Some(entry) = self.channels.get(self.selected) else {
@@ -1393,6 +1644,8 @@ impl App {
     fn merge_channels(&mut self, roster: Roster) {
         let selection = self.channels.get(self.selected).map(|entry| entry.id);
         let at = self.selected;
+        let thread_channel = self.thread.open.then_some(self.thread.channel);
+        let thread_was_open = thread_channel.is_some();
         let listed: Vec<ChannelInfo> = roster
             .items
             .into_iter()
@@ -1454,6 +1707,17 @@ impl App {
         }
         self.channels = merged;
         self.roster_complete = roster.complete;
+        let thread_lost =
+            thread_channel.is_some_and(|id| !self.channels.iter().any(|entry| entry.id == id));
+        if thread_lost {
+            let keep_draft = !self.composer.text().is_empty();
+            self.draft_blocked = keep_draft;
+            self.thread = ThreadView::default();
+            if !keep_draft {
+                self.composer.reply = None;
+                self.composer.edit = None;
+            }
+        }
         self.assign_shortcuts();
         self.refresh_views();
         // The selection is a conversation, not a row: the list can be rebuilt
@@ -1461,15 +1725,16 @@ impl App {
         // next surviving neighbor, or to the previous one at the end.
         match selection.and_then(|id| self.index_of(id)) {
             Some(found) => {
-                let moved = found != self.selected;
                 self.selected = found;
-                if moved {
+                if !thread_was_open && !thread_lost {
                     self.adopt_draft();
                 }
             }
             None => {
                 self.selected = at.min(self.channels.len().saturating_sub(1));
-                self.adopt_draft();
+                if !thread_was_open && !thread_lost {
+                    self.adopt_draft();
+                }
             }
         }
         if self.selected < self.channels.len() {
@@ -1843,6 +2108,403 @@ impl App {
         self.request_profiles();
         let _ = now;
     }
+    /// Fold one bounded thread read in.
+    ///
+    /// An answer for a thread that is no longer open, or for another thread,
+    /// changes nothing: a late read must not replace the active view. The rows
+    /// already on screen are the newer truth - a live reply that arrived
+    /// during the read is kept, an edit that landed stays applied, and a
+    /// deletion is not resurrected by the page the read was answering.
+    fn load_thread(
+        &mut self,
+        channel: Uuid,
+        root: String,
+        request: u64,
+        events: Vec<nostr::Event>,
+        partial: bool,
+        _now: u64,
+    ) {
+        if !self.thread.open
+            || self.thread.channel != channel
+            || self.thread.root != root
+            || self.thread.request != request
+        {
+            return;
+        }
+        let me = self.me.clone();
+        let profiles = self.profiles.clone();
+        let cached: HashMap<String, Row> = self
+            .channels
+            .iter()
+            .find(|entry| entry.id == channel)
+            .into_iter()
+            .flat_map(|entry| entry.rows.iter())
+            .map(|row| (row.event_id.clone(), row.clone()))
+            .collect();
+        let mut deleted = std::mem::take(&mut self.thread.deleted);
+        let global_deleted = self.deleted_rows.clone();
+        let root_deleted = self.thread.root_deleted || global_deleted.contains(&self.thread.root);
+        let live_ids = self.thread.live_ids.clone();
+        let was_loaded = self.thread.loaded;
+        let previous_focus = self.thread.focused().map(|row| row.event_id.clone());
+        let mut previous: HashMap<String, Row> = std::mem::take(&mut self.thread.rows)
+            .into_iter()
+            .map(|row| (row.event_id.clone(), row))
+            .collect();
+        let mut rows = Vec::with_capacity(events.len() + previous.len());
+        for event in &events {
+            if buzz_sdk::extract_channel_id(event) != Some(channel) {
+                continue;
+            }
+            let id = event.id.to_hex();
+            if deleted.contains(&id) {
+                continue;
+            }
+            if global_deleted.contains(&id) && id != self.thread.root {
+                deleted.insert(id);
+                continue;
+            }
+            // Keep the current row, then the channel cache row, before falling
+            // back to the raw read. Both existing views may already carry
+            // overlays that the bounded base query cannot express.
+            rows.push(
+                previous
+                    .remove(&id)
+                    .or_else(|| cached.get(&id).cloned())
+                    .unwrap_or_else(|| content::row_from_event(event, &me)),
+            );
+        }
+        // A live reply or pending local row that was not in this bounded read
+        // remains visible. A stale row with no live/pending provenance does not.
+        rows.extend(
+            previous
+                .into_values()
+                .filter(|row| row.pending || live_ids.contains(&row.event_id) || root_deleted),
+        );
+        for row in &mut rows {
+            row.author = author_name(&profiles, &me, &row.pubkey);
+        }
+        // Oldest first, with the root always first: it is the head of this
+        // conversation, not one more reply in time order.
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.event_id.cmp(&b.event_id))
+        });
+        if let Some(at) = rows.iter().position(|row| row.event_id == self.thread.root) {
+            let root_row = rows.remove(at);
+            rows.insert(0, root_row);
+        }
+        let present: HashSet<String> = rows.iter().map(|row| row.event_id.clone()).collect();
+        self.thread.live_ids.retain(|id| present.contains(id));
+        self.thread.deleted = deleted;
+        self.thread.root_deleted = root_deleted;
+        self.thread.rows = rows;
+        self.thread.loading = false;
+        self.thread.loaded = true;
+        self.thread.partial = partial;
+        self.thread.failed = None;
+        self.thread.stale = false;
+        let preferred = if was_loaded {
+            previous_focus
+        } else {
+            Some(self.thread.entered.clone())
+        };
+        match preferred.and_then(|id| self.thread.rows.iter().position(|row| row.event_id == id)) {
+            Some(at) => self.thread.focus = at,
+            None => {
+                self.thread.focus = self
+                    .thread
+                    .rows
+                    .iter()
+                    .position(|row| row.event_id == self.thread.root)
+                    .unwrap_or(0);
+                if !was_loaded && self.thread.entered != self.thread.root {
+                    self.thread.notice =
+                        Some("the selected reply was not in the thread read".to_owned());
+                }
+            }
+        }
+        let buffered = std::mem::take(&mut self.thread.buffered_overlays);
+        for event in buffered {
+            self.apply_overlay(event);
+        }
+        self.request_profiles();
+    }
+
+    /// A thread read failed: the root is missing or inaccessible, or the query
+    /// did not answer. Rows a previous read loaded stay on screen as stale
+    /// content; `t` retries the read.
+    fn thread_failed(&mut self, channel: Uuid, root: String, request: u64, reason: String) {
+        if !self.thread.open
+            || self.thread.channel != channel
+            || self.thread.root != root
+            || self.thread.request != request
+        {
+            return;
+        }
+        self.thread.loading = false;
+        self.thread.notice = None;
+        self.thread.failed = Some(reason);
+    }
+
+    /// Ask for the open thread again over the current connection. Every read
+    /// of this view goes through here, so a retry and a reconnect re-read are
+    /// the same operation.
+    fn reread_thread(&mut self) {
+        if !self.thread.open {
+            return;
+        }
+        self.thread_request = self.thread_request.wrapping_add(1);
+        self.thread.request = self.thread_request;
+        self.thread.loading = true;
+        self.thread.notice = None;
+        self.thread.failed = None;
+        self.outbox.push(SessionCommand::OpenThread {
+            channel: self.thread.channel,
+            root: self.thread.root.clone(),
+            request: self.thread.request,
+        });
+    }
+
+    /// Merge one matching live reply into the open thread. It takes its place
+    /// in time order after the root, and focus follows the message it was on
+    /// rather than the row index, so an incoming message never pulls focus.
+    fn push_thread_row(&mut self, row: Row) {
+        if self.thread.rows.iter().any(|r| r.event_id == row.event_id) {
+            return;
+        }
+        self.thread.live_ids.insert(row.event_id.clone());
+        let at = if self.thread.rows.is_empty() {
+            0
+        } else {
+            self.thread.rows[1..]
+                .iter()
+                .position(|r| (r.created_at, &r.event_id) > (row.created_at, &row.event_id))
+                .map(|index| index + 1)
+                .unwrap_or(self.thread.rows.len())
+        };
+        if at <= self.thread.focus && !self.thread.rows.is_empty() {
+            self.thread.focus += 1;
+        }
+        self.thread.rows.insert(at, row);
+    }
+
+    /// Move the thread's message focus. It never moves past the ends.
+    fn thread_focus(&mut self, index: usize) {
+        if self.thread.rows.is_empty() {
+            return;
+        }
+        self.thread.focus = index.min(self.thread.rows.len() - 1);
+    }
+
+    /// `t` in the channel timeline: open the focused message's thread. A
+    /// top-level message is its own root; a reply names the root it belongs
+    /// to, which may sit outside the loaded channel history.
+    fn open_thread(&mut self) {
+        if self.thread.open {
+            // `t` does not open another level, and there is nothing above a
+            // thread.
+            return;
+        }
+        let Some(row) = self.focused_row() else {
+            self.note("no message to open a thread from");
+            return;
+        };
+        if row.pending || !is_event_id(&row.event_id) {
+            self.note("the focused message is still sending");
+            return;
+        }
+        if !self.composer.text().is_empty() {
+            self.note(DRAFT_BLOCKED);
+            return;
+        }
+        let Some(channel) = self.selected_entry().map(|entry| entry.id) else {
+            return;
+        };
+        let root = row.root_id.clone().unwrap_or_else(|| row.event_id.clone());
+        let saved_row = row.event_id.clone();
+        let saved_index = self.focus;
+        self.thread_request = self.thread_request.wrapping_add(1);
+        let request = self.thread_request;
+        // Only one view is on screen at a time.
+        self.help = false;
+        self.picker = None;
+        self.agents.open = false;
+        self.thread = ThreadView {
+            open: true,
+            channel,
+            root: root.clone(),
+            request,
+            entered: saved_row.clone(),
+            rows: Vec::new(),
+            focus: 0,
+            loading: true,
+            failed: None,
+            partial: false,
+            root_deleted: false,
+            notice: None,
+            loaded: false,
+            stale: self.conn != ConnState::Connected,
+            live_ids: HashSet::new(),
+            buffered_overlays: Vec::new(),
+            deleted: HashSet::new(),
+            pending_writes: HashSet::new(),
+            saved_row: Some(saved_row),
+            saved_index,
+        };
+        self.outbox.push(SessionCommand::OpenThread {
+            channel,
+            root,
+            request,
+        });
+    }
+
+    /// `Esc` in thread navigation: return to the channel and the row the
+    /// thread was opened from.
+    fn leave_thread(&mut self) {
+        if !self.thread.open {
+            return;
+        }
+        if !self.composer.text().is_empty() {
+            // Leaving with a draft would either lose it or send it somewhere
+            // else; the reader clears it with the ordinary editor instead.
+            self.note(DRAFT_BLOCKED);
+            return;
+        }
+        if self.thread.send_pending() {
+            self.note("Wait for send result");
+            return;
+        }
+        // An empty buffer leaves no thread-only target behind: the next
+        // channel composition cannot inherit a thread reply or edit.
+        self.composer.reply = None;
+        self.composer.edit = None;
+        self.thread.open = false;
+        self.thread.loading = false;
+        self.thread.notice = None;
+        // The saved row, or its nearest surviving neighbor when it was deleted
+        // while the thread was open: the row at its old position is the one
+        // that took its place, and the last row when it was the newest.
+        let saved = self.thread.saved_row.clone();
+        let index = self.thread.saved_index;
+        if let Some(entry) = self.selected_entry() {
+            let at = saved
+                .and_then(|id| entry.rows.iter().position(|row| row.event_id == id))
+                .unwrap_or_else(|| index.min(entry.rows.len().saturating_sub(1)));
+            self.focus = at;
+        }
+        // From here the ordinary channel presentation rules decide when read
+        // progress advances.
+        self.set_focus(self.focus);
+    }
+
+    /// `t` inside a thread: retry a read that failed. It never retries a
+    /// write, and a loaded thread has nothing to retry.
+    fn retry_thread(&mut self) {
+        if self.thread.failed.is_none() {
+            return;
+        }
+        self.reread_thread();
+    }
+
+    /// Enter, `i` or Tab inside a thread: resume the draft that is there, or
+    /// aim a new reply at the root (`root`) or the focused row.
+    fn thread_compose(&mut self, root: bool) {
+        if !self.thread.open || !self.thread.loaded {
+            // Content-targeted actions wait for the first read: a row that is
+            // not loaded cannot be replied to.
+            return;
+        }
+        // A draft already in the buffer keeps its own destination: none of
+        // these keys retargets a message that has not been sent.
+        if !self.composer.text().is_empty() {
+            if self.composer.reply.is_some() || self.composer.edit.is_some() {
+                self.mode = Mode::Composer;
+            } else {
+                self.note(DRAFT_BLOCKED);
+            }
+            return;
+        }
+        let at = if root { 0 } else { self.thread.focus };
+        let Some(row) = self.thread.rows.get(at) else {
+            return;
+        };
+        if row.pending || !is_event_id(&row.event_id) {
+            self.note("the focused message is still sending");
+            return;
+        }
+        if at == 0 && self.thread.root_deleted {
+            self.note("the thread root is deleted");
+            return;
+        }
+        let target = ReplyTarget {
+            event_id: row.event_id.clone(),
+            author: row.author.clone(),
+        };
+        self.thread.notice = None;
+        self.composer.edit = None;
+        self.composer.reply = Some(target);
+        self.mode = Mode::Composer;
+    }
+
+    /// The thread view's own key handling. The conversation keys are not part
+    /// of it: none of them may switch the destination behind the thread.
+    fn handle_thread(&mut self, action: Action, _now: u64) {
+        let root_action = self.thread.root_deleted
+            && self
+                .thread
+                .focused()
+                .is_some_and(|row| row.event_id == self.thread.root);
+        if root_action
+            && matches!(
+                &action,
+                Action::React | Action::EditRow | Action::DeleteRow | Action::ThreadReplyFocused
+            )
+        {
+            self.note("the thread root is deleted");
+            return;
+        }
+        if self.conn != ConnState::Connected && matches!(&action, Action::React | Action::DeleteRow)
+        {
+            self.note("publishing disabled while reconnecting");
+            return;
+        }
+        match action {
+            Action::Quit => self.quit = true,
+            Action::ToggleHelp => {
+                self.help = !self.help;
+                if self.help {
+                    self.help_scroll = 0;
+                }
+            }
+            Action::HelpScroll(step) => {
+                self.help_scroll = self.help_scroll.saturating_add_signed(step as i16);
+            }
+            Action::Dismiss => {
+                if self.help {
+                    self.help = false;
+                }
+            }
+            Action::NextRow => self.thread_focus(self.thread.focus.saturating_add(1)),
+            Action::PrevRow => self.thread_focus(self.thread.focus.saturating_sub(1)),
+            Action::Top => self.thread_focus(0),
+            Action::Bottom => self.thread_focus(usize::MAX),
+            Action::PageUp => self.thread_focus(self.thread.focus.saturating_sub(PAGE_ROWS)),
+            Action::PageDown => self.thread_focus(self.thread.focus.saturating_add(PAGE_ROWS)),
+            Action::ThreadLeave => self.leave_thread(),
+            Action::ThreadRetry => self.retry_thread(),
+            Action::ThreadReplyRoot => self.thread_compose(true),
+            Action::ThreadReplyFocused => self.thread_compose(false),
+            // Reaction, edit, and delete keep their existing ownership and
+            // focused-row rules; they act on the thread's focused row here.
+            Action::React if self.thread.loaded => self.react_focused(),
+            Action::EditRow if self.thread.loaded => self.edit_focused(),
+            Action::DeleteRow if self.thread.loaded => self.delete_focused(),
+            _ => {}
+        }
+    }
+
     fn history_failed(&mut self, channel: Uuid, reason: String) {
         self.history_failed.insert(channel);
         if let Some(entry) = self.entry_mut(&channel) {
@@ -1856,6 +2518,9 @@ impl App {
     }
 
     fn apply_timeline(&mut self, channel: Uuid, event: nostr::Event, _now: u64) {
+        if buzz_sdk::extract_channel_id(&event) != Some(channel) {
+            return;
+        }
         let id = event.id.to_hex();
         let me = self.me.clone();
         let profiles = self.profiles.clone();
@@ -1872,19 +2537,48 @@ impl App {
             return;
         }
         let was_at_bottom = self.at_bottom();
-        let Some(entry) = self.entry_mut(&channel) else {
-            return;
-        };
-        if entry.seen.contains(&id) || entry.rows.iter().any(|row| row.event_id == id) {
-            return;
-        }
-        entry.live_ids.insert(id.clone());
-        entry.seen.insert(id.clone());
+        // A reply of the thread on screen joins it too. The channel feed is
+        // the only live feed this view needs, and unrelated traffic keeps
+        // updating the channel behind it.
+        let thread_reply = self.thread.open
+            && self.thread.channel == channel
+            && content::root_of(&event).as_deref() == Some(self.thread.root.as_str());
         let mut row = content::row_from_event(&event, &me);
         row.author = author;
-        entry.rows.push(row);
-        if was_at_bottom {
-            self.focus = entry.rows.len() - 1;
+        let thread_row = thread_reply.then(|| row.clone());
+        if self.thread.open && self.thread.channel == channel && !thread_reply {
+            self.note_thread_unread(channel, &event);
+        }
+        let thread_missing = thread_row.as_ref().is_some_and(|row| {
+            !self
+                .thread
+                .rows
+                .iter()
+                .any(|existing| existing.event_id == row.event_id)
+        });
+        let already_channel;
+        {
+            let Some(entry) = self.entry_mut(&channel) else {
+                return;
+            };
+            already_channel =
+                entry.seen.contains(&id) || entry.rows.iter().any(|row| row.event_id == id);
+            if !already_channel {
+                entry.live_ids.insert(id.clone());
+                entry.seen.insert(id.clone());
+                entry.rows.push(row);
+                if was_at_bottom {
+                    self.focus = entry.rows.len() - 1;
+                }
+            }
+        }
+        if let Some(thread_row) = thread_row
+            && thread_missing
+        {
+            self.push_thread_row(thread_row);
+        }
+        if already_channel {
+            return;
         }
         self.outbox.push(SessionCommand::AddAux {
             channel,
@@ -1904,10 +2598,24 @@ impl App {
         }
     }
     fn channel_for_row(&self, target: &str) -> Option<Uuid> {
-        self.channels
+        if let Some(entry) = self
+            .channels
             .iter()
             .find(|entry| entry.rows.iter().any(|row| row.event_id == target))
-            .map(|entry| entry.id)
+        {
+            return Some(entry.id);
+        }
+        // The thread shows rows its channel may never have loaded - its root
+        // can sit outside the loaded history - and they belong to the same
+        // conversation.
+        if self.thread.open && self.thread.root == target {
+            return Some(self.thread.channel);
+        }
+        self.thread
+            .rows
+            .iter()
+            .any(|row| row.event_id == target)
+            .then_some(self.thread.channel)
     }
 
     fn remember_aux(&mut self, event_id: &str, target: &str) -> Option<Uuid> {
@@ -1929,6 +2637,13 @@ impl App {
     fn apply_overlay(&mut self, event: nostr::Event) {
         let id = event.id.to_hex();
         if self.seen_aux.contains(&id) {
+            return;
+        }
+        if self.thread.open
+            && !self.thread.loaded
+            && buzz_sdk::extract_channel_id(&event) == Some(self.thread.channel)
+        {
+            self.thread.buffered_overlays.push(event);
             return;
         }
         // A kind 5 aimed at a known reaction event id removes that reaction
@@ -2029,15 +2744,85 @@ impl App {
     }
 
     fn apply_to_row(&mut self, target: &str, mut apply: impl FnMut(&mut Row)) {
+        // The same message can be on screen in two views at once - the
+        // conversation behind a thread and the thread itself - and an overlay
+        // is a fact about the message, not about one of them.
         for entry in &mut self.channels {
-            if let Some(row) = entry.rows.iter_mut().find(|r| r.event_id == target) {
+            for row in entry.rows.iter_mut().filter(|r| r.event_id == target) {
                 apply(row);
-                return;
             }
+        }
+        for row in self.thread.rows.iter_mut().filter(|r| r.event_id == target) {
+            apply(row);
         }
     }
 
     fn remove_row(&mut self, target: &str) {
+        self.deleted_rows.insert(target.to_owned());
+        // Record deletion before the thread read arrives. The channel cache is
+        // the only proof that a root belongs to the active thread at that
+        // point; otherwise a late read could resurrect it.
+        let active_thread_target = (self.thread.open
+            && self
+                .channels
+                .iter()
+                .find(|entry| entry.id == self.thread.channel)
+                .is_some_and(|entry| {
+                    entry.rows.iter().any(|row| row.event_id == target)
+                        || self.thread.rows.iter().any(|row| row.event_id == target)
+                }))
+            || (self.thread.open && self.thread.root == target);
+        if active_thread_target {
+            self.thread.deleted.insert(target.to_owned());
+            self.thread.live_ids.remove(target);
+            if target == self.thread.root {
+                self.thread.root_deleted = true;
+            }
+        }
+        if active_thread_target
+            && target == self.thread.root
+            && !self.thread.rows.iter().any(|row| row.event_id == target)
+        {
+            let placeholder = self
+                .channels
+                .iter()
+                .find(|entry| entry.id == self.thread.channel)
+                .and_then(|entry| entry.rows.iter().find(|row| row.event_id == target))
+                .cloned()
+                .unwrap_or_else(|| Row {
+                    event_id: target.to_owned(),
+                    pubkey: String::new(),
+                    author: "unknown".to_owned(),
+                    created_at: 0,
+                    body: String::new(),
+                    kind: 0,
+                    root_id: None,
+                    parent_id: None,
+                    broadcast: false,
+                    mentions_me: false,
+                    reactions: Vec::new(),
+                    attachment: None,
+                    pending: false,
+                    uncertain: false,
+                    edited: false,
+                });
+            self.thread.rows.push(placeholder);
+        }
+        // A row the thread view holds is remembered as deleted: a read that
+        // lands after the deletion must not put it back. The root keeps its
+        // place as a placeholder, while the replies that named it stay
+        // readable; every other row leaves the view.
+        if self.thread.rows.iter().any(|r| r.event_id == target) {
+            if target == self.thread.root {
+                self.thread.root_deleted = true;
+            } else if let Some(at) = self.thread.rows.iter().position(|r| r.event_id == target) {
+                self.thread.rows.remove(at);
+                self.thread.focus = self
+                    .thread
+                    .focus
+                    .min(self.thread.rows.len().saturating_sub(1));
+            }
+        }
         for index in 0..self.channels.len() {
             if let Some(position) = self.channels[index]
                 .rows
@@ -2067,6 +2852,12 @@ impl App {
     }
 
     fn handle_navigation(&mut self, action: Action, now: u64) {
+        if self.thread.open {
+            // The thread view is the surface: it isolates the conversation
+            // keys instead of laying an overlay over the timeline.
+            self.handle_thread(action, now);
+            return;
+        }
         match action {
             Action::Quit => {
                 self.quit = true;
@@ -2160,6 +2951,7 @@ impl App {
             Action::React => self.react_focused(),
             Action::EditRow => self.edit_focused(),
             Action::DeleteRow => self.delete_focused(),
+            Action::OpenThread => self.open_thread(),
             Action::Ignored => {}
             _ => {}
         }
@@ -2179,9 +2971,16 @@ impl App {
             Action::ComposerHome => self.composer.home(),
             Action::ComposerEnd => self.composer.end(),
             Action::ComposerEscape => {
-                // First Esc clears the target; the second leaves the
-                // composer with the text kept.
-                if self.composer.reply.take().is_none() && self.composer.edit.take().is_none() {
+                if self.thread.open {
+                    // The thread composer leaves in one press and keeps its
+                    // reply or edit destination: a cancelled thread reply must
+                    // never become a top-level channel send.
+                    self.mode = Mode::Navigation;
+                } else if self.composer.reply.take().is_none()
+                    && self.composer.edit.take().is_none()
+                {
+                    // First Esc clears the target; the second leaves the
+                    // composer with the text kept.
                     self.mode = Mode::Navigation;
                 }
             }
@@ -2363,27 +3162,6 @@ impl App {
         });
     }
 
-    /// The membership can change under the picker; its cursor never points at
-    /// a conversation that is gone. Its next surviving neighbor takes the row,
-    /// or the previous one at the end.
-    fn clamp_picker(&mut self) {
-        let Some(picker) = self.picker.clone() else {
-            return;
-        };
-        if picker.at == 0 && self.channels.iter().any(|entry| entry.id == picker.cursor) {
-            return;
-        }
-        let view: Vec<Uuid> = self.view().all().collect();
-        let Some(next) = view.get(picker.at.min(view.len().saturating_sub(1))) else {
-            self.picker = None;
-            return;
-        };
-        self.picker = Some(Picker {
-            cursor: *next,
-            at: picker.at,
-        });
-    }
-
     /// Keep the composer's text with the conversation it belongs to. A draft
     /// must never follow the user into another conversation.
     fn save_draft(&mut self) {
@@ -2395,16 +3173,25 @@ impl App {
     /// Put the selected conversation's own draft - and its reply or edit
     /// target - back in the composer.
     fn adopt_draft(&mut self) {
+        if self.draft_blocked {
+            return;
+        }
         if let Some(entry) = self.channels.get(self.selected) {
             self.composer = entry.draft.clone();
         }
     }
 
     fn react_focused(&mut self) {
-        let Some(row) = self.focused_row() else {
+        let Some((row_id, pending)) = self
+            .action_row()
+            .map(|row| (row.event_id.clone(), row.pending))
+        else {
             return;
         };
-        let row_id = row.event_id.clone();
+        if pending {
+            self.note("the focused message is still sending");
+            return;
+        }
         let emoji = content::DEFAULT_REACTION.to_owned();
         let toggle_key = (row_id.clone(), emoji.clone());
         if let Some(reaction_id) = self.my_reaction.get(&toggle_key).cloned() {
@@ -2418,12 +3205,15 @@ impl App {
                     reaction_id: reaction_id.clone(),
                 },
             );
-            content::apply_overlay(
-                self.row_mut(&row_id).expect("the focused row exists"),
-                &content::Overlay::Reaction {
-                    emoji: format!("-{emoji}"),
-                },
-            );
+            self.track_thread_write(&local);
+            self.apply_to_row(&row_id, |row| {
+                content::apply_overlay(
+                    row,
+                    &content::Overlay::Reaction {
+                        emoji: format!("-{emoji}"),
+                    },
+                )
+            });
             self.my_reaction.remove(&toggle_key);
             self.outbox.push(SessionCommand::React {
                 target: row_id,
@@ -2441,14 +3231,15 @@ impl App {
                 emoji: emoji.clone(),
             },
         );
-        if let Some(row) = self.row_mut(&row_id) {
+        self.track_thread_write(&local);
+        self.apply_to_row(&row_id, |row| {
             content::apply_overlay(
                 row,
                 &content::Overlay::Reaction {
                     emoji: emoji.clone(),
                 },
-            );
-        }
+            )
+        });
         self.outbox.push(SessionCommand::React {
             target: row_id,
             emoji,
@@ -2456,34 +3247,36 @@ impl App {
             local,
         });
     }
-
-    fn row_mut(&mut self, id: &str) -> Option<&mut Row> {
-        self.channels
-            .iter_mut()
-            .flat_map(|e| e.rows.iter_mut())
-            .find(|r| r.event_id == id)
-    }
-
     fn edit_focused(&mut self) {
-        let Some(row) = self.focused_row().filter(|row| row.pubkey == self.me) else {
-            if let Some(row) = self.focused_row() {
-                self.status = if row.pending || !is_event_id(&row.event_id) {
-                    "the focused message is still sending".to_owned()
-                } else {
-                    "only your own messages can be edited".to_owned()
-                };
-            }
+        if self.thread.open && !self.composer.text().is_empty() {
+            self.note(DRAFT_BLOCKED);
+            return;
+        }
+        let Some((row_id, pubkey, pending, body)) = self.action_row().map(|row| {
+            (
+                row.event_id.clone(),
+                row.pubkey.clone(),
+                row.pending,
+                row.body.clone(),
+            )
+        }) else {
             return;
         };
-        let Some(channel_id) = self.selected_entry().map(|e| e.id) else {
+        if pending {
+            self.note("the focused message is still sending");
+            return;
+        }
+        if pubkey != self.me {
+            self.note("only your own messages can be edited");
+            return;
+        }
+        let Some(channel_id) = self.action_channel() else {
             return;
         };
-        let body = row.body.clone();
-        let id = row.event_id.clone();
         self.composer.reply = None;
         self.composer.set_text(&body);
         self.composer.edit = Some(EditTarget {
-            event_id: id,
+            event_id: row_id,
             channel: channel_id,
         });
         self.mode = Mode::Composer;
@@ -2491,29 +3284,59 @@ impl App {
 
     fn delete_focused(&mut self) {
         let own = self
-            .focused_row()
+            .action_row()
             .map(|row| (row.pubkey == self.me, row.event_id.clone(), row.pending));
         let Some((true, id, false)) = own else {
             if let Some((_, id, pending)) = own {
-                self.status = if pending || !is_event_id(&id) {
+                self.note(if pending || !is_event_id(&id) {
                     "the focused message is still sending".to_owned()
                 } else {
                     "only your own messages can be deleted".to_owned()
-                };
+                });
             }
             return;
         };
-        let Some(channel_id) = self.selected_entry().map(|e| e.id) else {
+        let Some(channel_id) = self.action_channel() else {
             return;
         };
         let local = format!("pending:{}", Uuid::new_v4());
-        let removed = self
-            .channels
-            .get_mut(self.selected)
-            .and_then(|e| e.rows.iter().position(|r| r.event_id == id))
-            .map(|position| self.channels[self.selected].rows.remove(position));
+        // The row leaves the view it is shown in, and the write either keeps
+        // it gone or brings it back where it was.
+        let removed = if self.thread.open {
+            let at = self.thread.rows.iter().position(|r| r.event_id == id);
+            at.map(|position| {
+                let removed = self.thread.rows[position].clone();
+                if removed.event_id == self.thread.root {
+                    // The root keeps its place as a placeholder; the replies
+                    // that named it stay readable.
+                    self.thread.root_deleted = true;
+                } else {
+                    self.thread.rows.remove(position);
+                }
+                self.thread.deleted.insert(removed.event_id.clone());
+                self.thread.live_ids.remove(&removed.event_id);
+                removed
+            })
+        } else {
+            self.channels
+                .get_mut(self.selected)
+                .and_then(|e| e.rows.iter().position(|r| r.event_id == id))
+                .map(|position| self.channels[self.selected].rows.remove(position))
+        };
         let Some(removed) = removed else { return };
-        self.set_focus(self.focus);
+        self.deleted_rows.insert(removed.event_id.clone());
+        if self.thread.open
+            && let Some(entry) = self.entry_mut(&channel_id)
+            && let Some(position) = entry.rows.iter().position(|row| row.event_id == id)
+        {
+            entry.rows.remove(position);
+            entry.live_ids.remove(&id);
+        }
+        if self.thread.open {
+            self.thread_focus(self.thread.focus);
+        } else {
+            self.set_focus(self.focus);
+        }
         self.pending.insert(
             local.clone(),
             PendingOp::Delete {
@@ -2521,6 +3344,7 @@ impl App {
                 row: removed,
             },
         );
+        self.track_thread_write(&local);
         self.outbox.push(SessionCommand::Delete {
             channel: channel_id,
             target: id,
@@ -2531,21 +3355,48 @@ impl App {
     fn send_composer(&mut self, now: u64) {
         self.mention_block = None;
         let text = self.composer.text();
+        if self.draft_blocked {
+            if text.trim().is_empty() {
+                self.draft_blocked = false;
+            } else {
+                self.note("publishing blocked: channel membership was lost");
+                return;
+            }
+        }
         if text.trim().is_empty() {
             self.status = "nothing to send".to_owned();
             return;
         }
-        let Some(channel) = self.selected_entry() else {
+        if self.thread.open && self.conn != ConnState::Connected {
+            self.note("publishing disabled while reconnecting");
             return;
+        }
+        let channel_id = if self.thread.open {
+            self.thread.channel
+        } else {
+            let Some(channel) = self.selected_entry() else {
+                return;
+            };
+            channel.id
         };
-        let channel_id = channel.id;
+        if !self.channels.iter().any(|entry| entry.id == channel_id) {
+            self.draft_blocked = true;
+            self.note("publishing blocked: channel membership was lost");
+            return;
+        }
         let local = format!("pending:{}", Uuid::new_v4());
         if let Some(edit) = self.composer.edit.clone() {
             let row_id = edit.event_id.clone();
-            let old_body = self
-                .row_mut(&row_id)
-                .map(|row| std::mem::replace(&mut row.body, text.clone()))
-                .unwrap_or_default();
+            if self.thread.open && self.thread.deleted.contains(&row_id) {
+                self.note("the edit target was deleted");
+                return;
+            }
+            let Some(target) = self.row(&row_id) else {
+                self.note("the edit target was deleted");
+                return;
+            };
+            let old_body = target.body.clone();
+            self.apply_to_row(&row_id, |row| row.body = text.clone());
             self.pending.insert(
                 local.clone(),
                 PendingOp::Edit {
@@ -2553,6 +3404,7 @@ impl App {
                     old_body,
                 },
             );
+            self.track_thread_write(&local);
             self.outbox.push(SessionCommand::Edit {
                 channel: channel_id,
                 target: row_id,
@@ -2564,20 +3416,33 @@ impl App {
             return;
         }
 
-        // The pending row mirrors the final tag shape so overlays behave.
-        let thread = self.composer.reply.as_ref().and_then(|reply| {
-            let target = self
-                .channels
-                .iter()
-                .flat_map(|e| e.rows.iter())
-                .find(|r| r.event_id == reply.event_id)?;
-            let root = target
-                .root_id
-                .clone()
-                .unwrap_or_else(|| target.event_id.clone());
-            Some((root, target.event_id.clone()))
-        });
+        // The pending row mirrors the final tag shape so overlays behave. A
+        // reply target that is gone from every view is refused instead of
+        // becoming a top-level message: a thread reply must never turn into a
+        // channel send.
+        let thread = match &self.composer.reply {
+            None => None,
+            Some(reply) => {
+                if self.thread.open && self.thread.deleted.contains(&reply.event_id) {
+                    self.status = "the reply target was deleted".to_owned();
+                    return;
+                }
+                let Some(target) = self.row(&reply.event_id) else {
+                    self.status = "the reply target was deleted".to_owned();
+                    return;
+                };
+                let root = target
+                    .root_id
+                    .clone()
+                    .unwrap_or_else(|| target.event_id.clone());
+                Some((root, target.event_id.clone()))
+            }
+        };
         let mentions_me = false;
+        let thread_pending = self
+            .thread
+            .open
+            .then(|| content::pending_row(&self.me, &local, &text, &thread, mentions_me, now));
         let row = content::pending_row(&self.me, &local, &text, &thread, mentions_me, now);
         let draft = text.clone();
         let reply = self.composer.reply.clone();
@@ -2589,10 +3454,18 @@ impl App {
                 reply,
             },
         );
+        self.track_thread_write(&local);
         // Follow the new row only when the user was at the bottom before it
         // appeared; checking after the push always reads as not at bottom.
         let was_at_bottom =
             self.selected_entry().map(|e| e.id) == Some(channel_id) && self.at_bottom();
+        if let Some(pending) = thread_pending {
+            let at_bottom = self.thread.focus + 1 >= self.thread.rows.len();
+            self.push_thread_row(pending);
+            if at_bottom {
+                self.thread_focus(usize::MAX);
+            }
+        }
         if let Some(entry) = self.entry_mut(&channel_id) {
             entry.rows.push(row);
             if was_at_bottom {
@@ -2610,6 +3483,7 @@ impl App {
     }
 
     fn complete_write(&mut self, local: String, event_id: String) {
+        self.thread.pending_writes.remove(&local);
         match self.pending.remove(&local) {
             Some(PendingOp::Send { channel, .. }) => {
                 self.seen_aux_insert(&event_id);
@@ -2621,10 +3495,25 @@ impl App {
                         row.event_id = event_id.clone();
                         row.pending = false;
                     }
-                    entry.seen.insert(event_id);
+                    entry.seen.insert(event_id.clone());
+                }
+                // The thread view carries its own copy of the row it composed:
+                // the same echo replaces it there.
+                if self.thread.rows.iter().any(|r| r.event_id == local) {
+                    if self.thread.rows.iter().any(|r| r.event_id == event_id) {
+                        self.thread.rows.retain(|r| r.event_id != local);
+                    } else if let Some(row) =
+                        self.thread.rows.iter_mut().find(|r| r.event_id == local)
+                    {
+                        row.event_id = event_id.clone();
+                        row.pending = false;
+                        row.uncertain = false;
+                    }
+                    self.thread.live_ids.remove(&local);
+                    self.thread.live_ids.insert(event_id.clone());
                 }
                 self.set_focus(self.focus);
-                self.status = "sent".to_owned();
+                self.note("sent");
             }
             Some(PendingOp::Edit { row_id, .. }) => {
                 if let Some(channel) = self.channel_for_row(&row_id) {
@@ -2632,14 +3521,12 @@ impl App {
                 } else {
                     self.seen_aux_insert(&event_id);
                 }
-                if let Some(row) = self.row_mut(&row_id) {
-                    row.uncertain = false;
-                }
-                self.status = "edited".to_owned();
+                self.apply_to_row(&row_id, |row| row.uncertain = false);
+                self.note("edited");
             }
             Some(PendingOp::Delete { channel, .. }) => {
                 self.remember_aux_channel(&event_id, channel);
-                self.status = "deleted".to_owned();
+                self.note("deleted");
             }
             Some(PendingOp::React { row_id, emoji }) => {
                 if let Some(channel) = self.channel_for_row(&row_id) {
@@ -2650,7 +3537,7 @@ impl App {
                 self.reaction_of
                     .insert(event_id.clone(), (row_id.clone(), emoji.clone()));
                 self.my_reaction.insert((row_id, emoji), event_id);
-                self.status = "reacted".to_owned();
+                self.note("reacted");
             }
             Some(PendingOp::ReactRemove {
                 row_id,
@@ -2663,7 +3550,7 @@ impl App {
                     self.seen_aux_insert(&event_id);
                 }
                 self.purge_reaction(&reaction_id);
-                self.status = "reaction removed".to_owned();
+                self.note("reaction removed");
             }
             None => {}
         }
@@ -2677,6 +3564,7 @@ impl App {
     /// A send the relay never saw: the draft comes back to the composer with
     /// the reason, and the exact references stay for the help surface.
     fn block_send(&mut self, local: String, summary: String, details: Vec<String>) {
+        self.thread.pending_writes.remove(&local);
         if let Some(PendingOp::Send {
             channel,
             draft,
@@ -2686,16 +3574,19 @@ impl App {
             if let Some(entry) = self.entry_mut(&channel) {
                 entry.rows.retain(|r| r.event_id != local);
             }
+            self.thread.rows.retain(|r| r.event_id != local);
+            self.thread.live_ids.remove(&local);
             self.set_focus(self.focus);
             self.composer.set_text(&draft);
             self.composer.reply = reply;
             self.mode = Mode::Composer;
         }
-        self.status = summary.clone();
+        self.note(summary.clone());
         self.mention_block = Some(MentionBlock { summary, details });
     }
 
     fn fail_write(&mut self, local: String, reason: String) {
+        self.thread.pending_writes.remove(&local);
         match self.pending.remove(&local) {
             Some(PendingOp::Send {
                 channel,
@@ -2705,39 +3596,51 @@ impl App {
                 if let Some(entry) = self.entry_mut(&channel) {
                     entry.rows.retain(|r| r.event_id != local);
                 }
+                self.thread.rows.retain(|r| r.event_id != local);
+                self.thread.live_ids.remove(&local);
                 self.set_focus(self.focus);
                 self.composer.set_text(&draft);
                 self.composer.reply = reply;
                 self.mode = Mode::Composer;
-                self.status = format!("send failed: {reason}");
+                self.note(format!("send failed: {reason}"));
             }
             Some(PendingOp::Edit {
                 row_id, old_body, ..
             }) => {
-                if let Some(row) = self.row_mut(&row_id) {
-                    row.body = old_body;
+                self.apply_to_row(&row_id, |row| {
+                    row.body = old_body.clone();
                     row.uncertain = false;
-                }
-                self.status = format!("edit failed: {reason}");
+                });
+                self.note(format!("edit failed: {reason}"));
             }
             Some(PendingOp::Delete { channel, row }) => {
+                // A refused deletion brings the message back where it was, in
+                // both views that showed it.
+                self.deleted_rows.remove(&row.event_id);
+                if self.thread.deleted.remove(&row.event_id) {
+                    if self.thread.root == row.event_id {
+                        self.thread.root_deleted = false;
+                    }
+                    self.push_thread_row(row.clone());
+                    self.thread_focus(self.thread.focus);
+                }
                 if let Some(entry) = self.entry_mut(&channel) {
                     entry.rows.push(row);
                     entry.rows.sort_by_key(|r| r.created_at);
                 }
                 self.set_focus(self.focus);
-                self.status = format!("delete failed: {reason}");
+                self.note(format!("delete failed: {reason}"));
             }
             Some(PendingOp::React { row_id, emoji }) => {
-                if let Some(row) = self.row_mut(&row_id) {
+                self.apply_to_row(&row_id, |row| {
                     content::apply_overlay(
                         row,
                         &content::Overlay::Reaction {
                             emoji: format!("-{emoji}"),
                         },
-                    );
-                }
-                self.status = format!("reaction failed: {reason}");
+                    )
+                });
+                self.note(format!("reaction failed: {reason}"));
             }
             Some(PendingOp::ReactRemove {
                 row_id,
@@ -2746,22 +3649,23 @@ impl App {
             }) => {
                 // The removal was refused: the counter comes back, and so
                 // does the toggle entry.
-                if let Some(row) = self.row_mut(&row_id) {
+                self.apply_to_row(&row_id, |row| {
                     content::apply_overlay(
                         row,
                         &content::Overlay::Reaction {
                             emoji: emoji.clone(),
                         },
-                    );
-                }
+                    )
+                });
                 self.my_reaction.insert((row_id, emoji), reaction_id);
-                self.status = format!("reaction removal failed: {reason}");
+                self.note(format!("reaction removal failed: {reason}"));
             }
             None => {}
         }
     }
 
     fn uncertain_write(&mut self, local: String, reason: String) {
+        self.thread.pending_writes.remove(&local);
         match self.pending.remove(&local) {
             Some(PendingOp::Send { channel, .. }) => {
                 if let Some(row) = self
@@ -2771,19 +3675,21 @@ impl App {
                     row.pending = false;
                     row.uncertain = true;
                 }
-                self.status = format!("send uncertain, not retried: {reason}");
-            }
-            Some(PendingOp::Edit { row_id, .. }) => {
-                if let Some(row) = self.row_mut(&row_id) {
+                if let Some(row) = self.thread.rows.iter_mut().find(|r| r.event_id == local) {
+                    row.pending = false;
                     row.uncertain = true;
                 }
-                self.status = format!("edit uncertain, not retried: {reason}");
+                self.note(format!("send uncertain, not retried: {reason}"));
+            }
+            Some(PendingOp::Edit { row_id, .. }) => {
+                self.apply_to_row(&row_id, |row| row.uncertain = true);
+                self.note(format!("edit uncertain, not retried: {reason}"));
             }
             Some(PendingOp::Delete { .. }) => {
-                self.status = format!("delete uncertain, not retried: {reason}");
+                self.note(format!("delete uncertain, not retried: {reason}"));
             }
             Some(PendingOp::React { .. }) | Some(PendingOp::ReactRemove { .. }) => {
-                self.status = format!("reaction uncertain, not retried: {reason}");
+                self.note(format!("reaction uncertain, not retried: {reason}"));
             }
             None => {}
         }
@@ -2912,6 +3818,552 @@ mod tests {
             .into_iter()
             .filter(|command| !matches!(command, SessionCommand::ReadProgress { .. }))
             .collect()
+    }
+
+    fn reply_event(
+        keys: &Keys,
+        channel_id: Uuid,
+        root: &str,
+        parent: &str,
+        body: &str,
+        at: u64,
+    ) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(9), body)
+            .tags(vec![
+                nostr::Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+                nostr::Tag::parse(["e", root, "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", parent, "", "reply"]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(at))
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    /// One conversation on screen with a root and a reply of it, the ids of
+    /// both rows, and the author keys that signed them.
+    fn channel_with_a_reply() -> (App, Uuid, String, String, Keys) {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        let id = channel(1).id;
+        let author = keys();
+        let root_event = message_event(&author, id, "the root", 10);
+        let root = root_event.id.to_hex();
+        let reply_event = reply_event(&author, id, &root, &root, "a reply", 20);
+        let reply = reply_event.id.to_hex();
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![root_event, reply_event],
+            },
+            30,
+        );
+        app.take_outbox();
+        (app, id, root, reply, author)
+    }
+
+    /// The thread read of the conversation above, as the session delivers it.
+    fn thread_read(app: &mut App, id: Uuid, root: &str, events: Vec<nostr::Event>, partial: bool) {
+        app.conn = ConnState::Connected;
+        app.apply(
+            ChatEvent::Thread {
+                channel: id,
+                root: root.to_owned(),
+                request: app.thread.request,
+                events,
+                partial,
+            },
+            40,
+        );
+    }
+
+    #[test]
+    fn t_opens_the_thread_of_a_top_level_message_as_its_own_root() {
+        let (mut app, id, root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        assert!(app.thread.open);
+        assert_eq!(app.thread.root, root);
+        assert_eq!(app.thread.channel, id);
+        match &take_commands(&mut app)[..] {
+            [
+                SessionCommand::OpenThread {
+                    channel,
+                    root: asked,
+                    ..
+                },
+            ] => {
+                assert_eq!(*channel, id);
+                assert_eq!(*asked, root);
+            }
+            other => panic!("expected one thread read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t_on_a_reply_opens_its_root_and_remembers_the_entry_row() {
+        let (mut app, _id, root, reply, _author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenThread, 40);
+        assert_eq!(app.thread.root, root);
+        assert_eq!(app.thread.entered, reply);
+        match &take_commands(&mut app)[..] {
+            [SessionCommand::OpenThread { root: asked, .. }] => assert_eq!(*asked, root),
+            other => panic!("expected one thread read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_row_cannot_open_a_thread() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        let mut pending = row("pending:abc", 40, "me");
+        pending.pending = true;
+        app.channels[0].rows.push(pending);
+        app.set_focus(2);
+        app.handle(Action::OpenThread, 40);
+        assert!(!app.thread.open);
+        assert!(take_commands(&mut app).is_empty());
+        assert!(app.status.contains("still sending"));
+    }
+
+    #[test]
+    fn an_empty_timeline_cannot_open_a_thread() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        app.take_outbox();
+        app.handle(Action::OpenThread, 10);
+        assert!(!app.thread.open);
+        assert!(take_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn the_thread_read_puts_the_root_first_and_keeps_a_live_reply_once() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        // A matching live reply lands while the read is still out.
+        let live = reply_event(&author, id, &root, &reply, "live", 25);
+        let live_id = live.id.to_hex();
+        app.apply(
+            ChatEvent::Timeline {
+                channel: id,
+                event: live.clone(),
+            },
+            41,
+        );
+        let read_root = message_event(&author, id, "the root", 10);
+        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![read_root, read_reply, live],
+            false,
+        );
+        let ids: Vec<&str> = app
+            .thread
+            .rows
+            .iter()
+            .map(|row| row.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec![root.as_str(), reply.as_str(), live_id.as_str()]);
+        // The entry row is where focus lands, not the newest reply.
+        assert_eq!(app.thread.rows[app.thread.focus].event_id, reply);
+    }
+
+    #[test]
+    fn a_live_reply_does_not_pull_focus_and_an_older_one_sits_above() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        let read_root = message_event(&author, id, "the root", 10);
+        thread_read(&mut app, id, &root, vec![read_root], false);
+        assert_eq!(app.thread.focus, 0);
+        // An older reply arrives late: it is inserted above, and focus stays
+        // on the message the reader was on.
+        let older = reply_event(&author, id, &root, &root, "older", 15);
+        let older_id = older.id.to_hex();
+        app.apply(
+            ChatEvent::Timeline {
+                channel: id,
+                event: older,
+            },
+            42,
+        );
+        let _ = reply;
+        assert_eq!(app.thread.rows[1].event_id, older_id);
+        assert_eq!(app.thread.rows[app.thread.focus].event_id, root);
+    }
+
+    #[test]
+    fn a_late_read_for_a_closed_thread_changes_nothing() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        let read_root = message_event(&author, id, "the root", 10);
+        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(&mut app, id, &root, vec![read_root, read_reply], false);
+        let loaded = app.thread.rows.len();
+        app.handle(Action::ThreadLeave, 41);
+        assert!(!app.thread.open);
+        let late = reply_event(&author, id, &root, &reply, "late", 30);
+        thread_read(&mut app, id, &root, vec![late], false);
+        assert_eq!(app.thread.rows.len(), loaded);
+    }
+
+    #[test]
+    fn a_failed_read_keeps_the_rows_and_t_retries_only_a_read() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        let read_root = message_event(&author, id, "the root", 10);
+        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(&mut app, id, &root, vec![read_root, read_reply], true);
+        assert!(app.thread.partial);
+        assert_eq!(app.thread.rows.len(), 2);
+        app.apply(
+            ChatEvent::ThreadFailed {
+                channel: id,
+                root: root.clone(),
+                request: app.thread.request,
+                reason: "relay said no".into(),
+            },
+            50,
+        );
+        assert!(app.thread.failed.is_some());
+        assert_eq!(app.thread.rows.len(), 2);
+        app.take_outbox();
+        assert!(app.thread.rows.iter().any(|row| row.event_id == reply));
+        app.handle(Action::ThreadRetry, 51);
+        match &take_commands(&mut app)[..] {
+            [SessionCommand::OpenThread { .. }] => {}
+            other => panic!("expected one retry, got {other:?}"),
+        }
+        // It never retries a write: a loaded thread has nothing to retry.
+        app.thread.failed = None;
+        app.take_outbox();
+        app.handle(Action::ThreadRetry, 52);
+        assert!(take_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn esc_returns_to_the_saved_row_and_clears_thread_targets() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        let read_root = message_event(&author, id, "the root", 10);
+        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
+        app.set_focus(1);
+        app.handle(Action::OpenThread, 40);
+        thread_read(&mut app, id, &root, vec![read_root, read_reply], false);
+        assert_eq!(app.thread.rows[app.thread.focus].event_id, reply);
+        app.composer.reply = Some(ReplyTarget {
+            event_id: root.clone(),
+            author: "root".into(),
+        });
+        app.composer.set_text("");
+        app.handle(Action::ThreadLeave, 41);
+        assert!(!app.thread.open);
+        assert_eq!(app.focus, 1);
+        assert!(app.composer.reply.is_none());
+        assert!(app.composer.edit.is_none());
+    }
+
+    #[test]
+    fn a_draft_refuses_both_entering_and_leaving_the_thread() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.composer.set_text("draft");
+        app.handle(Action::OpenThread, 40);
+        assert!(!app.thread.open);
+        assert!(take_commands(&mut app).is_empty());
+        app.composer.set_text("");
+        app.handle(Action::OpenThread, 41);
+        assert!(app.thread.open);
+        app.composer.set_text("draft");
+        app.handle(Action::ThreadLeave, 42);
+        assert!(app.thread.open);
+        assert_eq!(app.composer.text(), "draft");
+        assert!(app.status.contains("Send or clear the draft first"));
+    }
+
+    #[test]
+    fn a_pending_write_holds_the_thread_until_it_settles() {
+        let (mut app, id, root, _reply, author) = channel_with_a_reply();
+        let read_root = message_event(&author, id, "the root", 10);
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(&mut app, id, &root, vec![read_root], false);
+        app.thread.rows.push(Row {
+            pending: true,
+            ..app.thread.rows[0].clone()
+        });
+        app.handle(Action::ThreadLeave, 41);
+        assert!(app.thread.open);
+        assert!(app.status.contains("Wait for send result"));
+        // An uncertain result ends that wait.
+        let last = app.thread.rows.len() - 1;
+        app.thread.rows[last].pending = false;
+        app.thread.rows[last].uncertain = true;
+        app.handle(Action::ThreadLeave, 42);
+        assert!(!app.thread.open);
+    }
+
+    #[test]
+    fn a_root_reply_keeps_the_root_and_a_reply_to_a_reply_keeps_the_parent() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenThread, 40);
+        let read_root = message_event(&author, id, "the root", 10);
+        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
+        thread_read(&mut app, id, &root, vec![read_root, read_reply], false);
+        app.take_outbox();
+        let target = |app: &App| app.composer.reply.as_ref().map(|r| r.event_id.clone());
+        // `i` in navigation aims at the root.
+        app.handle(Action::ThreadReplyRoot, 41);
+        assert_eq!(target(&app), Some(root.clone()));
+        assert_eq!(app.mode, Mode::Composer);
+        // The thread composer leaves in one press, and the target stays: a
+        // cancelled thread reply can never become a channel send.
+        app.handle(Action::ComposerEscape, 42);
+        assert_eq!(app.mode, Mode::Navigation);
+        assert_eq!(target(&app), Some(root.clone()));
+        // Enter aims at the focused row, which is the row this thread was
+        // entered from.
+        app.handle(Action::ThreadReplyFocused, 43);
+        assert_eq!(target(&app), Some(reply.clone()));
+        app.handle(Action::ComposerEscape, 44);
+        // A draft in the buffer resumes that target; this key does not
+        // retarget it to the root.
+        app.composer.set_text("nested");
+        app.handle(Action::ThreadReplyRoot, 45);
+        assert_eq!(app.mode, Mode::Composer);
+        assert_eq!(target(&app), Some(reply.clone()));
+        // A reply to a reply keeps the thread root and uses the focused
+        // message as parent.
+        app.handle(Action::ComposerSend, 46);
+        let sent_thread = take_commands(&mut app)
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::Send { thread, .. } => Some(thread),
+                _ => None,
+            })
+            .expect("expected a send");
+        assert_eq!(sent_thread, Some((root.clone(), reply.clone())));
+    }
+
+    #[test]
+    fn a_deleted_root_keeps_its_place_and_blocks_root_replies() {
+        let (mut app, id, root, _reply, author) = channel_with_a_reply();
+        let read_root = message_event(&author, id, "the root", 10);
+        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(&mut app, id, &root, vec![read_root, read_reply], false);
+        app.take_outbox();
+        app.remove_row(&root);
+        assert!(app.thread.root_deleted);
+        assert_eq!(app.thread.rows.len(), 2);
+        app.handle(Action::ThreadReplyRoot, 41);
+        assert!(app.composer.reply.is_none());
+        assert!(app.status.contains("root is deleted"));
+        // A late read cannot resurrect it.
+        let read_root = message_event(&author, id, "the root", 10);
+        thread_read(&mut app, id, &root, vec![read_root], false);
+        assert!(app.thread.rows.iter().any(|row| row.event_id == root));
+        assert_eq!(app.thread.rows.len(), 2);
+    }
+
+    #[test]
+    fn a_thread_reread_preserves_overlays_and_the_focused_reply() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![
+                message_event(&author, id, "the root", 10),
+                reply_event(&author, id, &root, &root, "a reply", 20),
+            ],
+            false,
+        );
+        app.take_outbox();
+        app.handle(Action::NextRow, 41);
+        app.apply(ChatEvent::Overlay(edit_event(&reply, "edited reply")), 42);
+        assert_eq!(app.thread.focused().unwrap().body, "edited reply");
+        app.reread_thread();
+        app.take_outbox();
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![
+                message_event(&author, id, "the root", 10),
+                reply_event(&author, id, &root, &root, "a reply", 20),
+            ],
+            false,
+        );
+        assert_eq!(app.thread.focused().unwrap().event_id, reply);
+        assert_eq!(app.thread.focused().unwrap().body, "edited reply");
+    }
+
+    #[test]
+    fn a_pending_thread_overlay_blocks_escape_until_the_relay_answers() {
+        let (mut app, id, root, _reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![message_event(&author, id, "the root", 10)],
+            false,
+        );
+        app.take_outbox();
+        app.handle(Action::React, 41);
+        let commands = take_commands(&mut app);
+        let local = commands
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::React { local, .. } => Some(local),
+                _ => None,
+            })
+            .expect("reaction write");
+        app.handle(Action::ThreadLeave, 42);
+        assert!(app.thread.open);
+        assert!(app.status.contains("Wait for send result"));
+        app.apply(
+            ChatEvent::WriteOk {
+                local,
+                event_id: "reaction-confirmed".to_owned(),
+            },
+            43,
+        );
+        app.handle(Action::ThreadLeave, 44);
+        assert!(!app.thread.open);
+    }
+
+    #[test]
+    fn reconnecting_keeps_a_thread_reply_draft_without_publishing() {
+        let (mut app, id, root, _reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![message_event(&author, id, "the root", 10)],
+            false,
+        );
+        app.take_outbox();
+        app.handle(Action::ThreadReplyRoot, 41);
+        app.composer.set_text("draft during reconnect");
+        app.conn = ConnState::Reconnecting;
+        app.handle(Action::ComposerSend, 42);
+        assert_eq!(app.composer.text(), "draft during reconnect");
+        assert!(app.take_outbox().is_empty());
+        assert!(app.status.contains("publishing disabled"));
+    }
+
+    #[test]
+    fn a_deleted_reply_target_cannot_turn_a_thread_draft_into_a_channel_send() {
+        let (mut app, id, root, _reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![message_event(&author, id, "the root", 10)],
+            false,
+        );
+        app.take_outbox();
+        app.handle(Action::ThreadReplyRoot, 41);
+        app.composer.set_text("must remain a reply");
+        app.remove_row(&root);
+        app.handle(Action::ComposerSend, 42);
+        assert_eq!(app.composer.text(), "must remain a reply");
+        assert!(app.take_outbox().is_empty());
+        assert!(app.status.contains("reply target was deleted"));
+    }
+
+    #[test]
+    fn losing_thread_membership_keeps_the_draft_but_blocks_the_replacement_channel() {
+        let (mut app, id, root, _reply, author) = channel_with_a_reply();
+        app.channels.push(channel(2));
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![message_event(&author, id, "the root", 10)],
+            false,
+        );
+        app.take_outbox();
+        app.handle(Action::ThreadReplyRoot, 41);
+        app.composer.set_text("keep this draft");
+        app.apply(
+            ChatEvent::ChannelGone {
+                channel: id,
+                reason: "membership lost".to_owned(),
+            },
+            42,
+        );
+        app.take_outbox();
+        assert!(!app.thread.open);
+        assert_eq!(app.composer.text(), "keep this draft");
+        app.handle(Action::ComposerSend, 43);
+        assert!(app.take_outbox().is_empty());
+        assert!(app.status.contains("membership was lost"));
+    }
+
+    #[test]
+    fn reading_a_thread_does_not_advance_the_channel_frontier() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        app.note_presented();
+        assert!(
+            app.take_outbox()
+                .iter()
+                .all(|command| !matches!(command, SessionCommand::ReadProgress { .. }))
+        );
+    }
+
+    #[test]
+    fn the_thread_holds_the_conversation_keys() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        let before = app.selected;
+        let filter = app.filter;
+        app.handle(Action::OpenThread, 40);
+        for action in [
+            Action::NextChannel,
+            Action::PrevChannel,
+            Action::TogglePicker,
+            Action::FilterNext,
+            Action::ToggleAgents,
+        ] {
+            app.handle(action, 41);
+        }
+        assert_eq!(app.selected, before);
+        assert_eq!(app.filter, filter);
+        assert!(app.picker.is_none());
+        assert!(!app.agents.open);
+        assert!(app.thread.open);
+    }
+
+    #[test]
+    fn t_inside_a_thread_does_not_open_another_level() {
+        let (mut app, _id, root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        app.handle(Action::OpenThread, 41);
+        assert_eq!(app.thread.root, root);
+        assert!(take_commands(&mut app).is_empty());
     }
 
     #[test]

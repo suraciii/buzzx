@@ -51,6 +51,16 @@ pub enum Action {
     /// Enter: compose a reply to the focused row, or a new message when the
     /// timeline is empty.
     ComposeReply,
+    /// `t`: open the focused message's thread.
+    OpenThread,
+    /// Esc inside a thread: return to the channel it was opened from.
+    ThreadLeave,
+    /// Enter inside a thread: compose a reply to the focused row.
+    ThreadReplyFocused,
+    /// `i` or Tab inside a thread: compose a reply to the root.
+    ThreadReplyRoot,
+    /// `t` inside a thread: retry a failed read. It never retries a write.
+    ThreadRetry,
     React,
     EditRow,
     DeleteRow,
@@ -85,10 +95,24 @@ pub enum Overlay {
     Agents,
 }
 
+/// What the navigation keys act on. The thread view is a full-screen view of
+/// its own, not an overlay: it replaces the channel timeline, and the
+/// conversation keys that would switch the destination are not part of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Channel,
+    Thread,
+}
+
 /// Map a key press to an action in navigation mode. `layout` selects the
 /// list that `j` and `k` move; `overlay` routes keys to the overlay that is
-/// open.
-pub fn map_navigation(key: KeyEvent, layout: LayoutMode, overlay: Overlay) -> Action {
+/// open; `surface` selects the channel timeline or an open thread.
+pub fn map_navigation(
+    key: KeyEvent,
+    layout: LayoutMode,
+    overlay: Overlay,
+    surface: Surface,
+) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
@@ -138,6 +162,29 @@ pub fn map_navigation(key: KeyEvent, layout: LayoutMode, overlay: Overlay) -> Ac
             _ => Action::Ignored,
         };
     }
+    if surface == Surface::Thread {
+        // One full-screen thread: `j`/`k` move message focus at every width,
+        // the timeline navigation keeps its meaning, and the conversation
+        // keys are not here - they must not switch the destination.
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::NextRow,
+            KeyCode::Char('k') | KeyCode::Up => Action::PrevRow,
+            KeyCode::Char('g') | KeyCode::Home => Action::Top,
+            KeyCode::Char('G') | KeyCode::End => Action::Bottom,
+            KeyCode::PageUp => Action::PageUp,
+            KeyCode::PageDown => Action::PageDown,
+            KeyCode::Enter => Action::ThreadReplyFocused,
+            KeyCode::Char('i') | KeyCode::Tab => Action::ThreadReplyRoot,
+            KeyCode::Char('t') => Action::ThreadRetry,
+            KeyCode::Char('r') => Action::React,
+            KeyCode::Char('e') => Action::EditRow,
+            KeyCode::Char('d') => Action::DeleteRow,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Esc => Action::ThreadLeave,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => match layout {
             LayoutMode::Wide => Action::NextChannel,
@@ -153,6 +200,7 @@ pub fn map_navigation(key: KeyEvent, layout: LayoutMode, overlay: Overlay) -> Ac
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('i') => Action::ComposeNew,
         KeyCode::Enter => Action::ComposeReply,
+        KeyCode::Char('t') => Action::OpenThread,
         KeyCode::Char('c') => Action::TogglePicker,
         KeyCode::Char('a') => Action::ToggleAgents,
         KeyCode::Char('f') => Action::FilterNext,
@@ -212,6 +260,7 @@ mod tests {
             key(code, KeyModifiers::NONE),
             LayoutMode::Wide,
             Overlay::None,
+            Surface::Channel,
         )
     }
 
@@ -220,6 +269,7 @@ mod tests {
             key(code, KeyModifiers::NONE),
             LayoutMode::Narrow,
             Overlay::None,
+            Surface::Channel,
         )
     }
 
@@ -229,7 +279,80 @@ mod tests {
             key(code, KeyModifiers::NONE),
             LayoutMode::Wide,
             Overlay::Agents,
+            Surface::Channel,
         )
+    }
+
+    /// A key press while one thread is on screen.
+    fn thread(code: KeyCode) -> Action {
+        map_navigation(
+            key(code, KeyModifiers::NONE),
+            LayoutMode::Wide,
+            Overlay::None,
+            Surface::Thread,
+        )
+    }
+
+    #[test]
+    fn the_thread_surface_has_its_own_keys_and_no_conversation_keys() {
+        assert_eq!(thread(KeyCode::Char('j')), Action::NextRow);
+        assert_eq!(thread(KeyCode::Down), Action::NextRow);
+        assert_eq!(thread(KeyCode::Char('k')), Action::PrevRow);
+        assert_eq!(thread(KeyCode::Char('g')), Action::Top);
+        assert_eq!(thread(KeyCode::Char('G')), Action::Bottom);
+        assert_eq!(thread(KeyCode::PageUp), Action::PageUp);
+        assert_eq!(thread(KeyCode::Enter), Action::ThreadReplyFocused);
+        assert_eq!(thread(KeyCode::Char('i')), Action::ThreadReplyRoot);
+        assert_eq!(thread(KeyCode::Tab), Action::ThreadReplyRoot);
+        assert_eq!(thread(KeyCode::Char('t')), Action::ThreadRetry);
+        assert_eq!(thread(KeyCode::Char('r')), Action::React);
+        assert_eq!(thread(KeyCode::Char('e')), Action::EditRow);
+        assert_eq!(thread(KeyCode::Char('d')), Action::DeleteRow);
+        assert_eq!(thread(KeyCode::Char('?')), Action::ToggleHelp);
+        assert_eq!(thread(KeyCode::Esc), Action::ThreadLeave);
+        assert_eq!(thread(KeyCode::Char('q')), Action::Quit);
+        // The conversation keys are not here: none of them may switch the
+        // destination behind the thread.
+        for code in [
+            KeyCode::Char('c'),
+            KeyCode::Char('f'),
+            KeyCode::Char('a'),
+            KeyCode::Char('3'),
+        ] {
+            assert_eq!(
+                thread(code),
+                Action::Ignored,
+                "{code:?} is not a thread key"
+            );
+        }
+    }
+
+    #[test]
+    fn help_still_works_inside_a_thread() {
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('j'), KeyModifiers::NONE),
+                LayoutMode::Wide,
+                Overlay::Help,
+                Surface::Thread
+            ),
+            Action::HelpScroll(1)
+        );
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                LayoutMode::Wide,
+                Overlay::Help,
+                Surface::Thread
+            ),
+            Action::Dismiss
+        );
+    }
+
+    #[test]
+    fn t_opens_a_thread_in_the_channel_and_retries_inside_one() {
+        assert_eq!(wide(KeyCode::Char('t')), Action::OpenThread);
+        assert_eq!(thread(KeyCode::Char('t')), Action::ThreadRetry);
     }
 
     #[test]
@@ -259,6 +382,7 @@ mod tests {
                 key(code, KeyModifiers::NONE),
                 LayoutMode::Narrow,
                 Overlay::Picker,
+                Surface::Channel,
             )
         };
         assert_eq!(picker(KeyCode::Char('j')), Action::PickerNext);
@@ -277,7 +401,12 @@ mod tests {
     #[test]
     fn a_too_small_terminal_only_answers_q_and_ctrl_c() {
         let small = |code: KeyCode, modifiers| {
-            map_navigation(key(code, modifiers), LayoutMode::TooSmall, Overlay::None)
+            map_navigation(
+                key(code, modifiers),
+                LayoutMode::TooSmall,
+                Overlay::None,
+                Surface::Channel,
+            )
         };
         assert_eq!(small(KeyCode::Char('q'), KeyModifiers::NONE), Action::Quit);
         assert_eq!(
@@ -306,7 +435,8 @@ mod tests {
             map_navigation(
                 key(KeyCode::Char('G'), KeyModifiers::SHIFT),
                 LayoutMode::Wide,
-                Overlay::None
+                Overlay::None,
+                Surface::Channel
             ),
             Action::Bottom
         );
@@ -327,6 +457,7 @@ mod tests {
                 key(code, KeyModifiers::NONE),
                 LayoutMode::Minimal,
                 Overlay::Help,
+                Surface::Channel,
             )
         };
         assert_eq!(help(KeyCode::Char('j')), Action::HelpScroll(1));
@@ -373,6 +504,7 @@ mod tests {
                 key(code, KeyModifiers::NONE),
                 LayoutMode::Narrow,
                 Overlay::Picker,
+                Surface::Channel,
             )
         };
         assert_eq!(picker(KeyCode::Char('f')), Action::FilterNext);
@@ -386,7 +518,8 @@ mod tests {
             map_navigation(
                 key(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 LayoutMode::Wide,
-                Overlay::None
+                Overlay::None,
+                Surface::Channel
             ),
             Action::Quit
         );

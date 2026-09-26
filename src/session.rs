@@ -58,6 +58,24 @@ pub enum ChatEvent {
         channel: Uuid,
         event: Event,
     },
+    /// One bounded thread read: the root first, then its replies, oldest
+    /// first. `partial` is true when the reply query reached its bound, so the
+    /// view must not present the result as complete history.
+    Thread {
+        channel: Uuid,
+        root: String,
+        request: u64,
+        events: Vec<Event>,
+        partial: bool,
+    },
+    /// A thread read failed: the root is missing or inaccessible, or the query
+    /// did not answer. A view that already holds rows keeps them.
+    ThreadFailed {
+        channel: Uuid,
+        root: String,
+        request: u64,
+        reason: String,
+    },
     /// The relay closed one conversation's Inbox feed: new messages there are
     /// no longer observed, so its unread state stops being trustworthy.
     InboxClosed {
@@ -164,6 +182,13 @@ pub enum SessionCommand {
     LoadAgents,
     /// Fetch history, subscribe live, and backfill overlays for one channel.
     OpenChannel(Uuid),
+    /// Read one conversation's thread: its root and a bounded page of replies.
+    /// Asked for when the thread view opens or a failed read is retried.
+    OpenThread {
+        channel: Uuid,
+        root: String,
+        request: u64,
+    },
     /// Extend the selected conversation's auxiliary feed with a live row
     /// whose id was not part of the HTTP history answer.
     AddAux {
@@ -311,6 +336,13 @@ async fn run_command_pump(
             }
             SessionCommand::OpenChannel(channel) => {
                 open_channel(&client, channel, &subs, &events).await;
+            }
+            SessionCommand::OpenThread {
+                channel,
+                root,
+                request,
+            } => {
+                open_thread(&client, channel, &root, request, &subs, &events).await;
             }
             SessionCommand::LoadProfiles(pubkeys) => {
                 load_profiles(&client, pubkeys, &events).await;
@@ -622,6 +654,61 @@ async fn open_channel(
         })
         .await;
     let _ = subs.send(SubControl::Aux { channel, ids }).await;
+}
+
+/// Read one bounded thread: the root and up to the reply bound. The rows are
+/// installed before the aux feed is extended, so the overlays of a thread that
+/// is already on screen cannot land before the rows they belong to.
+async fn open_thread(
+    client: &Client,
+    channel: Uuid,
+    root: &str,
+    request: u64,
+    subs: &mpsc::Sender<SubControl>,
+    events: &mpsc::Sender<ChatEvent>,
+) {
+    let root = root.to_owned();
+    let id = match event_id(&root) {
+        Ok(id) => id,
+        Err(failure) => {
+            let _ = events
+                .send(ChatEvent::ThreadFailed {
+                    channel,
+                    root,
+                    request,
+                    reason: failure.to_string(),
+                })
+                .await;
+            return;
+        }
+    };
+    let read = match client.thread(id, Some(channel)).await {
+        Ok(read) => read,
+        Err(failure) => {
+            let _ = events
+                .send(ChatEvent::ThreadFailed {
+                    channel,
+                    root,
+                    request,
+                    reason: failure.to_string(),
+                })
+                .await;
+            return;
+        }
+    };
+    let ids: Vec<String> = read.events.iter().map(|event| event.id.to_hex()).collect();
+    let _ = events
+        .send(ChatEvent::Thread {
+            channel,
+            root,
+            request,
+            events: read.events,
+            partial: read.partial,
+        })
+        .await;
+    if !ids.is_empty() {
+        let _ = subs.send(SubControl::AuxAdd { channel, ids }).await;
+    }
 }
 
 async fn load_profiles(client: &Client, pubkeys: Vec<String>, events: &mpsc::Sender<ChatEvent>) {
