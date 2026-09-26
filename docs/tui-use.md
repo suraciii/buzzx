@@ -551,3 +551,254 @@ mention candidates and Mobile message recipients at upstream revision
 `93114c9c65138397de39729fde0a816eb9f314ab`. Both graphical clients separate
 names from identities; this slice reuses that semantic requirement without
 copying their richer editor and non-member invitation flows.
+
+## Planned: focused thread reading
+
+Status: implemented. This slice lets a person follow one conversation inside a
+busy channel, reply, and return to the same channel row. It applies to stream
+channels and existing DMs. Forum navigation remains deferred.
+
+### Enter, read, return
+
+In timeline navigation, `t` opens the focused message's containing thread.
+A top-level message is its own root; a reply uses its existing thread root.
+An empty timeline or an unconfirmed local send cannot open a thread. Keep the
+current view and explain why. Do not change the existing `Enter` reply shortcut
+in the channel timeline.
+
+The thread uses one full-screen timeline at every supported size. Show the
+channel label, `Thread`, and `Esc: back`; do not add a split pane or nested
+navigation stack. The root is the first row, followed by loaded replies in
+chronological order. Focus the message used to enter when it is available;
+otherwise focus the root and report that the selected reply was not loaded.
+The root scrolls normally; it is not pinned above every reply.
+
+```text diagram
+#general / Thread
+  Alice: Can we ship this?
+> Build: Checks passed.
+  Product: One acceptance case remains.
+Enter: reply   i: reply to root   Esc: back
+```
+
+Within this view, `j`/`k` and arrows move message focus at all widths.
+`g`/`G`, Home/End, PgUp/PgDn, help, and quit retain their timeline meaning.
+`t` does not open another level. Conversation shortcuts, picker, Inbox filters,
+and Agents navigation are unavailable until returning; they must not silently
+switch the destination. `Esc` in navigation returns to the saved channel,
+filter, focus, and viewport. If the saved row was deleted, select its nearest
+surviving neighbor. Incoming messages must not pull focus away from older rows.
+Resize, including below 24x6 and back, preserves this context.
+
+### Reply without changing destination
+
+`Enter` replies to the focused confirmed row; `i` or Tab replies to the root.
+The composer visibly identifies the reply target. Sending uses the existing
+mention resolution and write-result rules. A reply to a reply keeps the thread
+root and uses the focused message as parent. No implicit recipients or channel
+broadcast are added. Reaction, edit, and delete keep their existing ownership
+and focused-row rules.
+
+Share the selected conversation's existing composer buffer; preserve existing
+per-conversation draft behavior. If it contains unsent text, entering or leaving the
+thread is refused with `Send or clear the draft first`; the text and destination
+stay intact. This avoids adding a per-thread draft store. Empty composers may
+change view. In a thread composer, Esc leaves composing without clearing its
+reply or edit destination; returning to channel navigation still requires an empty
+buffer. Never turn a cancelled thread reply into a top-level channel send.
+A refused or uncertain write follows the existing send contract, never an
+automatic resend. Pending writes must settle before leaving the thread.
+An uncertain result ends that pending wait: keep the uncertain row and allow
+return, without restoring that already-attempted send as a ready-to-send draft.
+An unconfirmed local row cannot be a reply/edit/reaction target.
+
+When a nonempty draft exists, i, Tab, or Enter resumes that draft with its
+original reply/edit target; none retargets it to the root or current focus.
+Starting a different edit is refused until the draft is sent or cleared.
+The root/focused-row shortcuts above apply only to an empty buffer. Clearing
+means deleting the buffer's text using the existing editor; no discard dialog
+or draft manager is added. On leaving with an empty buffer, clear thread-only
+reply/edit targets so the next channel composition cannot inherit them.
+If a target is deleted while composing, keep the text but refuse its write;
+the user can clear the draft and return. Empty edited content must not be
+implicitly published when leaving.
+
+These are thread-view rules. In particular, thread Esc leaves composing in one
+press and preserves its target, unlike the existing channel composer's two-step
+Esc. Help must state this difference. Quit retains the existing application
+behavior; it does not promise persisted drafts.
+
+### Honest loading and read state
+
+Fetch the root and replies even when the root is outside loaded channel
+history. A local filter of the channel's loaded rows is insufficient. Show
+`Loading thread...`, not an empty-thread claim, until the query finishes.
+On missing or inaccessible root, or query failure, show an explicit error and
+keep Esc available. `t` retries a failed read only; it never retries a write.
+Late results from a closed thread must not replace the active timeline.
+
+Reuse the current bounded thread read: root plus at most 500 replies. If the
+reply query reaches its limit, show `Partial thread: reply limit reached`.
+Determine saturation from the raw reply query before deduplication or filtering.
+The cap is not a total reply count; do not claim complete history. Pagination,
+thread search, follow/unfollow, thread unread badges, and reply-count queries
+are deferred. If the deployment cannot provide this bounded read, report that
+as an implementation blocker rather than silently using channel cache only.
+
+Display only messages from the selected conversation belonging to this root.
+Validate both conversation and thread membership before displaying a returned
+row; do not trust an arbitrary e-reference to prove thread membership. Use the
+existing root/parent semantics. Resolve an entry reply's root before querying;
+reject a root in another conversation rather than switching conversations.
+Merge matching live replies once by canonical event id; unrelated traffic
+continues to update the channel in the background. Apply edit, delete, and
+reaction overlays to loaded rows as in the channel view. A deleted root becomes
+a `Root deleted` placeholder while loaded replies remain readable; disable
+root-targeted actions. Disconnect keeps loaded content with a stale/reconnecting
+status. Reconnect re-reads the bounded thread before removing that status.
+If a reconnect read fails, keep loaded rows with an explicit stale/error state
+and allow t to retry. A late history response must not undo a newer observed
+edit or deletion, or drop a matching live reply received during the read.
+Before initial load succeeds, disable every content-targeted action. While
+disconnected, composing and reading remain possible but publication is disabled
+with a connection reason; do not queue writes for reconnect. Lost membership
+blocks writes and exposes the access error; draft text remains available.
+Typing remains channel-scoped and must not be labeled as thread activity.
+
+Thread reading does not advance the channel read frontier: other discussions
+may be unseen. On return, the ordinary channel presentation rules decide when
+read progress advances. No new persistent read state is introduced.
+
+### Thread view layout
+
+These are proposed frames with sample messages, not implementation screenshots.
+Blank lines count toward the height; trailing padding is omitted. Each line
+fits its stated ASCII column budget.
+
+Use the existing palette: bold for focus/context, dim for metadata, normal for
+bodies, and the existing error accent for failures. The `>` focus marker and
+state text work without color. Authors are labels, not notification syntax.
+
+| Region | Reading | Composing |
+| --- | --- | --- |
+| Header: one row | Thread, conversation, back hint | Thread and conversation |
+| Timeline: remaining rows | Keep focus visible | Keep at least one context row |
+| Target: one row when composing | Absent | Reply to author, or Edit own message |
+| Input: one row when composing | Absent | Buffer and cursor; horizontal scroll in minimal mode |
+| Keys: one row | Navigation hints | Send and leave-composer hints |
+| Status: one row | Connection, coverage, or error | Connection or write outcome |
+
+Reading has no empty composer border. At 24x6 it leaves three message rows;
+composing leaves one context row. At larger sizes use the existing multi-line
+composer, provided all other regions still fit. At 79x12 use the same single
+column as 80x12 with width-dependent wrapping, never a sidebar. The target is
+an explicit label, never inferred from the currently visible timeline row.
+
+#### 80x12: reading
+
+```text diagram
+Thread / #buzzx-tui                                             Esc: back
+  Alice  2m  [root]
+  Can we ship the mention fix?
+
+> Buzzx Build  1m
+  Checks passed. The installed version is ready.
+
+  Product  30s
+  I will verify the recipient readback.
+
+j/k: move  Enter: reply  i: root  ?: help
+Connected
+```
+
+#### 40x10: replying
+
+```text diagram
+Thread / #buzzx-tui
+  Alice [root]
+  Can we ship the mention fix?
+> Buzzx Build
+  Checks passed.
+
+Reply to Buzzx Build
+> @Buzzx Build please share evidence
+Enter: send  Esc: cancel compose
+Connected
+```
+
+#### 24x6: reading
+
+```text diagram
+Thread #buzz... Esc:back
+> Build: Checks passed.
+  Installed version is
+  ready.
+Enter:reply i:root ?help
+Connected
+```
+
+#### 24x6: composing
+
+```text diagram
+Thread #buzzx...
+> Build: Checks passed.
+Reply to Build
+> Please share evidence
+Enter:send Esc:nav
+Connected
+```
+
+#### Clipping and priority
+
+Reserve the navigation back hint before shortening the conversation name.
+Use `...` for clipped labels; wrap message bodies rather than truncating
+content. Measure terminal cells, not bytes: wide characters and emoji must not
+overlap markers or status. The root label belongs only to the root row; it is
+not a second pinned header. No reply counts or progress percentages are added.
+
+The status row prioritizes write error/uncertainty, then read error or stale
+connection, then partial coverage, then connection success. Lower-priority
+states and full clipped labels/errors remain available in help. Leaving help
+returns to the thread. In composer mode `?` remains literal input; Esc returns
+to navigation before opening help. When a higher-priority transient message
+clears, reveal the still-active lower-priority state.
+
+#### State frames
+
+| State | Content | Status and actions |
+| --- | --- | --- |
+| Loading | Loading thread, no false empty result | Esc back; sending disabled |
+| Root without replies | Root stays visible | No replies yet; i replies to root |
+| Read failure | Error replaces unloaded content | Thread load failed; t retry, Esc back; reason in help |
+| Partial | Loaded rows remain usable | Partial: limit reached; limit explanation in help |
+| Disconnected | Keep loaded rows | Reconnecting; stale |
+| Sending | Dim pending reply | Sending...; leaving reports Wait for send result |
+| Refused write | Restore draft and target | Error reason; correction and manual send |
+| Uncertain write | Existing uncertain-write presentation | Send unconfirmed; no automatic retry |
+| Draft blocks return | Keep text and destination | Send or clear draft; i resumes existing draft |
+| Deleted root | Root deleted placeholder | Replies remain; disable root-targeted actions |
+
+Short status labels fit 24 columns; detailed reasons go to help rather than
+taking the input row. Suppress channel-scoped typing inside the thread view:
+it cannot identify who is replying to this thread. The channel view keeps its
+existing typing behavior.
+
+### Acceptance required before delivery
+
+| Case | Required evidence |
+| --- | --- |
+| Root and nested reply entry | Both open the same root; root outside channel cache is fetched; unrelated discussion excluded |
+| 80x12, 79x12, 40x10, 24x6 | Open, move focus, reply, return; resize preserves target and saved channel focus |
+| Reply to root and to reply | Stored event has correct h/root/parent and only explicit mention recipients; recipient-authenticated readback |
+| Draft and failed send | Resume via i/Tab/Enter preserves reply/edit target; refusal keeps draft; uncertainty permits return without a resend draft; empty exit clears thread targets |
+| Live and overlays | Matching reply appears once; unrelated reply stays out; edit/delete/reaction targets remain correct |
+| Read frontier | Reading this thread leaves other channel unread candidates intact |
+| Loading/error/late result | No false empty success; Esc works; closed-thread results cannot steal the view |
+| Full bounded page | Partial label appears, no invented count or claim of complete history |
+| Reconnect and deleted root | Stale state clears only after successful read; live changes survive read races; deleted targets and lost access cannot be written to |
+
+Implementation delivery requires the repository checks and a real-relay TUI
+run, including connect/send/reply/react/edit/delete/quit, at the final source
+state. Record signed events, authenticated readback, dimensions, and source
+revision separately from CI. Merge and verify remote main, then identify the
+actual usable binary. A spec commit or passing unit tests alone is not delivery.

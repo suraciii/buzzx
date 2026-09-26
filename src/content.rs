@@ -319,7 +319,6 @@ pub fn pending_row(
     created_at: u64,
 ) -> Row {
     let (root_id, parent_id) = match thread {
-        Some((root, parent)) if root == parent => (None, Some(parent.clone())),
         Some((root, parent)) => (Some(root.clone()), Some(parent.clone())),
         None => (None, None),
     };
@@ -574,7 +573,7 @@ mod tests {
             false,
             12,
         );
-        assert_eq!(direct.root_id, None, "a direct reply carries one tag");
+        assert_eq!(direct.root_id.as_deref(), Some(root.as_str()));
         assert_eq!(direct.parent_id.as_deref(), Some(root.as_str()));
         assert_eq!(direct.pubkey, me);
         assert!(direct.pending);

@@ -26,3 +26,7 @@ identity owns and what the owner-private observer feed says about their work.
 recipient-correctness rule for the composer: a complete `@member name` in a new
 message or reply becomes a signed recipient, and a draft that cannot be resolved
 is not published.
+
+[Focused thread reading](tui-use.md#planned-focused-thread-reading) is the next
+planned TUI slice: open one discussion, reply, and return to the channel.
+It is a product spec, not an implemented capability.

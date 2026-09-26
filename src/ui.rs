@@ -12,6 +12,7 @@ use crate::agents;
 use crate::app::{AgentStatus, App, ConnState, Context, Marker, Mode, Sections};
 use crate::content::short_pubkey;
 use crate::layout::{self, LayoutMode};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 fn no_color() -> bool {
@@ -70,10 +71,27 @@ fn age(created_at: u64, now: u64) -> String {
     }
 }
 
+/// What a row's place in the view is, when it is the head of a thread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootMark {
+    /// Not a thread root: the channel timeline's ordinary case.
+    None,
+    /// The thread's head: it carries the `[root]` label.
+    Root,
+    /// The thread's head after a deletion: the placeholder replaces its body.
+    Deleted,
+}
+
 /// The lines one row renders as: the header, the wrapped body, attachments,
 /// and reactions. One-column modes ask for the compact markers, so a row
 /// spends its width on the message instead of on words like `(reply)`.
-fn row_lines(row: &crate::content::Row, now: u64, width: u16, compact: bool) -> Vec<Line<'static>> {
+fn row_lines(
+    row: &crate::content::Row,
+    now: u64,
+    width: u16,
+    compact: bool,
+    mark: RootMark,
+) -> Vec<Line<'static>> {
     let (reply, broadcast, edited) = if compact {
         (" <", " @c", " (ed)")
     } else {
@@ -86,6 +104,11 @@ fn row_lines(row: &crate::content::Row, now: u64, width: u16, compact: bool) -> 
     header.push(Span::styled(row.author.clone(), author_style()));
     header.push(Span::raw(" "));
     header.push(Span::raw(age(row.created_at, now)));
+    if mark != RootMark::None {
+        // The root label belongs to the root row and nowhere else: it is not
+        // a second pinned header.
+        header.push(Span::styled("  [root]".to_owned(), pending_style()));
+    }
     if row.pending {
         header.push(Span::styled(" ...".to_owned(), pending_style()));
     }
@@ -111,9 +134,15 @@ fn row_lines(row: &crate::content::Row, now: u64, width: u16, compact: bool) -> 
     } else {
         Style::default()
     };
-    for line in row.body.split('\n') {
-        for chunk in wrap(line, width) {
-            lines.push(Line::styled(chunk, body_style));
+    if mark == RootMark::Deleted {
+        // The replies that named it stay readable; only its own content is
+        // gone, and no root-targeted write is offered.
+        lines.push(Line::styled("Root deleted".to_owned(), pending_style()));
+    } else {
+        for line in row.body.split('\n') {
+            for chunk in wrap(line, width) {
+                lines.push(Line::styled(chunk, body_style));
+            }
         }
     }
     if let Some(attachment) = &row.attachment {
@@ -239,6 +268,9 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     let mode = layout::mode(area.width, area.height);
     match mode {
         LayoutMode::TooSmall => draw_size_message(frame, area),
+        // The thread is a surface of its own: it replaces the whole column
+        // rather than covering part of the timeline.
+        _ if app.thread.open => draw_thread(frame, app, now, area, mode),
         LayoutMode::Wide => draw_wide(frame, app, now, area),
         LayoutMode::Narrow => draw_narrow(frame, app, now, area),
         LayoutMode::Minimal => draw_minimal(frame, app, now, area),
@@ -293,6 +325,172 @@ fn draw_narrow(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     draw_typing(frame, &typing, column[2]);
     draw_composer(frame, app, column[3], true);
     draw_status(frame, app, column[4], false);
+}
+
+/// The focused thread: one full-screen timeline at every size, with the
+/// conversation named in the header and the way back next to it.
+///
+/// Nothing channel-scoped is drawn here. Typing is per channel, so it cannot
+/// say who is replying to this thread, and it is left out.
+fn draw_thread(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutMode) {
+    let compact = mode != LayoutMode::Wide;
+    let minimal = mode == LayoutMode::Minimal;
+    let composing = app.mode == Mode::Composer;
+    // The one-row input is the minimal shape; wider terminals keep the
+    // existing multi-line composer while every other region still fits.
+    let boxed = composing && !minimal;
+    let column = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(u16::from(composing)),
+        Constraint::Length(if boxed { 3 } else { u16::from(composing) }),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    draw_thread_header(frame, app, column[0], compact);
+    draw_thread_timeline(frame, app, column[1], now, compact);
+    if composing {
+        draw_thread_target(frame, app, column[2]);
+        if boxed {
+            draw_composer(frame, app, column[3], compact);
+        } else {
+            draw_composer_line(frame, app, column[3]);
+        }
+    }
+    draw_thread_keys(frame, app, column[4], compact);
+    draw_thread_status(frame, app, column[5], compact);
+}
+
+/// `Thread / #channel` and the way back. The back hint is reserved before the
+/// conversation name is shortened, so the exit never clips away.
+fn draw_thread_header(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
+    let label = match app
+        .channels
+        .iter()
+        .find(|entry| entry.id == app.thread.channel)
+    {
+        Some(entry) if entry.is_dm() => app.label(entry),
+        Some(entry) => format!("#{}", app.label(entry)),
+        None => app.thread.channel.to_string(),
+    };
+    let head = if compact {
+        format!("Thread {label}")
+    } else {
+        format!("Thread / {label}")
+    };
+    let back = if compact { "Esc:back" } else { "Esc: back" };
+    let room = (area.width as usize).saturating_sub(back.len() + 1);
+    let head = clip_with_ellipsis(&head, room);
+    let pad = room.saturating_sub(head.width()) + 1;
+    frame.render_widget(
+        Paragraph::new(format!("{head}{}{back}", " ".repeat(pad))),
+        area,
+    );
+}
+
+/// The thread's own rows: the root first, then the loaded replies in
+/// chronological order. The root scrolls like every other row.
+fn draw_thread_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, compact: bool) {
+    if app.thread.rows.is_empty() {
+        // Nothing is claimed about an unloaded thread: an empty-thread claim
+        // would be a false result while the read is still out.
+        return;
+    }
+    // The head label belongs to the root row itself: a live reply that
+    // arrived before the root did is not the head of this thread.
+    let is_root =
+        app.thread.rows.first().map(|row| row.event_id.as_str()) == Some(app.thread.root.as_str());
+    let head = match (is_root, app.thread.root_deleted) {
+        (false, _) => RootMark::None,
+        (true, true) => RootMark::Deleted,
+        (true, false) => RootMark::Root,
+    };
+    draw_rows(
+        frame,
+        &app.thread.rows,
+        app.thread.focus,
+        area,
+        now,
+        compact,
+        head,
+    );
+}
+
+/// What the composer is aimed at, stated rather than inferred from the
+/// focused row.
+fn draw_thread_target(frame: &mut Frame, app: &App, area: Rect) {
+    if app.composer.edit.is_some() {
+        frame.render_widget(Paragraph::new("Edit own message"), area);
+        return;
+    }
+    if let Some(reply) = &app.composer.reply {
+        frame.render_widget(Paragraph::new(format!("Reply to {}", reply.author)), area);
+        return;
+    }
+    frame.render_widget(Paragraph::new("New message"), area);
+}
+
+fn draw_thread_keys(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
+    let keys = match (app.mode == Mode::Composer, compact) {
+        (false, false) => "j/k: move  Enter: reply  i: root  ?: help",
+        (false, true) => "Enter:reply i:root ?help",
+        // Leaving a thread composer is one press, unlike the channel's, and
+        // the hint says so.
+        (true, false) => "Enter: send  Esc: cancel compose",
+        (true, true) => "Enter:send Esc:nav",
+    };
+    frame.render_widget(Paragraph::new(keys), area);
+}
+
+/// The thread's status. One transient message at a time, in the order the
+/// reader needs it: a write outcome, then the read state, then coverage.
+fn draw_thread_status(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
+    frame.render_widget(Paragraph::new(thread_status(app, compact)), area);
+}
+
+fn thread_status(app: &App, compact: bool) -> String {
+    if let Some(notice) = &app.thread.notice {
+        return notice.clone();
+    }
+    if app.thread.send_pending() {
+        return "Sending...".to_owned();
+    }
+    if app.thread.loading && app.thread.rows.is_empty() {
+        return "Loading thread...".to_owned();
+    }
+    if app.thread.root_deleted {
+        return if compact {
+            "Root deleted".to_owned()
+        } else {
+            "Root deleted; replies remain".to_owned()
+        };
+    }
+    if app.thread.failed.is_some() {
+        return if compact {
+            "Load failed; t retry".to_owned()
+        } else {
+            "Thread load failed; t retry, Esc back".to_owned()
+        };
+    }
+    if app.thread.stale() || app.conn != ConnState::Connected {
+        return if compact {
+            "reconnecting; stale".to_owned()
+        } else {
+            format!("{}; stale", conn_word(app.conn))
+        };
+    }
+    if app.thread.partial {
+        return if compact {
+            "Partial; limit reached".to_owned()
+        } else {
+            "Partial thread: reply limit reached".to_owned()
+        };
+    }
+    if app.thread.loaded() && app.thread.rows.len() <= 1 {
+        return "No replies yet".to_owned();
+    }
+    conn_word(app.conn).to_owned()
 }
 
 /// One column with compact rows. The composer takes a single line, and only
@@ -511,15 +709,30 @@ fn inbox_title(app: &App) -> Line<'static> {
 /// list drops any item taller than its area, and in a chat one long message
 /// is exactly that; this keeps the focused row's own lines on screen.
 fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, compact: bool) {
-    if area.is_empty() {
-        return;
-    }
-    let body_width = area.width.saturating_sub(2);
     let rows = app
         .channels
         .get(app.selected)
         .map(|e| e.rows.as_slice())
         .unwrap_or(&[]);
+    draw_rows(frame, rows, app.focus, area, now, compact, RootMark::None);
+}
+
+/// One row list, focused row kept visible. The channel timeline and the
+/// thread view use it: they differ in where the rows come from and in the
+/// label the head of the list carries, not in how a row reads.
+fn draw_rows(
+    frame: &mut Frame,
+    rows: &[crate::content::Row],
+    focus: usize,
+    area: Rect,
+    now: u64,
+    compact: bool,
+    head: RootMark,
+) {
+    if area.is_empty() {
+        return;
+    }
+    let body_width = area.width.saturating_sub(2);
     if rows.is_empty() {
         return;
     }
@@ -528,13 +741,14 @@ fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, compact: bo
     // be placed in lines rather than in whole rows.
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut starts: Vec<usize> = Vec::with_capacity(rows.len() + 1);
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         starts.push(lines.len());
-        lines.extend(row_lines(row, now, body_width, compact));
+        let mark = if index == 0 { head } else { RootMark::None };
+        lines.extend(row_lines(row, now, body_width, compact, mark));
     }
     starts.push(lines.len());
 
-    let focus = app.focus.min(rows.len() - 1);
+    let focus = focus.min(rows.len() - 1);
     let viewport = area.height as usize;
     let height = starts[focus + 1] - starts[focus];
     let offset = if height > viewport {
@@ -1035,6 +1249,40 @@ fn clip(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+/// Clip a label to `max` cells, saying that it was clipped. A shortened name
+/// without a mark reads as the whole name.
+fn clip_with_ellipsis(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_owned();
+    }
+    if max <= 3 {
+        let mut out = String::new();
+        let mut width = 0;
+        for ch in text.chars() {
+            let next = ch.width().unwrap_or(0);
+            if width + next > max {
+                break;
+            }
+            out.push(ch);
+            width += next;
+        }
+        return out;
+    }
+    let limit = max - 3;
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let next = ch.width().unwrap_or(0);
+        if width + next > limit {
+            break;
+        }
+        out.push(ch);
+        width += next;
+    }
+    out.push_str("...");
+    out
+}
+
 /// The lines of a body that a box of `rows` shows, centered on the line that
 /// must stay visible.
 fn scroll_window(len: usize, rows: usize, focus: usize) -> std::ops::Range<usize> {
@@ -1052,16 +1300,34 @@ fn scroll_window(len: usize, rows: usize, focus: usize) -> std::ops::Range<usize
 /// terminal width is not the whole name, and the help text may wrap and
 /// scroll to show it.
 fn help_text(app: &App, mode: LayoutMode) -> String {
-    let mut text = match mode {
-        LayoutMode::Wide => WIDE_HELP.to_owned(),
-        _ => COMPACT_HELP.to_owned(),
+    let mut text = match (app.thread.open, mode) {
+        (true, LayoutMode::Wide) => THREAD_WIDE_HELP.to_owned(),
+        (true, _) => THREAD_COMPACT_HELP.to_owned(),
+        (false, LayoutMode::Wide) => WIDE_HELP.to_owned(),
+        (false, _) => COMPACT_HELP.to_owned(),
     };
-    text.push_str(&format!(
-        "\nfilter: {} (f cycles All, Unread, For you)\n",
-        app.filter.name()
-    ));
-    if let Some(entry) = app.focused_entry() {
-        text.push_str(&format!("selected: {}\n", app.label(entry)));
+    if app.thread.open {
+        text.push_str(&format!("\nthread / {}\n", app.thread.root));
+        if let Some(reason) = &app.thread.failed {
+            text.push_str(&format!("  last read failed: {reason}\n"));
+        }
+        if app.thread.partial {
+            text.push_str(
+                "  the reply query reached its limit: this view is not\n  complete history.\n",
+            );
+        }
+        if let Some(notice) = &app.thread.notice {
+            text.push_str(&format!("  last outcome: {notice}\n"));
+        }
+    }
+    if !app.thread.open {
+        text.push_str(&format!(
+            "\nfilter: {} (f cycles All, Unread, For you)\n",
+            app.filter.name()
+        ));
+        if let Some(entry) = app.focused_entry() {
+            text.push_str(&format!("selected: {}\n", app.label(entry)));
+        }
     }
     if let Some(block) = &app.mention_block {
         // The last send never reached the relay: the full references stay
@@ -1115,6 +1381,25 @@ PgUp/PgDn move ten rows
 ? help  j k scroll  q quit
 Esc close  Alt+Enter nl
 ● unread  @ mention  ? unknown";
+
+const THREAD_WIDE_HELP: &str = "\
+thread
+  j k up down    move focused row    g G PgUp PgDn ends
+  Enter          reply to focused row    i Tab reply to root
+  t              retry failed read
+  r e d          react / edit / delete on focused row
+  Esc            back to the channel
+  ?              help                  q quit
+composer
+  Enter send     Alt+Enter newline
+  Esc leaves composing in one press and keeps its target";
+
+const THREAD_COMPACT_HELP: &str = "\
+thread: j k move  g G ends  PgUp/PgDn
+Enter reply  i/Tab root  t retry read
+r/e/d react/edit/delete  Esc back
+? help  q quit
+composer: Esc leaves; Enter sends";
 
 /// Wrap the help text to a width, so the popup can be sized to what it holds
 /// and scrolled by line rather than by paragraph.
@@ -1272,6 +1557,155 @@ mod tests {
             uncertain: false,
             edited: false,
         }
+    }
+
+    /// A conversation with a thread on screen: its root, one reply, and the
+    /// read that delivered both.
+    fn thread_app(own_root: bool) -> (App, nostr::Keys) {
+        use nostr::{EventBuilder, Kind, Timestamp};
+        let keys = nostr::Keys::generate();
+        let mut app = App::new(&keys, "http://relay.test");
+        app.conn = ConnState::Connected;
+        app.status = "connected".to_owned();
+        let entry = App::stub_entry(uuid::Uuid::new_v4(), "general");
+        let id = entry.id;
+        app.channels.push(entry);
+        app.stub_roster();
+        // The root is signed by the identity itself when the test needs to
+        // delete it, which only its own author may do.
+        let author = if own_root {
+            keys.clone()
+        } else {
+            nostr::Keys::generate()
+        };
+        let root = EventBuilder::new(Kind::Custom(9), "the root")
+            .tags(vec![nostr::Tag::parse(["h", &id.to_string()]).unwrap()])
+            .custom_created_at(Timestamp::from(100))
+            .sign_with_keys(&author)
+            .unwrap();
+        let root_id = root.id.to_hex();
+        let reply = EventBuilder::new(Kind::Custom(9), "the reply")
+            .tags(vec![
+                nostr::Tag::parse(["h", &id.to_string()]).unwrap(),
+                nostr::Tag::parse(["e", &root_id, "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", &root_id, "", "reply"]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(110))
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let me = app.me.clone();
+        app.channels[0].rows = vec![
+            crate::content::row_from_event(&root, &me),
+            crate::content::row_from_event(&reply, &me),
+        ];
+        app.focus = 0;
+        app.handle(crate::keys::Action::OpenThread, 130);
+        app.apply(
+            crate::session::ChatEvent::Thread {
+                channel: id,
+                root: root_id,
+                request: 1,
+                events: vec![root, reply],
+                partial: false,
+            },
+            130,
+        );
+        app.take_outbox();
+        (app, keys)
+    }
+
+    #[test]
+    fn the_thread_frame_names_the_conversation_and_reserves_the_way_back() {
+        let (app, _keys) = thread_app(false);
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Thread / #general"), "{text}");
+        assert!(text.contains("Esc: back"), "{text}");
+        assert!(text.contains("[root]"), "the root is labelled: {text}");
+        assert!(text.contains("the root"), "{text}");
+        assert!(text.contains("the reply"), "{text}");
+        assert!(text.contains("j/k: move"), "the key row: {text}");
+    }
+
+    #[test]
+    fn the_thread_frame_at_the_floor_keeps_every_region() {
+        let (mut app, _keys) = thread_app(false);
+        let reading = frame_text(&app, 24, 6);
+        assert!(reading.contains("Thread #general"), "{reading}");
+        assert!(reading.contains("Esc:back"), "{reading}");
+        assert!(reading.contains("Enter:reply"), "{reading}");
+        assert!(!reading.contains("typing"), "no channel typing: {reading}");
+
+        app.handle(crate::keys::Action::ThreadReplyRoot, 131);
+        let composing = frame_text(&app, 24, 6);
+        assert!(composing.contains("Reply to "), "{composing}");
+        assert!(composing.contains("Enter:send"), "{composing}");
+        // One context row survives next to the target and the input, and it
+        // is the focused row.
+        assert!(composing.contains("> "), "{composing}");
+        assert!(composing.contains("[root]"), "{composing}");
+    }
+
+    #[test]
+    fn a_long_conversation_name_is_clipped_after_the_back_hint() {
+        let (mut app, _keys) = thread_app(false);
+        app.channels[0].name = "a-very-long-conversation-name-indeed".into();
+        let text = frame_text(&app, 24, 6);
+        assert!(text.contains("Esc:back"), "the exit survives: {text}");
+        assert!(text.contains("..."), "the clipped name says so: {text}");
+        assert!(!text.contains("indeed"), "{text}");
+    }
+
+    #[test]
+    fn an_unloaded_thread_claims_loading_and_never_an_empty_thread() {
+        let (mut app, _keys) = thread_app(false);
+        app.apply(
+            crate::session::ChatEvent::Thread {
+                channel: app.thread.channel,
+                root: app.thread.root.clone(),
+                request: 1,
+                events: Vec::new(),
+                partial: false,
+            },
+            130,
+        );
+        // A read that carried nothing at all is a real answer of an empty
+        // thread, so ask for the state before the read instead: a fresh view.
+        app.thread.rows.clear();
+        app.thread.loading = true;
+        app.thread.notice = None;
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Loading thread..."), "{text}");
+        assert!(!text.contains("No replies yet"), "{text}");
+    }
+
+    #[test]
+    fn a_deleted_root_keeps_a_placeholder_and_says_so() {
+        let (mut app, _keys) = thread_app(true);
+        app.thread.focus = 0;
+        app.handle(crate::keys::Action::DeleteRow, 131);
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Root deleted"), "{text}");
+        assert!(text.contains("the reply"), "replies remain: {text}");
+    }
+
+    #[test]
+    fn a_partial_read_says_the_history_is_bounded() {
+        let (mut app, _keys) = thread_app(false);
+        app.thread.partial = true;
+        let text = frame_text(&app, 80, 12);
+        assert!(
+            text.contains("Partial thread: reply limit reached"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_stale_thread_keeps_its_rows_and_says_they_are_stale() {
+        let (mut app, _keys) = thread_app(false);
+        app.conn = ConnState::Reconnecting;
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("reconnecting; stale"), "{text}");
+        assert!(text.contains("the reply"), "loaded rows stay: {text}");
     }
 
     fn frame_text(app: &App, width: u16, height: u16) -> String {
@@ -1748,7 +2182,7 @@ mod tests {
         let mut row = message_row(0, "hi");
         row.mentions_me = true;
         row.parent_id = Some("root".into());
-        let header = row_lines(&row, 110, 40, true)[0].to_string();
+        let header = row_lines(&row, 110, 40, true, RootMark::None)[0].to_string();
         assert!(header.starts_with("*alice 10s"), "{header}");
         assert!(header.contains(" <"), "{header}");
         assert!(header.contains("@you"), "{header}");
@@ -1913,7 +2347,7 @@ mod tests {
             edited: true,
         };
         let render = |row: &crate::content::Row, compact| -> Vec<String> {
-            row_lines(row, 0, 40, compact)
+            row_lines(row, 0, 40, compact, RootMark::None)
                 .iter()
                 .map(|line| line.to_string())
                 .collect()
