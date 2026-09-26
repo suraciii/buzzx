@@ -445,6 +445,12 @@ stays readable at 24 columns. The correction is text: replace the ambiguous name
 with one of those references. A short public key is display-only and is never
 accepted as an input identity.
 
+A fragment the SDK extractor cannot read at all counts as an unknown name, not
+as text: a name that begins with a non-ASCII character has no fallback token, so
+without this check the fragment would vanish from the recipient list while the
+message published as written. The refusal names the fragment as the reader sees
+it, up to the next space.
+
 An exact reference picks one candidate of an otherwise ambiguous name, and it
 does not excuse another unresolved name in the same draft. Every reference must
 name a current member. The recipient list is capped at the SDK's
@@ -489,7 +495,7 @@ through a richer composer token.
 
 `RESEARCH/harness/verify_mentions.py` drives the real TUI over a PTY against the
 harness fake relay and reads the relay log, so the evidence is the signed event
-rather than the text on screen. Seven scenarios pass, at 80 by 12, 40 by 10, 79
+rather than the text on screen. Eight scenarios pass, at 80 by 12, 40 by 10, 79
 by 12 and 24 by 6 (`WORK_LOGS/BUZZX_MENTIONS_ACCEPTANCE_LOG.md`, raw screens and
 relay logs in `RESEARCH/harness/captures-mentions/`).
 
@@ -515,13 +521,30 @@ relay logs in `RESEARCH/harness/captures-mentions/`).
 - A reply to a message written by someone else, naming one member, stores the
   named member as its only `p` tag and the answered message as its `e` tag with
   the `reply` marker: the parent's author is not turned into a recipient.
+- A member whose display name is Chinese is named correctly, while an unknown
+  name in Chinese, a half-typed one, and an unknown Chinese fragment next to a
+  readable name all publish nothing and keep the draft; the same text in a code
+  span sends as plain text without a membership read.
 
-Not verified: the fake relay does not enforce per-identity authorization, so
-what the rig shows is the recipient's own `#p` filter returning the message, not
-an authorization check. A deployed relay readback of a mention-carrying message
-by the mentioned identity - and the same inside an existing DM, where the other
-participants are not added automatically - remains to be confirmed against a
-deployment.
+`RESEARCH/harness/verify_mentions_live.py` then drives the real TUI against the
+deployment itself (`wss://buzz.surac.cloud`) and reads the event back with the
+mentioned identity's own credential. Four sends pass - a channel and a
+three-person DM conversation, at 80 by 12 and 24 by 6
+(`RESEARCH/harness/captures-mentions-live/`) - and one refusal on the same
+deployment. Each send's signed kind 9 event carries the conversation's `h` tag
+and exactly the named member's `p` tag; the reply inside the DM also carries the
+answered message as its `e` tag with the `reply` marker, and neither the parent's
+author nor the third participant becomes a recipient. The mentioned identity's
+own read returns the event (`buzz messages get`, `buzz social event`) and its
+mention feed lists it (`buzz feed get --types mentions`). The refusal publishes
+nothing at all: the conversation's event set is identical before and after.
+
+Not verified: no Agent execution was observed from a mention - the evidence is
+storage and the recipient's own read, not an Agent's turn. The live runs cover
+one deployment and the acceptance identities in this workspace, not every relay
+or membership edge, and the fake relay still does not enforce authorization, so
+the refusal-by-policy case (a valid mention the reader is not entitled to read)
+is out of scope here.
 
 Source basis: Buzz SDK builders and mentions, the CLI message preflight, Desktop
 mention candidates and Mobile message recipients at upstream revision

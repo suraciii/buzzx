@@ -166,6 +166,72 @@ fn starts_a_name(content: &str) -> bool {
     })
 }
 
+/// Whether `c` may continue the SDK's fallback name token:
+/// `[A-Za-z0-9._-]`, the only characters it reads when no known name matches.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+/// The SDK's own rule for where a matched name ends: end of text, whitespace,
+/// or one of these closing marks.
+fn ends_a_name(s: &str) -> bool {
+    s.chars().next().is_none_or(|c| {
+        c.is_ascii_whitespace() || matches!(c, ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}')
+    })
+}
+
+/// The first `@` fragment the SDK extractor cannot read, in text order.
+///
+/// The extractor reads a name two ways: a known display name, matched
+/// longest-first at the `@`, or a single token of `[A-Za-z0-9._-]`. A name
+/// that begins with any other character - a display name in Chinese, say -
+/// matches neither, and the extractor reports nothing for it. Left alone, the
+/// fragment would vanish from the recipient list while the message published
+/// as written, which is the one outcome the contract forbids: a fragment that
+/// visibly names someone is either resolved or the draft does not go out.
+///
+/// The walk is the extractor's own - the whitespace rule, the longest-known-
+/// name-first match, the word boundary, the lowercase - so a fragment reported
+/// here is exactly one the extractor skipped. Its text runs to the next
+/// whitespace, which is what the reader sees as the name.
+fn unreadable_name(content: &str, known: &[&str]) -> Option<String> {
+    let mut sorted: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|name| !name.trim().is_empty())
+        .collect();
+    sorted.sort_by_key(|name| std::cmp::Reverse(name.len()));
+
+    for (i, _) in content.match_indices('@') {
+        if i != 0 && !content.as_bytes()[i - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let rest = &content[i + 1..];
+        let matched_known = sorted.iter().any(|&name| {
+            rest.get(..name.len()).is_some_and(|head| {
+                head.eq_ignore_ascii_case(name) && ends_a_name(&rest[name.len()..])
+            })
+        });
+        if matched_known {
+            continue;
+        }
+        let Some(first) = rest.chars().next() else {
+            continue;
+        };
+        if first.is_ascii_whitespace() || is_token_char(first) {
+            // The extractor reads whitespace as no name and token characters
+            // as its fallback name, which resolution reports if unknown.
+            continue;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        // Reported as typed: the extractor never read this fragment, so there
+        // is no lowercased name to keep, and the reader has to find the words
+        // they wrote in the draft.
+        return Some(rest[..end].to_owned());
+    }
+    None
+}
+
 /// The recipients this draft asks to notify, or why it cannot be sent.
 ///
 /// A unique complete member name resolves to that member. An exact reference
@@ -178,6 +244,9 @@ pub fn plan(content: &str, directory: &Directory) -> Result<Vec<String>, Block> 
 
     let names = directory.display_names();
     let known: Vec<&str> = names.iter().map(String::as_str).collect();
+    if let Some(name) = unreadable_name(&stripped, &known) {
+        return Err(Block::Unknown { name });
+    }
     let named = extract_at_mentions_with_known(&stripped, &known);
 
     let map = directory.name_map();
@@ -292,6 +361,51 @@ mod tests {
             }
         );
         assert!(block.summary().contains("@nobody"));
+    }
+
+    #[test]
+    fn an_unknown_unicode_name_blocks_the_draft() {
+        let block = plan("@李四 please look", &directory()).expect_err("blocks");
+        assert_eq!(
+            block,
+            Block::Unknown {
+                name: "李四".to_owned()
+            }
+        );
+        assert!(block.summary().contains("@李四"));
+    }
+
+    #[test]
+    fn a_partial_unicode_name_is_not_expanded() {
+        let block = plan("@张 please look", &directory()).expect_err("blocks");
+        assert_eq!(
+            block,
+            Block::Unknown {
+                name: "张".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_fragment_is_reported_as_typed() {
+        let block = plan("@ÄBC please look", &directory()).expect_err("blocks");
+        assert_eq!(
+            block,
+            Block::Unknown {
+                name: "ÄBC".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_valid_name_does_not_excuse_an_unknown_unicode_name() {
+        let block = plan("@Buzzx Build and @李四 please", &directory()).expect_err("blocks");
+        assert_eq!(
+            block,
+            Block::Unknown {
+                name: "李四".to_owned()
+            }
+        );
     }
 
     #[test]
