@@ -636,8 +636,17 @@ impl App {
         let me = self.me.clone();
         self.channels
             .iter()
-            .flat_map(|e| e.rows.iter())
-            .map(|r| r.pubkey.clone())
+            .flat_map(|entry| {
+                entry
+                    .rows
+                    .iter()
+                    .map(|row| row.pubkey.clone())
+                    // A DM's label is its participants, and that label is
+                    // needed before any of its history is loaded: the roster
+                    // alone has to ask for them, or an unopened DM shows a
+                    // short key where a name belongs.
+                    .chain(entry.participants.iter().cloned())
+            })
             .filter(|pubkey| pubkey != &me && !self.profiles.contains_key(pubkey))
             .collect::<HashSet<String>>()
             .into_iter()
@@ -698,6 +707,10 @@ impl App {
                     self.outbox
                         .push(SessionCommand::OpenChannel(self.channels[0].id));
                 }
+                // A DM is labelled by its participants, and that label is on
+                // screen before the conversation is ever opened, so the names
+                // are wanted as soon as the roster names the people.
+                self.request_profiles();
             }
             ChatEvent::ReadState { contexts, complete } => {
                 self.apply_read_state(&contexts, complete);
@@ -862,6 +875,10 @@ impl App {
         }
         self.request_catch_up();
         self.refresh_views();
+        // The answer that makes a frontier claimable can arrive after the
+        // conversation was already shown, which is the normal cold start: the
+        // screen did not change, but what may be claimed about it did.
+        self.note_presented();
     }
 
     /// Fold one conversation's catch-up in. What this identity wrote, and what
@@ -898,6 +915,10 @@ impl App {
             entry.read.unread.insert(id, candidate);
         }
         self.refresh_views();
+        // The catch-up answer is what turns a conversation's coverage into
+        // something a frontier may rest on, and it can land after the
+        // conversation is already on screen.
+        self.note_presented();
     }
 
     /// Start tracking a conversation that has no marker yet: the newest
@@ -943,6 +964,9 @@ impl App {
             .unread
             .retain(|id, candidate| candidate.at >= frontier && !presented.contains(id));
         self.refresh_views();
+        // A conversation with no marker starts from this seed, and the
+        // conversation may already be the one on screen when it lands.
+        self.note_presented();
     }
 
     /// One live message for a conversation nobody has open. The conversation on
@@ -3697,6 +3721,52 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_on_screen_claims_its_read_state_when_the_answer_lands() {
+        let mut app = app();
+        let keys = keys();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        let id = app.channels[0].id;
+        let event = message_event(&keys, id, "hello", 10);
+        app.channels[0].rows = vec![Row {
+            event_id: event.id.to_hex(),
+            ..row("a", 10, "p")
+        }];
+        app.channels[0].loading = false;
+        app.focus = 0;
+        // The cold start: the newest message is on screen before the relay has
+        // said what this identity already read.
+        app.note_presented();
+        assert_eq!(
+            published(&mut app),
+            None,
+            "nothing is claimed before the relay's answer"
+        );
+
+        app.apply(
+            ChatEvent::ReadState {
+                contexts: HashMap::new(),
+                complete: true,
+            },
+            0,
+        );
+        app.apply(
+            ChatEvent::CatchUp {
+                channel: id,
+                events: Vec::new(),
+                complete: true,
+            },
+            0,
+        );
+        let claim = published(&mut app).expect("the answer closes the gate on the conversation");
+        assert_eq!(
+            claim.get(&id.to_string()),
+            Some(&10),
+            "the frontier is the newest message that was on screen"
+        );
+    }
+
+    #[test]
     fn an_unread_message_and_a_mention_raise_their_rows_and_the_filters_agree() {
         let mut app = app();
         app.channels = vec![channel(1), channel(2)];
@@ -4254,6 +4324,38 @@ mod tests {
             Some(4),
             "a freed number is not handed to a new conversation"
         );
+    }
+
+    #[test]
+    fn a_dm_asks_for_its_participants_before_any_of_its_history_lands() {
+        let mut app = app();
+        let other = Keys::generate().public_key().to_hex();
+        app.apply(
+            ChatEvent::Channels(roster(vec![
+                channel_info(1),
+                dm_info(2, vec![other.clone()]),
+            ])),
+            0,
+        );
+        assert_eq!(app.channels[1].rows.len(), 0, "the DM has no history yet");
+        let asked: Vec<String> = take_commands(&mut app)
+            .into_iter()
+            .filter_map(|command| match command {
+                SessionCommand::LoadProfiles(pubkeys) => Some(pubkeys),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            asked.contains(&other),
+            "an unopened DM is labelled by its participants, so their profiles are wanted \
+             without waiting for its history: {asked:?}"
+        );
+        app.apply(
+            ChatEvent::Profiles(vec![(other.clone(), "Direct Person".into())]),
+            0,
+        );
+        assert_eq!(app.label(&app.channels[1]), "Direct Person");
     }
 
     #[test]

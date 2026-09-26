@@ -112,8 +112,12 @@ conversation or reading older history does not clear unread messages. When a
 saved marker is available, the next session reads it from the relay and
 continues from that frontier. A conversation with no marker starts at the
 newest message as a local baseline; the seed is never uploaded. A message in
-the frontier's own second stays unread until shown. (Sources:
-`src/app.rs::note_presented`, `apply_seed`, `ReadTrack::unread_at`;
+the frontier's own second stays unread until shown. The claim is re-made when
+the answer that makes it possible lands — the marker, the catch-up, or the
+seed — so a conversation that was already on screen before the relay answered
+is not left unclaimed. (Sources:
+`src/app.rs::note_presented`, `apply_read_state`, `apply_catch_up`,
+`apply_seed`, `ReadTrack::unread_at`;
 `src/client.rs::CatchUp::Newest`, `read_state`; `src/session.rs::load_read_state`.)
 
 Read state is a NIP-44 encrypted kind 30078 event with one replaceable `buzzx`
