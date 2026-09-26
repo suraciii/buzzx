@@ -1,7 +1,8 @@
 # TUI visual language
 
-Status: revision 4, product review draft. Not implemented. This replaces the
-visual direction in revisions 1-3. Previous images remain historical artifacts.
+Status: revision 5, approved for implementation on 2026-09-27. Not implemented.
+This is the implementation baseline, including the approved weak message
+separators. It replaces revisions 1-4; previous images remain historical artifacts.
 The [review atlas](assets/tui-design-system.html) contains four boards and dark,
 light and NO_COLOR studies. Its controls are for reviewing the design, not new
 client controls. Sample messages and Agent states are invented fixtures.
@@ -20,23 +21,22 @@ explicit when its knowledge is incomplete. A conversation is the primary
 surface. Navigation supports it; runtime information does not take it over.
 This follows the [product contract](../core.md).
 
-## Review of the previous direction
+## Scope and authority
 
-Revision 3 styled isolated screens before defining their shared grammar. The
-selected conversation, selected message and input all used blue emphasis, so
-several regions competed to be the action target. A highlighted message kept
-its accent while the composer was active. The proposed author/body gap broke
-message grouping, and the 26-cell roomy example did not demonstrate the
-compact sidebar allocation.
+Implement this visual language across the channel/DM timeline, focused thread,
+composer, Inbox picker, Agent list/detail and help. All pages use the same
+styles, spacing and selection rules. Do not stop at the main channel screen.
 
-The sample also replaced the existing unread dot with an unexplained asterisk.
-It mainly demonstrated a spacious dark channel and a narrow reply; light,
-NO_COLOR, list/detail, refused sends and uncertain sends were left as future
-checks. Passing repository checks could not establish that the design worked.
+This document owns visual appearance and density. [The manual](tui-use.md)
+owns keys, focus, drafts, recipients and state meanings;
+[the render contract](../design/render-contract.md) owns rows and overlays.
+Existing ASCII layouts in the manual explain behavior, not the final styling.
+This spec and its revision-5 atlas are the appearance baseline.
 
-Choose a shared layout and semantic emphasis before styling individual views.
-Keep one message grammar, one list selection, one composer, and one state area.
-The specimens below demonstrate these components together and under pressure.
+No new control surface, setting, theme picker, navigation command, message
+grouping, protocol, read-state rule or Agent capability is added. A visual
+separator cannot merge two events, introduce a selectable item or imply that
+a task or thread has finished. The application remains a terminal chat client.
 
 ## Shared anatomy
 
@@ -93,8 +93,11 @@ All authors use the same treatment. No synthetic human/assistant bubble style,
 role color, avatar or inferred bot badge is added.
 
 An author line is immediately followed by its body, always on the same left
-edge. At 16 rows or more, one blank row separates message groups and list items
-may have one intervening blank row. Below 16 rows, remove decorative gaps.
+edge. A roomy timeline has at least 40 terminal columns and 16 terminal rows;
+all other supported sizes use compact spacing. This is a density choice, not
+a new navigation breakpoint. Roomy timelines use one separator row between
+messages; compact timelines use no extra separator row. Lists may have one
+intervening blank row in roomy mode, but do not inherit timeline separators.
 Existing newlines in message content are content and are not removed.
 
 The channel sidebar stays 22 cells wide. Content starts with a two-cell focus
@@ -103,11 +106,13 @@ outer inset plus its focus gutter. At widths below 40, reduce outer padding
 before reducing body width. At 24 columns, padding can be zero. At 24x6,
 composition uses exactly the six rows illustrated in the density studies.
 
-Leave no blank row inside a short composer between its target and input. A
-roomy composer can have one. The cursor is a terminal cell after the insertion
-point, not an extra icon. Use at most one neutral input surface and a short
-left rule beside its target; remove full box borders. At small sizes the
-target and cursor establish the input region without decoration.
+A compact composer uses one target row immediately followed by one input row.
+A roomy composer uses one target row, one blank row and two input rows. Keep
+the cursor visible within that fixed input allocation as the draft grows;
+the buffer itself is not clipped or shortened. Use the terminal cursor at the
+insertion point; the block in the mockup illustrates it, not a second cursor.
+Use one neutral input surface and a short left rule beside its target, with no
+full box border. At minimal widths, the target and cursor suffice.
 
 Conversation signal slots retain the existing five-cell reservation. Names
 shorten only after allocating their state. In an Agent list, align state words
@@ -116,12 +121,78 @@ Do not abbreviate `No active turn observed` to a different claim. Message
 bodies wrap; labels may clip; complete names and reasons remain in help/detail.
 Measure terminal cells, including wide and combining characters.
 
+## Message separators
+
+Ordinary messages have no complete frame or card. A weak horizontal rule
+clarifies where one message ends and the next starts. It uses the neutral
+separator role, never the focus, mention or error color. Do not brighten it
+when a message is focused, mentioned, pending or uncertain.
+
+- **Roomy timeline:** replace the single gap between adjacent messages with
+  one rule row. Start at the body left edge and end at the content right inset;
+  do not cross the focus gutter or sidebar. The rule follows the entire message,
+  including attachment and reaction lines, and precedes the next author. Do not
+  add another gap above or below it, or a rule before the first/after the last
+  message in the loaded sequence.
+- **Compact timeline:** allocate the author, age and semantic labels first.
+  If at least six cells remain, leave two spaces and fill the remainder with
+  the rule (at least four strokes). Otherwise omit it. Never clip a name,
+  state or body just to fit decoration. The rule cannot wrap to another row.
+- **Minimal one-row excerpt:** where the existing compact view combines an
+  author and body in one row, omit the rule. At 24x6 the input context needs
+  that space. A header-only row may still use the compact rule if space permits.
+
+A separator is presentational spacing, not a row/event of its own. It cannot
+receive focus, advance read progress, count as a reply or be a write target.
+When the viewport starts inside a message, do not fabricate a new message
+boundary. A rule scrolls with the actual boundary, not as a sticky screen edge.
+Incoming messages and switching density must preserve the focused event.
+
+Use a single-cell horizontal stroke, such as `─`; ASCII `-` is acceptable when
+that glyph is unavailable. In NO_COLOR use default foreground with dim styling
+where supported, never reverse, bold or an attention marker. If dim is not
+supported, a plain neutral stroke is sufficient; author weight and position
+still distinguish the message. Keep the focused author and meaningful labels
+stronger than the decoration. Consecutive messages by the same author retain
+separate headers and the same rule: no new grouping behavior is introduced.
+
+The input's short vertical rule identifies the active writing region. It does
+not wrap the draft in a message frame. Inbox, Agents and help retain their
+existing list/section grouping; they do not put a horizontal line after every
+item. This keeps boundaries consistent with the type of content.
+
+## Region budgets
+
+Reserve from the bottom before laying out the timeline. Every supported view
+has a one-row context header, one keys row and one state row. In minimal mode
+the state word can replace a redundant mode word. The remaining rows are
+content; reading mode has no reserved empty composer.
+
+| Density | Composer allocation | Timeline allocation while composing |
+| --- | --- | --- |
+| Roomy | Target 1 + gap 1 + input 2 | Remaining height after header, keys and state |
+| Compact | Target 1 + input 1 | Remaining height after header, keys and state |
+| 24x6 minimum | Target 1 + input 1 | Exactly 1 context row |
+
+The channel typing line may take one additional row only when at least one
+context row remains. Otherwise omit that decorative activity line for the
+frame, retaining its existing state and sidebar signal. A thread never labels
+channel typing as thread activity. Full errors must not replace the target or
+input; expose the short reason in the state row and full detail through help.
+
+At 24x6, composing is exactly: header, context, target, input, keys, state.
+At that size, reading has three content rows. At 80x12 a channel still keeps
+its 22-cell sidebar; at 79x12 the existing one-column navigation applies. A
+thread and overlays remain full-screen at both widths. Below the supported
+minimum, show the existing size message and preserve state for the next resize.
+
 ## Palette and terminal defaults
 
 Color reinforces a structure that is already legible without it. The following
 are controlled review values, not a theme setting or a requirement to override
 the user's terminal background. There are three neutral surfaces and three
-semantic foreground accents; there are no per-page palettes.
+semantic foreground accents and one decorative rule role; there are no
+per-page palettes.
 
 | Role | Dark study | Light study | No reliable palette / NO_COLOR |
 | --- | --- | --- | --- |
@@ -129,6 +200,7 @@ semantic foreground accents; there are no per-page palettes.
 | Navigation / input surface | `#1d2326` | `#eeefeb` | Default background, spacing and target label |
 | Selected list row | `#303a3e` | `#dce3de` | Reverse default foreground/background |
 | Secondary text | `#a1ada8` | `#56645e` | Default foreground, secondary position |
+| Decorative rule | `#52615c` | `#818f86` | Default foreground, dim when available |
 | Action accent | `#9bd5c9` | `#1a6960` | Bold, `>` or input target; underline optional |
 | Attention | `#edc57d` | `#835506` | Bold plus explicit signal/state |
 | Failure | `#f29da5` | `#ad3545` | Bold reason and correction |
@@ -154,7 +226,7 @@ rules live in [the manual](tui-use.md); these rules describe their appearance.
 
 | Component state | Appearance | Information retained |
 | --- | --- | --- |
-| Reading | Bare transcript, small row focus, no empty input region | Author, body, action target |
+| Reading | Separated transcript, small row focus, no empty input region | Author, body, action target |
 | New message / Reply / Edit | Same input surface, explicit target, cursor | Draft and destination |
 | Pending send | Pending label at attempted row, secondary text | Body remains legible |
 | Refused write | Failure reason in state row; restored draft in composer | Target, correction and route to full help |
@@ -209,13 +281,13 @@ support neutral content and secondary metadata. The terminal translation uses
 alignment and small semantic accents, not their gradient or pixel dimensions.
 References were inspected as images or source, not tested as live products.
 
-## Review and implementation acceptance
+## Implementation acceptance
 
 Review the atlas with its annotations covered: can a reader identify where they
 are, which row an action targets, where a draft will go, and which state needs
 attention? Changing pages should not require relearning those cues. Removing
-color must leave each answer intact. The self-review supports this direction;
-it is not user-test evidence.
+color must leave each answer intact. The direction is approved for implementation;
+the mockups are not user-test or runtime evidence.
 
 Before implementation is accepted, compare real captures against these studies
 at 120x30, 80x12, 79x12, 40x10 and 24x6. Include long author names, ambiguous
@@ -224,9 +296,41 @@ terminal palettes and NO_COLOR. Exercise loading, empty, stale, partial,
 refused, uncertain and deleted-target states without losing the draft or hiding
 its destination. In particular, verify selection and state contrast together.
 
+The following checks define done; every row needs evidence at the implemented
+source revision, with terminal dimensions and palette recorded:
+
+| Check | Observable result |
+| --- | --- |
+| V1: Message boundary | Roomy separator replaces a gap after all message content; compact separator stays in the author line; short/long and same-author messages remain distinct |
+| V2: Row identity | Movement, scroll, PgUp/PgDn, reply, react, edit and delete still target the same event; separators cannot receive focus or affect unread |
+| V3: Focus transfer | Reading identifies the action row; composing emphasizes only its destination and cursor; cancelling/restoring retains the correct target |
+| V4: Density | Channel and thread work at 120x30, 80x12, 79x12, 40x10 and 24x6; a 15/16-row resize switches rule placement without losing content or focus |
+| V5: Text pressure | Long names, state labels, CJK, combining marks, emoji and URLs do not collide with a rule, cursor or footer; decoration yields first |
+| V6: Write/read state | Pending, refused, uncertain, partial, unknown, reconnect and deleted-target states keep their meanings and draft behavior; uncertainty offers no automatic resend |
+| V7: Shared surfaces | Inbox, Agent list/detail and help use the same selection and text hierarchy; long Agent status wraps and remains readable |
+| V8: Portable rendering | Light/dark defaults, ANSI and NO_COLOR preserve focus, target and state; no hardcoded dark fill makes text unreadable |
+
 The atlas checks geometry and appearance of static fixtures only. Runtime
 wrapping, cursor movement, resize, terminals' palette behavior and actual
 write outcomes remain unverified. Implementation still requires repository
 checks, the real terminal workflow required by [AGENTS.md](../AGENTS.md), and
 reviewed captures from the usable binary. A spec or browser image is not that
 evidence.
+
+## Implementation handoff
+
+Start from the shared text, focus and separator rules, then apply them to the
+channel and full-screen thread together. Apply the composer budgets and state
+presentation next, then reuse the list treatment in Inbox, Agents and help.
+Each stage must leave the existing conversation loop usable. This order is a
+way to deliver the one visual spec, not permission to omit the other surfaces.
+
+Use the [existing presentation boundary](../design/architecture.md): rendering
+may read state but does not introduce writes or change event semantics. Reuse
+the current message focus and target identities. Adding decoration must not
+turn a rendered-line index into a message identity. Keep appearance knowledge
+shared; do not grow separate per-page palettes or density policies.
+
+This handoff authorizes implementation of the approved appearance. It does
+not claim implementation, integration or release completion. Delivery must
+identify the final revision and usable binary alongside the V1-V8 evidence.
