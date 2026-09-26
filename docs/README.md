@@ -31,5 +31,5 @@ is not published.
 planned TUI slice: open one discussion, reply, and return to the channel.
 It is a product spec, not an implemented capability.
 
-[tui-visual.md](tui-visual.md) proposes the next visual hierarchy for existing
-TUI surfaces, with cell-budgeted frames and visual acceptance criteria.
+[tui-visual.md](tui-visual.md) defines the proposed shared TUI visual language,
+with a review atlas covering conversation, list/detail, state and density.
