@@ -376,13 +376,26 @@ The relay rules this view depends on were checked against the deployed relay
 `https://buzz.surac.cloud` with a delegated Agent identity: the identity that
 would receive the frames is the identity that made the request. Both the
 roster read and the observer feed answered, and both stayed inside the owner
-boundary:
+boundary. The roster read was made with the identity that signed the
+deployment's three agent records too, read-only: one `POST /query`, one
+observer `REQ` answered with `EOSE`, and nothing published. The records that
+came back were then fed through this module and the overlay renderer.
 
-- `POST /query` for kind 30177 authored by the identity answered HTTP 200 with
-  an empty page. An empty roster is an answer, not a refusal.
+- `POST /query` for kind 30177 authored by the identity answered HTTP 200 and
+  delivered only records that identity had signed. On a delegated Agent
+  identity with no Agent the page was empty, and an empty roster is an answer,
+  not a refusal. On the deployment's owner identity the same read answered the
+  three records that identity owns: each one verified, each carried its Agent
+  key in the `d` tag and its name in the record content, and the classifier
+  read them as `Bumble`, `Fizz` and `Honey` sorted by name, with nothing
+  counted as foreign, unverified or unreadable.
+- The overlay rendered those three records as `Agents (3)`, one row per Agent,
+  each with `No active turn observed`, at the full width and at 40x10.
 - `REQ` for kind 24200 with `#p` set to the identity's own pubkey was answered
   with `EOSE` and never with `CLOSED`, and delivered no frame: the
-  subscription is legal, live-only, and quiet.
+  subscription is legal, live-only, and quiet. The owner identity's feed
+  behaved the same way in a twenty-second window, which is what makes `No
+  active turn observed` the tested state rather than an assumed one.
 - The same `REQ` naming another identity was closed with `restricted: p-gated
   events require #p matching your pubkey`. A client can only subscribe to its
   own observer feed, which is what lets a frame be read as evidence about the
@@ -392,11 +405,11 @@ boundary:
   authenticated identity`. A frame cannot be planted by a client that is not
   the Agent it claims to be, and the owner/agent check sits behind that.
 
-Not verified: no identity here owns a running Agent, so a live `Working`
-signal was not observed on the deployed relay. The states driven by frames are
-covered by the module and render tests, which use the deployed producer's
-field names (`kind`, `turnId`, `channelId`, `seq`) and its `batch` envelope.
-Confirm them once against a deployment where the signed-in identity owns a
-running Agent. `Unknown` is the answer for a feed that is refused, closed, or
-not yet established; `No active turn observed` follows only a feed the relay
-has answered with `EOSE`.
+Not verified: no Agent owned by an identity reachable from this workspace had
+a turn running while the feed was open, so a live `Working` signal was not
+observed on the deployed relay. The states driven by frames are covered by the
+module and render tests, which use the deployed producer's field names
+(`kind`, `turnId`, `channelId`, `seq`) and its `batch` envelope. Confirm them
+once against a deployment where an owned Agent has a turn running. `Unknown`
+is the answer for a feed that is refused, closed, or not yet established; `No
+active turn observed` follows only a feed the relay has answered with `EOSE`.
