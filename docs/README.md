@@ -21,3 +21,6 @@ why `buzzx` exists, lives in [../core.md](../core.md).
 
 The planned [Agents overview](tui-use.md#agents-overview) is the next
 read-only Agent capability; it is not implemented yet.
+
+The planned [send-time mention resolution](tui-use.md#planned-resolve-mentions-when-sending)
+is the minimal recipient-correctness slice for Build.

@@ -413,3 +413,86 @@ module and render tests, which use the deployed producer's field names
 once against a deployment where an owned Agent has a turn running. `Unknown`
 is the answer for a feed that is refused, closed, or not yet established; `No
 active turn observed` follows only a feed the relay has answered with `EOSE`.
+
+
+## Planned: resolve mentions when sending
+
+Status: specified for Build; not implemented. This slice makes an explicit
+mention in a new TUI message or reply carry the intended recipient identity.
+It uses the existing composer and send action, with no candidate overlay,
+identity tokens, recipient panel or additional confirmation dialog.
+
+### Behavior
+
+On send, resolve complete `@member names` against the current conversation's
+membership and profiles. A unique complete match adds that public key to the
+message's `p` tags. Keep the visible text unchanged and deduplicate recipients.
+Use the SDK's known-name matching, code-region stripping and Nostr URI helpers;
+do not introduce another mention syntax or fuzzy name matching.
+
+An unknown name, an ambiguous name, a non-member recipient, or a failed
+required lookup prevents submission and preserves the draft and reply target.
+The error names the unresolved fragment and the next correction. For duplicate
+names, expose candidate `nostr:npub...` references in the existing scrollable
+help/detail surface so the user can replace the ambiguous text with an exact
+identity. A short public key is display-only, never an input identity. This
+uses text correction, not a new interactive identity picker.
+
+A valid non-code `nostr:npub...` reference supplies an exact identity but still
+requires current membership. It does not excuse another unresolved `@name`
+in the same draft. Partial names are not expanded. To refer to a person
+without a notification, omit `@` or use a code span. Code spans, fenced code
+and email text follow the SDK's existing exclusion rules.
+
+Read current membership for messages requiring mention validation; do not
+silently use an incomplete or failed lookup as an empty list. Check the SDK's
+recipient cap and reject overflow without truncation. Messages with no
+mention input do not require a mention-specific membership/profile fetch.
+The relay remains authoritative if membership changes after validation.
+
+New messages and replies use the same resolution rules. Replies preserve
+existing root and parent references; this slice does not automatically mention
+all thread participants. Explicit mentions in existing DMs use the same rule,
+but adding every DM participant automatically is a separate, deferred change.
+Editing an old message is outside this slice and must retain its existing
+behavior; this feature makes no promise of new notifications through edits.
+
+A refused or uncertain write keeps the existing send-result semantics.
+Never retry an uncertain publication automatically. A confirmed send means
+the relay stored the event, not that a recipient read it or an Agent started.
+Do not add a notification-delivery or Agent-execution success badge.
+
+### Scope and acceptance
+
+Reuse SDK event construction and the existing shared-core boundaries.
+No new CLI flags, relay API, stored draft identity model, global directory,
+automatic invitation, completion UI, DM creation or editor rewrite is needed.
+The tradeoff is deliberate: duplicate names require correcting plain text
+rather than selecting a richer composer token.
+
+Build must verify:
+
+1. Complete unique member names, including spaces and Unicode names supported
+   by the SDK, and exact identity references produce the intended signed
+   `p` tags. Duplicates collapse, and reply root/parent tags remain correct.
+2. Unknown/ambiguous names, non-members, failed membership/profile reads and
+   over-cap recipients submit nothing and retain the draft. Exact references
+   can resolve ambiguity, but do not suppress other errors in the draft.
+3. Email/code examples do not create unintended recipients. Ordinary messages
+   without mentions still send without the new lookup dependency.
+4. At 24 by 6, 40 by 10, 79 by 12 and 80 by 12, the existing composer can send,
+   display an actionable error, expose a full identity reference and return
+   to the draft without losing it. Refused and uncertain writes do not cause
+   automatic duplicate sends.
+
+Record the implementation commit, inputs, signed recipient tags, relay result
+and readback from an authorized second identity. Visible `@text` alone is not
+proof. Agent response is not required to prove message routing: runtime
+subscription policy and model output are separate acceptance layers.
+
+Source basis: Buzz SDK builders/mentions, CLI message preflight, Desktop
+mention candidates and Mobile message recipients at upstream revision
+`93114c9c65138397de39729fde0a816eb9f314ab`. Both graphical clients separate names
+from identities; this slice reuses that semantic requirement without copying
+their richer editor and non-member invitation flows. Deployment acceptance
+remains pending implementation.
