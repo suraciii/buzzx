@@ -1,7 +1,8 @@
 # Web surface
 
-Status: proposed. [The product specification](../docs/web.md) owns startup,
-scope, browser interaction and acceptance. No Web implementation exists at
+Status: proposed. [The shared catalog](../docs/interactive.md) owns scope;
+[the Web specification](../docs/web.md) owns startup and browser interaction.
+No Web implementation exists at
 the recorded baseline.
 
 ## Design pressure
@@ -14,8 +15,13 @@ decisions, while giving the browser responsibility for layout and input.
 The current [architecture](architecture.md) separates one-shot relay
 operations from held-session behavior. The [shared core](shared-core.md)
 already owns identity-aware reads and signed writes, but subscriptions,
-read progress, Agent summaries and conversation state also live above it.
+read progress, Agent summaries, search/context state, history windows, reader
+anchors and draft-safe return also live above it.
 Reusing only `client.rs` is therefore insufficient for parity.
+
+[The Desktop/Mobile comparison](client-reference.md) informs presentation and
+navigation. Their newer relay contracts and richer feature sets do not replace
+buzzx's current transport or product rules.
 
 ## Alternatives considered
 
@@ -56,6 +62,10 @@ Terminal key mapping, ratatui layout and terminal dimensions stay TUI-specific.
 Web view state must not reuse terminal dimensions as a proxy for visibility.
 Keep the dependency direction in [architecture.md](architecture.md); no
 second implementation of the relay bridge or event builders is permitted.
+Reuse the current search/context/history operations and their limits in
+`client.rs`, with shared request generations, anchors and draft guards above
+them. Do not duplicate that knowledge in browser-only stores or call TUI keys
+to simulate it.
 
 The local API is private to the bundled page. Its endpoints and frontend
 framework are implementation choices, not a new public automation contract.
@@ -77,8 +87,11 @@ reports into the existing read-state rules; do not invent a Web marker model.
 Browser-to-process recovery is distinct from process-to-relay recovery.
 After either disconnect, recover reads and state before declaring the view
 current. Late responses cannot replace a newer selection or overwrite newer
-edits, deletions or live messages. Preserve current TUI bounded reads and
-coverage signals rather than adding a new pagination model.
+edits, deletions or live messages. Use the current incremental channel/thread
+history implementation, bounded search and coverage signals. The browser
+adapts input and rendering; it does not own another pagination algorithm.
+Carry the actual Search/Context/Thread/Reader origin through updates so Back
+cannot reconstruct its destination from whichever channel happens to be active.
 
 Correlate a submitted UI operation across a temporary browser connection
 loss. If the process already accepted the operation, returning a view or
@@ -87,9 +100,9 @@ existing result, or show it as uncertain when it cannot be established.
 This is local duplicate suppression, not permission to retry relay writes.
 Do not queue writes offline or replay them after process restart.
 
-The Web guard against publishing while disconnected is a browser interaction
-requirement. It does not change the underlying `Stored`, `Refused` and
-`Unknown` meanings or require changing TUI connection policy in this slice.
+Loss of the local browser connection prevents submitting a new action. Relay
+publication eligibility comes from the shared session rules, with the same
+`Stored`, `Refused` and `Unknown` meanings in both interactive surfaces.
 
 ## Local access and content
 
@@ -132,8 +145,10 @@ with a stale label.
    conversation view. Prove startup, stop and key isolation end to end.
 2. Add the complete message-action path with mentions and write outcomes.
    Prove stored routing and non-retry behavior before broadening the UI.
-3. Complete Inbox/read state, focused threads, My agents, help and responsive
-   interaction using the existing semantics. This completes the parity matrix.
+3. Complete the shared find-and-resume journey: conversation lookup, search
+   filters, exact context, adjacent history pages, focused thread, complete
+   reader and draft-safe return. Include Inbox/read state, My agents, help and
+   responsive interaction. Every shared catalog row is required.
 4. Run comparative TUI/Web acceptance and browser boundary checks against the
    final packaged binary. A milestone is not the full Web release until all
    rows pass. Update the architecture map to the actual module ownership.
@@ -144,6 +159,12 @@ Keep the repository checks and add behavior-level browser coverage during
 implementation. Exercise the existing TUI suite after shared behavior moves.
 Use deterministic fixtures for write refusal, lost answers, late responses,
 two-tab isolation, hidden-tab read progress and Agent freshness.
+
+Every new interactive feature updates the shared capability catalog and both
+surface entries together. Keep an explicit TUI/Web acceptance result per
+capability at the same source revision. Intermediate commits may be incomplete;
+release completion requires the [synchronized journeys](../docs/interactive.md#synchronized-acceptance)
+in both surfaces. Desktop/Mobile source observations do not count as that evidence.
 
 Verify that a bare unauthenticated local request and an untrusted website
 cannot read or send as the identity; reject invalid Host/Origin, forged

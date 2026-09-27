@@ -36,7 +36,10 @@ an interactive TUI and scripts or agents through non-interactive commands.
 Both use the same relay, identity, authorization, and event semantics.
 
 The planned `buzzx web` surface gives the same person a browser interface
-started from that CLI, with the TUI's capabilities. It uses the same identity
+started from that CLI. TUI and Web share the
+[interactive capability contract](docs/interactive.md), including discovery,
+search, context, history, complete reading and safe return. New product
+capabilities must have usable paths in both surfaces. Web uses the same identity
 and relay without requiring a separate application install. Its behavior and
 implementation status live in [docs/web.md](docs/web.md). This deliberately
 extends the terminal-only presentation boundary; it does not change Buzz's
@@ -127,7 +130,7 @@ These terms have one meaning across all documents.
 - channel: a NIP-29 group. Its id is a UUID, carried in an `h` tag.
 - timeline: the ordered messages of one channel, as buzzx renders them.
 - row: one rendered timeline entry.
-- composer: the text input at the bottom of the TUI.
+- composer: the text input in an interactive surface.
 - bridge: the relay's HTTP surface, `POST /events`, `POST /query`, and
   `POST /count`.
 - subscription: one live WebSocket REQ, and the events it delivers.

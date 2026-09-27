@@ -25,6 +25,8 @@ pub enum Action {
     PickerNext,
     PickerPrev,
     PickerConfirm,
+    PickerInput(char),
+    PickerBackspace,
     /// `f`: the next Inbox filter.
     FilterNext,
     /// `a`: open the Agents overlay, or close it when it is open.
@@ -53,6 +55,43 @@ pub enum Action {
     ComposeReply,
     /// `t`: open the focused message's thread.
     OpenThread,
+    /// Open the full-screen message search.
+    OpenSearch,
+    SearchNext,
+    SearchPrev,
+    SearchSubmit,
+    /// `/`: edit the query text again.
+    SearchEdit,
+    /// `f`: open the filter form over the results.
+    SearchFilter,
+    SearchInput(char),
+    SearchBackspace,
+    ContextNext,
+    ContextPrev,
+    ContextTop,
+    ContextBottom,
+    ContextPageUp,
+    ContextPageDown,
+    ContextOpenThread,
+    ContextOpenReader,
+    ContextReply,
+    ContextLoadOlder,
+    ContextLoadNewer,
+    ContextLeave,
+    /// `v`: read the focused confirmed message in a full-screen reader.
+    OpenReader,
+    /// One displayed reader line.
+    ReaderNextLine,
+    ReaderPrevLine,
+    /// One reader viewport minus one line.
+    ReaderPageUp,
+    ReaderPageDown,
+    ReaderTop,
+    ReaderBottom,
+    /// Enter from the reader starts a reply to its bound message.
+    ReaderReply,
+    /// Esc or `v` returns to the reader's origin.
+    ReaderClose,
     /// Esc inside a thread: return to the channel it was opened from.
     ThreadLeave,
     /// Enter inside a thread: compose a reply to the focused row.
@@ -91,31 +130,54 @@ pub enum Action {
 pub enum Overlay {
     None,
     Picker,
+    PickerSearch,
     Help,
     Agents,
 }
 
-/// What the navigation keys act on. The thread view is a full-screen view of
-/// its own, not an overlay: it replaces the channel timeline, and the
-/// conversation keys that would switch the destination are not part of it.
+/// What the navigation keys act on. Full-screen search/context/reader views
+/// replace the timeline instead of overlaying it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Channel,
     Thread,
+    Context,
+    Search,
+    Reader,
+}
+
+/// Which sub-surface of full-screen search a key press lands in. It decides
+/// whether printable characters are query text or filter-form and picker
+/// commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Navigating results.
+    Results,
+    /// Query text entry: every printable character is query text.
+    QueryEdit,
+    /// The filter form over scope, author and time.
+    Form,
+    /// The author picker over known profiles or an exact public key.
+    AuthorPick,
+    /// The conversation picker for a one-conversation scope.
+    ScopePick,
 }
 
 /// Map a key press to an action in navigation mode. `layout` selects the
 /// list that `j` and `k` move; `overlay` routes keys to the overlay that is
-/// open; `surface` selects the channel timeline or an open thread.
+/// open; `surface` selects the channel timeline or an open thread;
+/// `search_mode` selects which search sub-surface owns the keys.
 pub fn map_navigation(
     key: KeyEvent,
     layout: LayoutMode,
     overlay: Overlay,
     surface: Surface,
+    search_mode: SearchMode,
 ) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
+            KeyCode::Char('f') => Action::OpenSearch,
             _ => Action::Ignored,
         };
     }
@@ -149,14 +211,97 @@ pub fn map_navigation(
             _ => Action::Ignored,
         };
     }
+    if surface == Surface::Search {
+        if search_mode == SearchMode::Results {
+            return match key.code {
+                KeyCode::Char('j') | KeyCode::Down => Action::SearchNext,
+                KeyCode::Char('k') | KeyCode::Up => Action::SearchPrev,
+                KeyCode::Enter => Action::SearchSubmit,
+                KeyCode::Char('/') => Action::SearchEdit,
+                KeyCode::Char('s') => Action::SearchInput('s'),
+                KeyCode::Char('t') => Action::SearchInput('t'),
+                KeyCode::Char('f') => Action::SearchFilter,
+                KeyCode::Char('?') => Action::ToggleHelp,
+                KeyCode::Esc => Action::Dismiss,
+                KeyCode::Char('q') => Action::Quit,
+                _ => Action::Ignored,
+            };
+        }
+        if search_mode == SearchMode::QueryEdit {
+            // Query text entry: every printable character is query text.
+            return match key.code {
+                KeyCode::Char(c) if key.modifiers.is_empty() => Action::SearchInput(c),
+                KeyCode::Backspace => Action::SearchBackspace,
+                KeyCode::Enter => Action::SearchSubmit,
+                KeyCode::Esc => Action::Dismiss,
+                _ => Action::Ignored,
+            };
+        }
+        // The filter form and both pickers: j/k and the arrows move, other
+        // printable characters adjust the focused control or type text.
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::SearchNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::SearchPrev,
+            KeyCode::Char(c) if key.modifiers.is_empty() => Action::SearchInput(c),
+            KeyCode::Backspace => Action::SearchBackspace,
+            KeyCode::Enter => Action::SearchSubmit,
+            KeyCode::Esc => Action::Dismiss,
+            _ => Action::Ignored,
+        };
+    }
+    if surface == Surface::Context {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::ContextNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::ContextPrev,
+            KeyCode::Char('g') | KeyCode::Home => Action::ContextTop,
+            KeyCode::Char('G') | KeyCode::End => Action::ContextBottom,
+            KeyCode::PageUp => Action::ContextPageUp,
+            KeyCode::PageDown => Action::ContextPageDown,
+            KeyCode::Char('t') => Action::ContextOpenThread,
+            KeyCode::Char('v') => Action::ContextOpenReader,
+            KeyCode::Enter => Action::ContextReply,
+            KeyCode::Char('[') => Action::ContextLoadOlder,
+            KeyCode::Char(']') => Action::ContextLoadNewer,
+            KeyCode::Esc => Action::ContextLeave,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
+    if surface == Surface::Reader {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::ReaderNextLine,
+            KeyCode::Char('k') | KeyCode::Up => Action::ReaderPrevLine,
+            KeyCode::Char('g') | KeyCode::Home => Action::ReaderTop,
+            KeyCode::Char('G') | KeyCode::End => Action::ReaderBottom,
+            KeyCode::PageUp => Action::ReaderPageUp,
+            KeyCode::PageDown => Action::ReaderPageDown,
+            KeyCode::Enter => Action::ReaderReply,
+            KeyCode::Esc | KeyCode::Char('v') => Action::ReaderClose,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
+    if overlay == Overlay::PickerSearch {
+        return match key.code {
+            KeyCode::Esc => Action::Dismiss,
+            KeyCode::Enter => Action::PickerConfirm,
+            KeyCode::Backspace => Action::PickerBackspace,
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::PickerInput(c)
+            }
+            _ => Action::Ignored,
+        };
+    }
     if overlay == Overlay::Picker {
         return match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::PickerNext,
             KeyCode::Char('k') | KeyCode::Up => Action::PickerPrev,
             KeyCode::Char('f') | KeyCode::Tab => Action::FilterNext,
+            KeyCode::Char('/') => Action::PickerInput('/'),
             KeyCode::Enter => Action::PickerConfirm,
             KeyCode::Esc | KeyCode::Char('c') => Action::Dismiss,
-            KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Char(d @ '1'..='9') => Action::Channel(d as usize - '0' as usize),
             _ => Action::Ignored,
@@ -167,12 +312,14 @@ pub fn map_navigation(
         // the timeline navigation keeps its meaning, and the conversation
         // keys are not here - they must not switch the destination.
         return match key.code {
+            KeyCode::Char('v') => Action::OpenReader,
             KeyCode::Char('j') | KeyCode::Down => Action::NextRow,
             KeyCode::Char('k') | KeyCode::Up => Action::PrevRow,
+            KeyCode::Char('[') | KeyCode::PageUp => Action::ContextLoadOlder,
+            KeyCode::Char(']') | KeyCode::PageDown => Action::ContextLoadNewer,
             KeyCode::Char('g') | KeyCode::Home => Action::Top,
             KeyCode::Char('G') | KeyCode::End => Action::Bottom,
-            KeyCode::PageUp => Action::PageUp,
-            KeyCode::PageDown => Action::PageDown,
+            KeyCode::Char('/') => Action::OpenSearch,
             KeyCode::Enter => Action::ThreadReplyFocused,
             KeyCode::Char('i') | KeyCode::Tab => Action::ThreadReplyRoot,
             KeyCode::Char('t') => Action::ThreadRetry,
@@ -196,12 +343,16 @@ pub fn map_navigation(
         },
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
+        KeyCode::Char('[') => Action::ContextLoadOlder,
+        KeyCode::Char(']') => Action::ContextLoadNewer,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
+        KeyCode::Char('/') => Action::OpenSearch,
+        KeyCode::Char('c') => Action::TogglePicker,
+        KeyCode::Char('v') => Action::OpenReader,
+        KeyCode::Char('t') => Action::OpenThread,
         KeyCode::Char('i') => Action::ComposeNew,
         KeyCode::Enter => Action::ComposeReply,
-        KeyCode::Char('t') => Action::OpenThread,
-        KeyCode::Char('c') => Action::TogglePicker,
         KeyCode::Char('a') => Action::ToggleAgents,
         KeyCode::Char('f') => Action::FilterNext,
         KeyCode::Char('r') => Action::React,
@@ -221,6 +372,7 @@ pub fn map_composer(key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
+            KeyCode::Char('f') => Action::OpenSearch,
             _ => Action::Ignored,
         };
     }
@@ -261,6 +413,7 @@ mod tests {
             LayoutMode::Wide,
             Overlay::None,
             Surface::Channel,
+            SearchMode::Results,
         )
     }
 
@@ -270,6 +423,7 @@ mod tests {
             LayoutMode::Narrow,
             Overlay::None,
             Surface::Channel,
+            SearchMode::Results,
         )
     }
 
@@ -280,6 +434,7 @@ mod tests {
             LayoutMode::Wide,
             Overlay::Agents,
             Surface::Channel,
+            SearchMode::Results,
         )
     }
 
@@ -290,7 +445,68 @@ mod tests {
             LayoutMode::Wide,
             Overlay::None,
             Surface::Thread,
+            SearchMode::Results,
         )
+    }
+
+    fn reader(code: KeyCode) -> Action {
+        map_navigation(
+            key(code, KeyModifiers::NONE),
+            LayoutMode::Wide,
+            Overlay::None,
+            Surface::Reader,
+            SearchMode::Results,
+        )
+    }
+
+    #[test]
+    fn the_reader_isolates_scrolling_reply_and_return_keys() {
+        assert_eq!(reader(KeyCode::Char('j')), Action::ReaderNextLine);
+        assert_eq!(reader(KeyCode::Down), Action::ReaderNextLine);
+        assert_eq!(reader(KeyCode::Char('k')), Action::ReaderPrevLine);
+        assert_eq!(reader(KeyCode::PageDown), Action::ReaderPageDown);
+        assert_eq!(reader(KeyCode::Char('g')), Action::ReaderTop);
+        assert_eq!(reader(KeyCode::Char('G')), Action::ReaderBottom);
+        assert_eq!(reader(KeyCode::Enter), Action::ReaderReply);
+        assert_eq!(reader(KeyCode::Esc), Action::ReaderClose);
+        assert_eq!(reader(KeyCode::Char('v')), Action::ReaderClose);
+        assert_eq!(reader(KeyCode::Char('i')), Action::Ignored);
+    }
+
+    #[test]
+    fn search_results_open_the_form_and_the_form_takes_characters() {
+        let results = |code| {
+            map_navigation(
+                key(code, KeyModifiers::NONE),
+                LayoutMode::Wide,
+                Overlay::None,
+                Surface::Search,
+                SearchMode::Results,
+            )
+        };
+        assert_eq!(results(KeyCode::Char('/')), Action::SearchEdit);
+        assert_eq!(results(KeyCode::Char('f')), Action::SearchFilter);
+        assert_eq!(results(KeyCode::Enter), Action::SearchSubmit);
+        assert_eq!(results(KeyCode::Esc), Action::Dismiss);
+        // Legacy scope/time toggles remain available without applying a query
+        // until the user submits.
+        assert_eq!(results(KeyCode::Char('s')), Action::SearchInput('s'));
+
+        let form = |code| {
+            map_navigation(
+                key(code, KeyModifiers::NONE),
+                LayoutMode::Wide,
+                Overlay::None,
+                Surface::Search,
+                SearchMode::Form,
+            )
+        };
+        assert_eq!(form(KeyCode::Char('s')), Action::SearchInput('s'));
+        assert_eq!(form(KeyCode::Char('t')), Action::SearchInput('t'));
+        assert_eq!(form(KeyCode::Char('j')), Action::SearchNext);
+        assert_eq!(form(KeyCode::Down), Action::SearchNext);
+        assert_eq!(form(KeyCode::Enter), Action::SearchSubmit);
+        assert_eq!(form(KeyCode::Esc), Action::Dismiss);
     }
 
     #[test]
@@ -300,7 +516,9 @@ mod tests {
         assert_eq!(thread(KeyCode::Char('k')), Action::PrevRow);
         assert_eq!(thread(KeyCode::Char('g')), Action::Top);
         assert_eq!(thread(KeyCode::Char('G')), Action::Bottom);
-        assert_eq!(thread(KeyCode::PageUp), Action::PageUp);
+        assert_eq!(thread(KeyCode::PageUp), Action::ContextLoadOlder);
+        assert_eq!(thread(KeyCode::PageDown), Action::ContextLoadNewer);
+        assert_eq!(thread(KeyCode::Char('/')), Action::OpenSearch);
         assert_eq!(thread(KeyCode::Enter), Action::ThreadReplyFocused);
         assert_eq!(thread(KeyCode::Char('i')), Action::ThreadReplyRoot);
         assert_eq!(thread(KeyCode::Tab), Action::ThreadReplyRoot);
@@ -334,7 +552,8 @@ mod tests {
                 key(KeyCode::Char('j'), KeyModifiers::NONE),
                 LayoutMode::Wide,
                 Overlay::Help,
-                Surface::Thread
+                Surface::Thread,
+                SearchMode::Results,
             ),
             Action::HelpScroll(1)
         );
@@ -343,7 +562,8 @@ mod tests {
                 key(KeyCode::Esc, KeyModifiers::NONE),
                 LayoutMode::Wide,
                 Overlay::Help,
-                Surface::Thread
+                Surface::Thread,
+                SearchMode::Results,
             ),
             Action::Dismiss
         );
@@ -383,6 +603,7 @@ mod tests {
                 LayoutMode::Narrow,
                 Overlay::Picker,
                 Surface::Channel,
+                SearchMode::Results,
             )
         };
         assert_eq!(picker(KeyCode::Char('j')), Action::PickerNext);
@@ -406,6 +627,7 @@ mod tests {
                 LayoutMode::TooSmall,
                 Overlay::None,
                 Surface::Channel,
+                SearchMode::Results,
             )
         };
         assert_eq!(small(KeyCode::Char('q'), KeyModifiers::NONE), Action::Quit);
@@ -436,7 +658,8 @@ mod tests {
                 key(KeyCode::Char('G'), KeyModifiers::SHIFT),
                 LayoutMode::Wide,
                 Overlay::None,
-                Surface::Channel
+                Surface::Channel,
+                SearchMode::Results,
             ),
             Action::Bottom
         );
@@ -458,6 +681,7 @@ mod tests {
                 LayoutMode::Minimal,
                 Overlay::Help,
                 Surface::Channel,
+                SearchMode::Results,
             )
         };
         assert_eq!(help(KeyCode::Char('j')), Action::HelpScroll(1));
@@ -505,6 +729,7 @@ mod tests {
                 LayoutMode::Narrow,
                 Overlay::Picker,
                 Surface::Channel,
+                SearchMode::Results,
             )
         };
         assert_eq!(picker(KeyCode::Char('f')), Action::FilterNext);
@@ -519,7 +744,8 @@ mod tests {
                 key(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 LayoutMode::Wide,
                 Overlay::None,
-                Surface::Channel
+                Surface::Channel,
+                SearchMode::Results,
             ),
             Action::Quit
         );
@@ -534,6 +760,10 @@ mod tests {
         assert_eq!(
             map_composer(key(KeyCode::Char('x'), KeyModifiers::NONE)),
             Action::ComposerInput('x')
+        );
+        assert_eq!(
+            map_composer(key(KeyCode::Char('v'), KeyModifiers::NONE)),
+            Action::ComposerInput('v')
         );
         // Alt+x is not text; terminals use it for commands.
         assert_eq!(

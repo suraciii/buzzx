@@ -223,6 +223,152 @@ pub struct ThreadRead {
     /// must not present the result as complete history.
     pub partial: bool,
 }
+/// Which side of a loaded history window a page extends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryDirection {
+    Older,
+    Newer,
+}
+
+/// A bounded message search. `author` is an exact public key when present.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchRequest {
+    pub query: String,
+    pub channel: Option<Uuid>,
+    pub author: Option<String>,
+    pub since: Option<u64>,
+    pub until: Option<u64>,
+}
+
+/// A context read around one exact event.
+#[derive(Debug, Clone)]
+pub struct ContextRead {
+    pub events: Vec<Event>,
+    pub before_complete: bool,
+    pub after_complete: bool,
+}
+
+/// One answered page or window of a timeline: the rows oldest first, and
+/// whether the relay's answer reached its bound.
+pub struct HistoryPage {
+    pub events: Vec<Event>,
+    /// The raw answer carried a full page, decided before any filtering
+    /// drops rows: a page of a thread whose root check removed half the
+    /// answer is still a cut page. True means more rows may exist beyond
+    /// this page in its direction, so a caller must not treat it as a
+    /// boundary. False is the boundary evidence: the relay exhausted the
+    /// range, so nothing more exists there.
+    pub saturated: bool,
+}
+
+/// How many events one newest-to-anchor walk batch asks for. The bound a
+/// catch-up filter already uses: one batch is the most a walk holds at once.
+const WALK_LIMIT: u64 = 1000;
+
+/// One newest-to-anchor walk over a `since` range. The relay answers newest
+/// first, so the rows adjacent to the cursor sit at the oldest end of the
+/// answer, and one bounded query reaches them only while the whole range
+/// fits in it. The walk asks for the range's newest end first and steps an
+/// inclusive `until` bound down toward the cursor, keeping only the oldest
+/// `want` rows it has seen. Memory stays bounded: one batch plus the
+/// retained pool, whatever the conversation holds.
+struct Walk {
+    want: u64,
+    /// The batch size this walk decides full pages against.
+    batch_limit: u64,
+    /// The cursor's second, named by the saturation failure.
+    since: u64,
+    /// The oldest rows seen so far, canonical order, at most `want` of them.
+    pool: Vec<Event>,
+    /// A batch answered with a full page: the range holds rows the walk has
+    /// not seen, so more exist beyond any page it can hand out.
+    saturated: bool,
+    /// The second the previous full batch descended to. A full batch that
+    /// reaches no further means the identical query would repeat: the wall
+    /// the saturation failure names, in the relay's own order as much as in
+    /// a packed second.
+    bound: Option<u64>,
+}
+
+/// What one answered batch means for the walk.
+enum WalkStep {
+    /// The range is not exhausted: ask again with this second as the next
+    /// batch's inclusive `until`.
+    Descend(u64),
+    /// The cursor is reached: the adjacent rows and the saturation evidence.
+    Done(HistoryPage),
+}
+
+impl Walk {
+    fn new(want: u64, since: u64, batch_limit: u64) -> Self {
+        Walk {
+            want,
+            batch_limit,
+            since,
+            pool: Vec::new(),
+            saturated: false,
+            bound: None,
+        }
+    }
+
+    /// Fold one answered batch in. An inclusive bound re-answers its own
+    /// boundary second, so batches overlap by identity and the pool
+    /// deduplicates instead of dropping the second.
+    fn step(&mut self, batch: Vec<Event>) -> Result<WalkStep, Failure> {
+        let lowest = batch
+            .iter()
+            .map(|event| event.created_at.as_secs())
+            .min()
+            .unwrap_or(self.since);
+        let full = batch.len() as u64 >= self.batch_limit;
+        self.saturated = self.saturated || full;
+        // A full batch that never leaves one second cannot be descended
+        // through: stepping the bound to that second asks the identical
+        // query, so the rows below it stay out of reach. The same holds for
+        // a full batch that reached no further than the last one, whatever
+        // the relay's reason. That is the saturated boundary the contract
+        // names, and it is reported with its visible gap, never skipped and
+        // never walked in circles.
+        if full {
+            let one_second = batch
+                .iter()
+                .all(|event| event.created_at.as_secs() == lowest);
+            if one_second || self.bound == Some(lowest) {
+                return Err(Failure::new(
+                    Category::RelayRejected,
+                    format!(
+                        "History limit reached: second {lowest} holds more than {} events, so the \
+                         rows after second {} cannot be read exactly",
+                        self.batch_limit, self.since
+                    ),
+                ));
+            }
+        }
+        let mut seen: HashSet<String> = self.pool.iter().map(|event| event.id.to_hex()).collect();
+        let mut merged = std::mem::take(&mut self.pool);
+        for event in batch {
+            if seen.insert(event.id.to_hex()) {
+                merged.push(event);
+            }
+        }
+        let merged = order_timeline(merged);
+        if !full {
+            // The batch was the rest of the range: what the walk has seen is
+            // everything at or after the cursor, so the evidence is exact. A
+            // walk that ever saw a full page already knows more exist.
+            let more = self.saturated || merged.len() as u64 > self.want;
+            return Ok(WalkStep::Done(HistoryPage {
+                events: merged.into_iter().take(self.want as usize).collect(),
+                saturated: more,
+            }));
+        }
+        self.pool = merged.into_iter().take(self.want as usize).collect();
+        // The batch spans at least two seconds, and the older one may still
+        // hold rows nearer the cursor: descend to it, inclusively.
+        self.bound = Some(lowest);
+        Ok(WalkStep::Descend(lowest))
+    }
+}
 
 /// Parse a channel UUID from user input.
 pub fn channel_id(raw: &str) -> Result<Uuid, Failure> {
@@ -431,6 +577,214 @@ impl Client {
             }))
             .await?;
         Ok(order_timeline(events))
+    }
+    /// Search the relay's supported textual message kinds. The relay owns
+    /// matching semantics; this method only constructs the explicit filter.
+    pub async fn search(&self, request: &SearchRequest) -> Result<Vec<Event>, Failure> {
+        if request.query.trim().is_empty() && request.author.is_none() {
+            return Err(Failure::invalid_input(
+                "search needs a keyword or an exact author",
+            ));
+        }
+        if let Some(author) = &request.author
+            && (author.len() != 64 || !author.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(Failure::invalid_input(
+                "author must be a 64-character hex public key",
+            ));
+        }
+        let mut filter = json!({
+            "kinds": content::TIMELINE_KINDS,
+            "limit": 50,
+        });
+        if !request.query.is_empty() {
+            filter["search"] = json!(request.query);
+        }
+        if let Some(channel) = request.channel {
+            filter["#h"] = json!([channel.to_string()]);
+        }
+        if let Some(author) = &request.author {
+            filter["authors"] = json!([author]);
+        }
+        if let Some(since) = request.since {
+            filter["since"] = json!(since);
+        }
+        if let Some(until) = request.until {
+            filter["until"] = json!(until);
+        }
+        self.transport.query(&filter).await
+    }
+
+    /// Read the exact hit and bounded channel context around it.
+    pub async fn context(
+        &self,
+        target: EventId,
+        channel: Uuid,
+        radius: u64,
+    ) -> Result<ContextRead, Failure> {
+        let exact = self.event(target).await?;
+        if extract_channel_id(&exact) != Some(channel) {
+            return Err(Failure::invalid_input(
+                "the search result is not in the selected conversation",
+            ));
+        }
+        // The cursor is second-resolution, so one query cannot distinguish
+        // the target from other events in its second. Ask for extra overlap,
+        // then trim around the exact event id instead of dropping a same-
+        // second neighbor or claiming a complete boundary.
+        let query_limit = radius.saturating_mul(2).saturating_add(1).max(1);
+        let at = exact.created_at.as_secs();
+        let before = self
+            .transport
+            .query(&json!({
+                "kinds": content::TIMELINE_KINDS,
+                "#h": [channel.to_string()],
+                "until": at,
+                "limit": query_limit,
+            }))
+            .await?;
+        let before_saturated = before.len() as u64 >= query_limit;
+        // The relay answers newest first, so the nearest later rows take the
+        // bounded walk: a plain `since` answer would start at the
+        // conversation's newest end and silently skip everything between it
+        // and the target.
+        let (after, after_saturated) = self.later_rows(channel, None, at, radius).await?;
+        let mut events = Vec::with_capacity(before.len() + after.len() + 1);
+        events.push(exact.clone());
+        events.extend(before);
+        events.extend(after);
+        let mut unique = HashSet::new();
+        events.retain(|event| unique.insert(event.id.to_hex()));
+        events.retain(|event| extract_channel_id(event) == Some(channel));
+        let events = order_timeline(events);
+        let focus = events
+            .iter()
+            .position(|event| event.id == target)
+            .ok_or_else(|| Failure::not_found(format!("no event {}", target.to_hex())))?;
+        let radius = radius as usize;
+        let start = focus.saturating_sub(radius);
+        let end = (focus + radius + 1).min(events.len());
+        let before_count = focus - start;
+        let after_count = end.saturating_sub(focus + 1);
+        let events = events[start..end].to_vec();
+        Ok(ContextRead {
+            events,
+            before_complete: before_count < radius && !before_saturated,
+            after_complete: after_count < radius && !after_saturated,
+        })
+    }
+
+    /// Extend one channel window by one adjacent page. Inclusive relay
+    /// cursors are expected: an `until` page re-answers its boundary second,
+    /// and the caller deduplicates the overlap by event identity. A Newer
+    /// page is walked down to the cursor, so it carries the rows that come
+    /// right after it instead of the newest rows of the whole range.
+    pub async fn history_page(
+        &self,
+        channel: Uuid,
+        direction: HistoryDirection,
+        cursor: u64,
+        limit: u64,
+    ) -> Result<HistoryPage, Failure> {
+        match direction {
+            HistoryDirection::Older => {
+                let raw = self
+                    .transport
+                    .query(&json!({
+                        "kinds": content::TIMELINE_KINDS,
+                        "#h": [channel.to_string()],
+                        "until": cursor,
+                        "limit": limit,
+                    }))
+                    .await?;
+                let saturated = raw.len() as u64 >= limit;
+                Ok(HistoryPage {
+                    events: order_timeline(raw),
+                    saturated,
+                })
+            }
+            HistoryDirection::Newer => {
+                let (events, saturated) = self.later_rows(channel, None, cursor, limit).await?;
+                Ok(HistoryPage { events, saturated })
+            }
+        }
+    }
+
+    /// Extend a thread reply window without treating the old 500-row query
+    /// bound as an archive boundary. Saturation is decided on the raw
+    /// answer: a full page whose rows partly fail the root check is still a
+    /// cut page, and the filtered count below the bound is not boundary
+    /// evidence.
+    pub async fn thread_page(
+        &self,
+        root: EventId,
+        channel: Uuid,
+        direction: HistoryDirection,
+        cursor: u64,
+        limit: u64,
+    ) -> Result<HistoryPage, Failure> {
+        let hex = root.to_hex();
+        let (raw, saturated) = match direction {
+            HistoryDirection::Older => {
+                let raw = self
+                    .transport
+                    .query(&json!({
+                        "kinds": content::TIMELINE_KINDS,
+                        "#e": [hex],
+                        "#h": [channel.to_string()],
+                        "until": cursor,
+                        "limit": limit,
+                    }))
+                    .await?;
+                let saturated = raw.len() as u64 >= limit;
+                (raw, saturated)
+            }
+            HistoryDirection::Newer => self.later_rows(channel, Some(root), cursor, limit).await?,
+        };
+        let (replies, _) = thread_replies(raw, &hex, Some(channel));
+        Ok(HistoryPage {
+            events: order_timeline(replies),
+            saturated,
+        })
+    }
+
+    /// The rows that come right after one cursor: the newest-to-anchor walk
+    /// over the `since` range, returned oldest first with the raw answer's
+    /// saturation evidence, before any thread filtering. `root` bounds a
+    /// thread page to one reply tree; `None` is a channel page.
+    async fn later_rows(
+        &self,
+        channel: Uuid,
+        root: Option<EventId>,
+        since: u64,
+        want: u64,
+    ) -> Result<(Vec<Event>, bool), Failure> {
+        let mut filter = json!({
+            "kinds": content::TIMELINE_KINDS,
+            "#h": [channel.to_string()],
+            "since": since,
+            "limit": WALK_LIMIT,
+        });
+        if let Some(root) = root {
+            filter["#e"] = json!([root.to_hex()]);
+        }
+        let mut walk = Walk::new(want, since, WALK_LIMIT);
+        loop {
+            let batch = self.transport.query(&filter).await?;
+            match walk.step(batch)? {
+                WalkStep::Descend(until) => filter["until"] = json!(until),
+                WalkStep::Done(page) => return Ok((page.events, page.saturated)),
+            }
+        }
+    }
+
+    /// One conversation's newest window: the read behind `G`. The rows are
+    /// the newest the conversation holds, oldest first; a full answer may
+    /// have cut older rows off, which `saturated` reports.
+    pub async fn latest(&self, channel: Uuid, limit: u64) -> Result<HistoryPage, Failure> {
+        let events = self.history(channel, limit).await?;
+        let saturated = events.len() as u64 >= limit;
+        Ok(HistoryPage { events, saturated })
     }
 
     /// A thread: the root event first, then its replies, oldest first.
@@ -991,6 +1345,178 @@ mod tests {
         assert!(
             answers[1].complete,
             "the newest message answers the whole question by construction"
+        );
+    }
+
+    #[test]
+    fn a_newer_walk_hands_out_the_rows_adjacent_to_the_cursor_not_the_newest() {
+        let keys = keys();
+        let ch = channel();
+        // The relay answers newest first. The batch bound is 3, so this full
+        // answer spans seconds and the walk descends to its oldest second,
+        // inclusively.
+        let batch = vec![
+            message(&keys, ch, "m", 22),
+            message(&keys, ch, "m", 21),
+            message(&keys, ch, "m", 20),
+        ];
+        let mut walk = Walk::new(2, 10, 3);
+        match walk.step(batch).expect("a spanning full page descends") {
+            WalkStep::Descend(until) => assert_eq!(until, 20, "the boundary second is kept"),
+            WalkStep::Done(_) => panic!("a full page that spans seconds is not the walk's end"),
+        }
+        // The next batch is partial: the range ends here. What the walk hands
+        // out is the oldest it has seen - the rows nearest the cursor - not
+        // the newest rows of the range a plain `since` answer would carry.
+        let near = vec![
+            message(&keys, ch, "later", 19),
+            message(&keys, ch, "later", 18),
+        ];
+        match walk.step(near).expect("a partial batch ends the walk") {
+            WalkStep::Done(page) => {
+                assert_eq!(page.events.len(), 2);
+                assert_eq!(page.events[0].created_at.as_secs(), 18, "oldest first");
+                assert_eq!(page.events[1].created_at.as_secs(), 19);
+                assert!(
+                    page.saturated,
+                    "a full page happened: more rows may exist beyond the page"
+                );
+            }
+            WalkStep::Descend(_) => panic!("a partial batch is the walk's end"),
+        }
+    }
+
+    #[test]
+    fn a_range_that_fits_one_batch_is_boundary_evidence() {
+        let keys = keys();
+        let batch = vec![
+            message(&keys, channel(), "m", 12),
+            message(&keys, channel(), "m", 11),
+        ];
+        let mut walk = Walk::new(50, 10, 3);
+        match walk.step(batch).expect("a partial batch ends the walk") {
+            WalkStep::Done(page) => {
+                assert_eq!(page.events.len(), 2);
+                assert!(!page.saturated, "the relay exhausted the range");
+            }
+            WalkStep::Descend(_) => panic!("a partial batch is the walk's end"),
+        }
+    }
+
+    #[test]
+    fn a_page_shorter_than_its_range_reports_more_rows_beyond_it() {
+        let keys = keys();
+        let batch = vec![
+            message(&keys, channel(), "m", 12),
+            message(&keys, channel(), "m", 11),
+            message(&keys, channel(), "m", 10),
+        ];
+        let mut walk = Walk::new(2, 10, 4);
+        match walk.step(batch).expect("a partial batch ends the walk") {
+            WalkStep::Done(page) => {
+                assert_eq!(page.events.len(), 2, "the page holds its bound");
+                assert!(
+                    page.saturated,
+                    "the range holds a row the page does not carry"
+                );
+            }
+            WalkStep::Descend(_) => panic!("a partial batch is the walk's end"),
+        }
+    }
+
+    #[test]
+    fn an_inclusive_boundary_second_is_deduplicated_not_dropped() {
+        let keys = keys();
+        let ch = channel();
+        let boundary_a = message(&keys, ch, "boundary a", 20);
+        let batch = vec![
+            message(&keys, ch, "m", 23),
+            message(&keys, ch, "m", 22),
+            message(&keys, ch, "m", 21),
+            boundary_a.clone(),
+        ];
+        let mut walk = Walk::new(3, 10, 4);
+        match walk.step(batch).expect("a spanning full page descends") {
+            WalkStep::Descend(until) => assert_eq!(until, 20),
+            WalkStep::Done(_) => panic!("a full page that spans seconds is not the walk's end"),
+        }
+        // The next batch re-answers the boundary second: the same event
+        // again, a different event of that second, and an older row.
+        let boundary_b = message(&keys, ch, "boundary b", 20);
+        let older = message(&keys, ch, "older", 19);
+        let near = vec![older.clone(), boundary_b.clone(), boundary_a.clone()];
+        match walk.step(near).expect("a partial batch ends the walk") {
+            WalkStep::Done(page) => {
+                // Same-second rows keep one canonical order, by id.
+                let mut pair = [boundary_a.id.to_hex(), boundary_b.id.to_hex()];
+                pair.sort();
+                assert_eq!(
+                    ids(&page.events),
+                    vec![older.id.to_hex(), pair[0].clone(), pair[1].clone()],
+                    "the re-answered second adds its new row and drops the duplicate"
+                );
+                assert!(
+                    page.saturated,
+                    "the range held five rows and the page carries three"
+                );
+            }
+            WalkStep::Descend(_) => panic!("a partial batch is the walk's end"),
+        }
+    }
+
+    #[test]
+    fn a_full_page_inside_one_second_reports_the_history_limit() {
+        let keys = keys();
+        // A full answer that never leaves one second cannot be walked
+        // through: the bound would ask the identical query.
+        let batch: Vec<Event> = (0..3)
+            .map(|n| message(&keys, channel(), &format!("burst {n}"), 50))
+            .collect();
+        let mut walk = Walk::new(2, 10, 3);
+        let failure = match walk.step(batch) {
+            Err(failure) => failure,
+            Ok(_) => panic!("one saturated second cannot be walked through"),
+        };
+        assert!(
+            failure.detail.starts_with("History limit reached"),
+            "the saturation failure is explicit: {}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains("second 50"),
+            "the failure names the visible gap: {}",
+            failure.detail
+        );
+    }
+
+    #[test]
+    fn a_walk_that_stops_making_progress_reports_the_history_limit() {
+        let keys = keys();
+        let ch = channel();
+        // The narrowed query answered with the same rows again: no
+        // second-resolution descent is possible, so the walk names the limit
+        // instead of repeating the identical query forever.
+        let batch = vec![
+            message(&keys, ch, "m", 22),
+            message(&keys, ch, "m", 21),
+            message(&keys, ch, "m", 20),
+        ];
+        let mut walk = Walk::new(2, 10, 3);
+        match walk
+            .step(batch.clone())
+            .expect("a spanning full page descends")
+        {
+            WalkStep::Descend(20) => {}
+            _ => panic!("a full page that spans seconds descends"),
+        }
+        let failure = match walk.step(batch) {
+            Err(failure) => failure,
+            Ok(_) => panic!("an identical full page is a wall, not progress"),
+        };
+        assert!(
+            failure.detail.starts_with("History limit reached"),
+            "the stall is explicit: {}",
+            failure.detail
         );
     }
 

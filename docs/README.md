@@ -3,6 +3,8 @@
 Product documentation. It states what the product must satisfy and how a user
 works with it.
 
+- [interactive.md](interactive.md) owns the shared TUI/Web capability catalog
+  and synchronized acceptance, including find-and-resume and complete reading.
 - [tui.md](tui.md) is the TUI capability: its layout modes, its unified keys,
   and the criteria it must satisfy.
 - [tui-use.md](tui-use.md) is the TUI manual: the keys, the modes, and the
@@ -15,7 +17,7 @@ works with it.
 - [browse-collab-cli.md](browse-collab-cli.md) specifies the first `buzz ext`
   browse-and-collaborate flow for terminal users and agents.
 - [web.md](web.md) specifies the proposed local browser surface, its TUI
-  parity matrix, interaction flows and acceptance. It is not implemented.
+  equivalent controls, interaction flows and acceptance. It is not implemented.
 
 The design documents, which state the boundaries and the contracts to
 preserve, live in [../design/](../design/). The product contract, which states
@@ -29,9 +31,15 @@ recipient-correctness rule for the composer: a complete `@member name` in a new
 message or reply becomes a signed recipient, and a draft that cannot be resolved
 is not published.
 
-[Focused thread reading](tui-use.md#planned-focused-thread-reading) opens one
+[Focused thread reading](tui-use.md#focused-thread-reading) opens one
 discussion, replies, and returns to the channel. See its status in the manual.
 
 [tui-visual.md](tui-visual.md) is the approved implementation spec for the shared TUI
 visual language, with message separators, region budgets and acceptance checks.
 Its status section separates implementation evidence from the intended atlas.
+
+[Complete-message reading](tui-reading.md) documents the implemented full-screen reader for a
+loaded row whose content exceeds the timeline, with line scrolling and return
+to its original reply target. It is part of the M1 foundation and the find-and-resume release.
+
+[Find and resume a conversation](tui-context.md) is the release-level specification for conversation lookup, message search, context, history, complete reading and safe return. The implementation status and acceptance evidence are tracked in the linked workspace log.

@@ -1,12 +1,13 @@
 # Using `buzzx web`
 
 Status: proposed product specification. The command is not implemented.
-The parity baseline is main commit `88595b95b94875533e69704cda4c03f6a31eb9c2`.
+The current baseline and the synchronized TUI/Web capability catalog live in
+[interactive.md](interactive.md).
 
 ## Outcome and scope
 
-A person runs `buzzx web` and uses Buzz in a browser with the capabilities
-already available in `buzzx tui`. They use their existing identity, relay,
+A person runs `buzzx web` and uses Buzz in a browser with the same product
+capabilities as `buzzx tui`. They use their existing identity, relay,
 conversations and permissions. They install no separate web application.
 
 Parity means the same available operations, destinations, observed information
@@ -14,34 +15,17 @@ and result meanings. It does not mean drawing terminal cells in a browser or
 requiring terminal key sequences. Mouse, touch, text selection and ordinary
 browser navigation are first-class interactions.
 
-The [TUI manual](tui-use.md) owns the existing conversation behaviors. This
-document owns the browser-specific presentation and lifecycle. The
-[Web design](../design/web.md) records the implementation boundaries.
+The [shared catalog](interactive.md#shared-capability-catalog) and its linked
+behavior owners define the whole scope. This document owns browser-specific
+presentation and lifecycle. [The Web design](../design/web.md) records the
+implementation boundaries; [the reference comparison](../design/client-reference.md)
+explains the choices informed by Buzz Desktop and Mobile.
 
-The first release includes every row of the following matrix. Delivery may be
-incremental, but basic chat alone is not feature parity.
-
-| Capability | Browser entry | Existing behavior to preserve |
-| --- | --- | --- |
-| Identity and relay | Start from the terminal; identity label in the header | [Configuration](configuration.md): precedence, auth tag and one relay per run |
-| Channels and existing DMs | Inbox sidebar or conversation list | [Inbox](tui-use.md#inbox-and-read-state): labels, visibility and stable ordering |
-| All, Unread, For you | Three Inbox filter buttons | Same candidates, unknown state and retained selection |
-| Read progress | Read the latest channel content | Same marker and coverage rules; thread reading does not clear channel unread |
-| Live timeline and long reading | Scroll, select text, jump to latest | Same loaded rows, overlays and focus preservation |
-| New message and reply | Composer and per-message Reply | Same channel, root and parent; explicit target above input |
-| Mentions | Type complete names or exact references | [Mention resolution](tui-use.md#mentions-when-sending), including blocked sends |
-| Reactions | Reaction chips and thumbs-up action | Add/remove own default reaction; display observed reaction counts |
-| Edit and delete | Own-message action menu | Same ownership, target and write-result rules |
-| Focused thread | Open thread on a confirmed row | [Thread reading](tui-use.md#planned-focused-thread-reading), including draft guards |
-| Typing | Above the channel composer and in Inbox rows | [Typing](tui-use.md#typing-indicators): receive-only, channel-scoped and expiring |
-| My agents | Header action, list, then detail | [Agents overview](tui-use.md#agents-overview): owned roster, observed work and accessible contexts |
-| Help and status | Help action and persistent status area | Full labels, actionable reasons, connection and write outcomes |
-
-Rendered text, diffs, forum rows and attachment metadata retain the existing
-row meanings. Dedicated forum navigation, attachment upload or inline media,
-search, DM creation, channel administration, Agent control, notifications and
-huddles are outside this parity release. The browser does not add them merely
-because it can display richer controls.
+The first release includes every catalog row, including conversation lookup,
+message search, exact context, history paging, complete-message reading and
+safe return. Delivery may be incremental, but basic chat alone is not feature
+parity. Shared exclusions are recorded only in
+[the product boundary](interactive.md#reference-features-outside-this-release).
 
 ## Start and stop
 
@@ -89,9 +73,11 @@ not log out of buzzx or remove saved credentials.
 
 ## Page shape
 
-There are five surfaces: Inbox/conversation, focused thread, My agents, Agent
-detail and Help. The latter three return to the same conversation context.
-There is no dashboard or separate home page before the Inbox.
+The main surface is Inbox/conversation. Search, exact result context, focused
+thread and a full-message reader form an inspection journey; My agents, Agent
+detail and Help return to their invoking view. There is no dashboard before
+the Inbox. Keep Search messages visible in the conversation/thread header and
+available while composing; Find conversation belongs to the Inbox list.
 
 At 900 CSS pixels and wider, show a 260-pixel Inbox sidebar, a flexible
 conversation column and a composer at the bottom. Keep the reading column
@@ -102,7 +88,8 @@ the full content region on narrow screens; it never creates a third column.
 
 ```text diagram
 +------------------+--------------------------------------------------+
-| buzzx            | #engineering                  My agents    Help  |
+| buzzx            | #engineering          Search   My agents   Help  |
+| Find conversation|                                                  |
 | All Unread       | Connected                                        |
 | For you          +--------------------------------------------------+
 | Channels         | Alice                              10:42         |
@@ -139,6 +126,33 @@ the full content region on narrow screens; it never creates a third column.
 These are product wireframes with sample content, not screenshots. The narrow
 thread back action returns to its saved channel position, not the Inbox.
 
+Search replaces the content region. The same form stacks vertically on narrow
+screens; a result opens context in that region, and Back returns to the result.
+
+```text diagram
++-----------------------------------------------------------+
+| < Back to #engineering                     Search messages |
+| [ release decision                               ] Search |
+| Scope: #engineering   Author: Anyone   Time: All           |
+| 8 results returned                                        |
+| > #engineering / Alice / Sep 25                            |
+|   We will release after the migration...                   |
+|   Open context                                            |
++-----------------------------------------------------------+
+| Draft kept in #engineering                Return to draft  |
++-----------------------------------------------------------+
+
++-----------------------------------------------------------+
+| < Search results           #engineering / Search context  |
+| Load older                                                |
+|   Sam: The migration is ready.                             |
+| > Alice: We will release after the migration...            |
+|   Reply   Open thread   Read message                       |
+| Load newer                                Jump to latest  |
+| Draft kept in #engineering                Return to draft  |
++-----------------------------------------------------------+
+```
+
 Use the TUI's calm reading hierarchy: clear author labels, secondary times
 and metadata, weak message separators, and explicit state words. Use a system
 sans-serif body at 16 pixels with 1.5 line height, monospace for code, an
@@ -159,33 +173,92 @@ incomplete and failed lists have different messages. Filters do not fabricate
 a zero unread count when coverage is unknown. Hidden DMs and archived
 channels follow the existing visibility rules.
 
+Find conversation filters the accessible listed channels/DMs by name using
+the [shared ranking and filter rules](tui-context.md#c1-find-a-conversation).
+Keep the active Inbox filter visible. It is a local list filter, not message
+search or a way to discover/join a new channel. Clearing it restores the list;
+opening a result obeys the existing draft/navigation guards.
+
 Incoming content follows the viewport only when the person is already at the
 latest message. When reading older content, retain the visible event and
 offset and offer `Jump to latest`. Preserve selection, scroll and draft
-through resize, in-app navigation and transient disconnection. The top of the
-loaded window is labeled as such; do not imply that all history was fetched
-or add infinite history pagination in this release.
+through resize, in-app navigation and transient disconnection. At a loaded
+boundary expose Load older or Load newer; reaching it may request the same
+single page automatically. Repeated input while loading does not enqueue
+duplicate requests. Keep the readable window on failure and offer Retry read.
+Jump to latest requests the newest window and changes position only on success.
+The [shared history rules](tui-context.md#c4-read-earlier-and-later-history)
+own page/window bounds, ordering, same-second saturation and boundary evidence.
+The initial page is not a permanent limit on how much history can be read.
 
 A browser adds one requirement to read progress: its document must be visible
 and focused and the latest loaded content must actually be in view. A hidden
-tab, a minimized window, a covering view, an unloaded timeline or a focused
-thread cannot advance a channel frontier. Receiving data is not reading it.
+tab, a minimized window, a covering view, an unloaded timeline, search context,
+thread or full-message reader cannot advance a channel frontier. Receiving
+data is not reading it.
 Existing incomplete-coverage and unsynced-marker states remain visible.
 
 Open thread resolves the selected row's containing root even when it is
 outside the channel's loaded window. Keep the root and replies together,
-show partial coverage when the existing bound is reached, and preserve live
+offer adjacent pages under the shared history rules, and preserve live
 edits, deletions and reactions. A deleted root is a placeholder, not an empty
 thread. Loading failure offers Retry read and Back, never an empty success.
 
 While a thread is open, the wide sidebar is visible for context but its
 navigation, filters and My agents are disabled with `Return to channel first`.
 Do not let another control silently change a thread draft's destination.
-Thread entry and return follow the TUI's existing nonempty-draft and
-pending-write guards. When allowed, Back restores channel selection, filter
-and viewport; a deleted anchor uses the nearest surviving row.
+Ordinary thread entry and return follow the existing nonempty-draft and
+pending-write guards. A thread entered through search is part of that inspection
+journey and may be read with the origin draft suspended; writing still obeys
+the shared draft guard. Back restores the actual invoking channel or search
+context, including selection and viewport. A deleted anchor uses the nearest
+surviving row.
 
-Browser Back follows these same in-app guards. It cannot bypass them and
+## Search, inspect and resume
+
+Search messages opens a dedicated view scoped to the current conversation,
+including when invoked from its thread or composer. Preserve the invoking
+surface, draft, reply/edit target, text cursor and focus. The current query,
+applied filters, selected result and result scroll position survive inspection.
+
+Provide a query field and separate Scope, Author and Time controls using the
+[shared search options](tui-context.md#c2-search-messages). Scope distinguishes
+this conversation, a chosen listed conversation and all accessible listed
+conversations. Authors bind to a public key, with full identity details for
+duplicate names; allow the same exact-key input as TUI. Apply Search or Enter
+explicitly; changing a form field alone does not replace the results.
+
+Each result shows conversation, author, time, excerpt and known thread
+relationship. Keep selection by event id and retain the relay's ordering until
+another search is submitted. Display loading, empty, failed, unsupported and
+bounded results distinctly. A failed query can retain previous results only
+with their previous-query label. Limits and coverage wording follow the shared
+contract; do not offer unsupported result pagination or claim archive totals.
+
+Open a hit in Search context at that exact event, with surrounding messages
+and Older/Newer controls. Reply, Open thread and Read message use the focused
+confirmed row. A missing/deleted/revoked hit shows an explicit unavailable
+state and Back; it never silently opens the latest channel message instead.
+Do not use the clicked display name or array index as the action destination.
+
+Read message opens the complete text in one scrollable content region, with
+author and origin visible and Reply/Back controls. It is available for any
+confirmed readable row, regardless of its length. Native line/page scrolling,
+text selection and zoom must expose its final character. The
+[reader specification](tui-reading.md) owns live-edit reset, deletion, logical
+text anchors and reply guards. The browser may already show complete text
+inline; the focused reader still supplies a stable target and return route.
+
+Back unwinds the actual Search -> Context -> Thread -> Reader journey.
+Return to draft goes to its saved origin only when doing so cannot abandon a
+new local draft or pending operation. A suspended nonempty draft allows
+inspection but blocks replacing it with a reply elsewhere; show
+`Draft kept; return to draft`. Known access revocation removes affected content
+and returns to accessible navigation while preserving unrelated drafts.
+
+## Browser navigation and view lifetime
+
+Browser Back follows the same inspection and draft guards. It cannot bypass them and
 silently turn a thread reply into a channel message. Refreshing, closing the
 tab or leaving the application uses the browser's unsaved-work prompt when
 supported if a draft or pending write exists. Drafts are kept only in the
@@ -246,8 +319,8 @@ refresh, repeated clicks and tab reconnection must never replay a write.
 
 Loss of the browser-to-process connection disables writes but retains the
 current draft and loaded content. A disconnected relay shows stale content;
-Web disables publication until its session can publish again and does not
-queue offline operations. Lost membership or a deleted target blocks the
+publication follows the same session eligibility and outcome rules as TUI,
+without queuing offline operations. Lost membership or a deleted target blocks the
 affected action with a reason and keeps the draft available to copy.
 
 ## My agents and help
@@ -269,7 +342,9 @@ assistive technology without reading every incoming message aloud.
 1. A configured user starts from the shipped buzzx binary with `buzzx web`,
    opens its printed link, and reaches the same visible conversations as TUI.
    Browser launch failure and missing identity have actionable outcomes.
-2. Exercise every parity-matrix row with the same identity, relay and source
+2. Exercise every [shared catalog](interactive.md#shared-capability-catalog)
+   row and [synchronized journey](interactive.md#synchronized-acceptance)
+   with the same identity, relay and source
    revision in both surfaces. Record differences explicitly; omitted rows
    prevent a feature-parity claim.
 3. In Chromium and Firefox, complete read/send/reply/react/edit/delete and
@@ -278,9 +353,10 @@ assistive technology without reading every incoming message aloud.
 4. Verify stored channel/root/parent/recipient identities and canonical ids
    through authenticated relay readback, including mentions in an existing DM.
    A screenshot of a pending row is not proof of a stored message.
-5. Read older content during live traffic; open/return from a thread; switch
-   conversations with drafts; resize and reconnect. No focus jump, draft loss,
-   wrong destination or duplicate write is allowed in these in-app flows.
+5. Find a conversation, search messages, open exact context, page history,
+   inspect a thread and read a complete report before returning to an existing
+   draft. Exercise live traffic, resize and reconnect during this journey.
+   No focus jump, draft loss, wrong destination or duplicate write is allowed.
 6. Leave a tab hidden, unfocused or covered and read a thread. Its channel
    frontier must not advance. Then view the latest channel content and verify
    the existing cross-client marker behavior, including unknown/unsynced states.

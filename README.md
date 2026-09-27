@@ -11,7 +11,9 @@ the relay they already belong to.
 - [`buzzx logout`](docs/configuration.md#logout) removes the saved key and
   auth tag, keeping the relay preference.
 - [`buzzx web`](docs/web.md) is a proposed browser surface with TUI capability
-  parity. Its product design is available; the command is not implemented.
+  parity under the [shared interactive contract](docs/interactive.md). Its
+  design includes current search, context recovery and complete reading;
+  the command is not implemented.
 
 Buzz ships a Tauri desktop app, a Flutter mobile app, and the `buzz` CLI. The
 desktop and mobile apps need a graphical session. The `buzz` CLI is a

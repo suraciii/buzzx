@@ -23,6 +23,14 @@ const HISTORY_LIMIT: u64 = 100;
 /// sending.
 const READ_PUBLISH_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The loaded surface a history page extends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorySurface {
+    Channel,
+    Context,
+    Thread,
+}
+
 /// What the transport side tells the UI. Every mutation the UI renders
 /// arrives as one of these.
 #[derive(Debug)]
@@ -67,6 +75,71 @@ pub enum ChatEvent {
         request: u64,
         events: Vec<Event>,
         partial: bool,
+    },
+    /// A bounded relay search result, with the request token that owns it.
+    Search {
+        request: u64,
+        events: Vec<Event>,
+    },
+    SearchFailed {
+        request: u64,
+        reason: String,
+    },
+    /// A context window around one exact event.
+    Context {
+        channel: Uuid,
+        target: String,
+        request: u64,
+        events: Vec<Event>,
+        before_complete: bool,
+        after_complete: bool,
+    },
+    ContextFailed {
+        channel: Uuid,
+        target: String,
+        request: u64,
+        reason: String,
+    },
+    /// One bounded page for a channel, context, or thread surface.
+    /// `saturated` is the raw answer's cut-page evidence: true means more
+    /// rows may exist in the page's direction, false is the boundary.
+    HistoryPage {
+        surface: HistorySurface,
+        channel: Uuid,
+        root: Option<String>,
+        request: u64,
+        direction: crate::client::HistoryDirection,
+        events: Vec<Event>,
+        saturated: bool,
+    },
+    HistoryPageFailed {
+        surface: HistorySurface,
+        channel: Uuid,
+        root: Option<String>,
+        request: u64,
+        direction: crate::client::HistoryDirection,
+        reason: String,
+    },
+    /// The newest window of one surface, fetched for `G`. Replaces the
+    /// surface's loaded rows; the app focuses its newest valid event and
+    /// keeps its return state. `saturated` says the window was cut by its
+    /// bound, not that the archive ends at the window's oldest row.
+    NewestWindow {
+        surface: HistorySurface,
+        channel: Uuid,
+        root: Option<String>,
+        request: u64,
+        events: Vec<Event>,
+        saturated: bool,
+    },
+    /// The newest-window read failed: the surface keeps its prior rows and
+    /// position, per the contract that a failed read never moves the user.
+    NewestWindowFailed {
+        surface: HistorySurface,
+        channel: Uuid,
+        root: Option<String>,
+        request: u64,
+        reason: String,
     },
     /// A thread read failed: the root is missing or inaccessible, or the query
     /// did not answer. A view that already holds rows keeps them.
@@ -187,6 +260,34 @@ pub enum SessionCommand {
     OpenThread {
         channel: Uuid,
         root: String,
+        request: u64,
+    },
+    /// Search loaded or relay history without blocking the UI.
+    Search {
+        request: crate::client::SearchRequest,
+        token: u64,
+    },
+    OpenContext {
+        channel: Uuid,
+        target: String,
+        request: u64,
+    },
+    HistoryPage {
+        surface: HistorySurface,
+        channel: Uuid,
+        root: Option<String>,
+        request: u64,
+        direction: crate::client::HistoryDirection,
+        cursor: u64,
+    },
+    /// The newest window of one surface, behind `G`. The surface's loaded
+    /// rows are replaced; the app keeps its return state and focuses the
+    /// newest valid row.
+    NewestWindow {
+        surface: HistorySurface,
+        channel: Uuid,
+        /// The thread root, for `HistorySurface::Thread`.
+        root: Option<String>,
         request: u64,
     },
     /// Extend the selected conversation's auxiliary feed with a live row
@@ -343,6 +444,47 @@ async fn run_command_pump(
                 request,
             } => {
                 open_thread(&client, channel, &root, request, &subs, &events).await;
+            }
+            SessionCommand::Search { request, token } => {
+                search(&client, request, token, &events).await;
+            }
+            SessionCommand::OpenContext {
+                channel,
+                target,
+                request,
+            } => {
+                open_context(&client, channel, &target, request, &subs, &events).await;
+            }
+            SessionCommand::HistoryPage {
+                surface,
+                channel,
+                root,
+                request,
+                direction,
+                cursor,
+            } => {
+                history_page(
+                    &client,
+                    PageFetch {
+                        surface,
+                        channel,
+                        root,
+                        request,
+                        direction,
+                        cursor,
+                    },
+                    &subs,
+                    &events,
+                )
+                .await;
+            }
+            SessionCommand::NewestWindow {
+                surface,
+                channel,
+                root,
+                request,
+            } => {
+                newest_window(&client, surface, channel, root, request, &subs, &events).await;
             }
             SessionCommand::LoadProfiles(pubkeys) => {
                 load_profiles(&client, pubkeys, &events).await;
@@ -708,6 +850,221 @@ async fn open_thread(
         .await;
     if !ids.is_empty() {
         let _ = subs.send(SubControl::AuxAdd { channel, ids }).await;
+    }
+}
+async fn search(
+    client: &Client,
+    request: crate::client::SearchRequest,
+    token: u64,
+    events: &mpsc::Sender<ChatEvent>,
+) {
+    let result = client.search(&request).await;
+    match result {
+        Ok(found) => {
+            let _ = events
+                .send(ChatEvent::Search {
+                    request: token,
+                    events: found,
+                })
+                .await;
+        }
+        Err(failure) => {
+            let _ = events
+                .send(ChatEvent::SearchFailed {
+                    request: token,
+                    reason: failure.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
+async fn open_context(
+    client: &Client,
+    channel: Uuid,
+    target: &str,
+    request: u64,
+    subs: &mpsc::Sender<SubControl>,
+    events: &mpsc::Sender<ChatEvent>,
+) {
+    let target_owned = target.to_owned();
+    let id = match event_id(target) {
+        Ok(id) => id,
+        Err(failure) => {
+            let _ = events
+                .send(ChatEvent::ContextFailed {
+                    channel,
+                    target: target_owned,
+                    request,
+                    reason: failure.to_string(),
+                })
+                .await;
+            return;
+        }
+    };
+    match client.context(id, channel, 20).await {
+        Ok(read) => {
+            let ids: Vec<String> = read.events.iter().map(|event| event.id.to_hex()).collect();
+            let _ = events
+                .send(ChatEvent::Context {
+                    channel,
+                    target: target_owned,
+                    request,
+                    events: read.events,
+                    before_complete: read.before_complete,
+                    after_complete: read.after_complete,
+                })
+                .await;
+            if !ids.is_empty() {
+                let _ = subs.send(SubControl::AuxAdd { channel, ids }).await;
+            }
+        }
+        Err(failure) => {
+            let _ = events
+                .send(ChatEvent::ContextFailed {
+                    channel,
+                    target: target_owned,
+                    request,
+                    reason: failure.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
+/// One page request, grouped the way the fetch reads it.
+struct PageFetch {
+    surface: HistorySurface,
+    channel: Uuid,
+    root: Option<String>,
+    request: u64,
+    direction: crate::client::HistoryDirection,
+    cursor: u64,
+}
+
+async fn history_page(
+    client: &Client,
+    fetch: PageFetch,
+    subs: &mpsc::Sender<SubControl>,
+    events: &mpsc::Sender<ChatEvent>,
+) {
+    let PageFetch {
+        surface,
+        channel,
+        root,
+        request,
+        direction,
+        cursor,
+    } = fetch;
+    let root = root.as_deref();
+    let result = match (surface, root) {
+        (HistorySurface::Thread, Some(root)) => match event_id(root) {
+            Ok(root) => client
+                .thread_page(root, channel, direction, cursor, 50)
+                .await
+                .map_err(|failure| failure.to_string()),
+            Err(failure) => Err(failure.to_string()),
+        },
+        (HistorySurface::Thread, None) => Err("thread root is missing".to_owned()),
+        _ => client
+            .history_page(channel, direction, cursor, 50)
+            .await
+            .map_err(|failure| failure.to_string()),
+    };
+    match result {
+        Ok(page) => {
+            let ids: Vec<String> = page.events.iter().map(|event| event.id.to_hex()).collect();
+            let _ = events
+                .send(ChatEvent::HistoryPage {
+                    surface,
+                    channel,
+                    root: root.map(str::to_owned),
+                    request,
+                    direction,
+                    events: page.events,
+                    saturated: page.saturated,
+                })
+                .await;
+            if !ids.is_empty() {
+                let _ = subs.send(SubControl::AuxAdd { channel, ids }).await;
+            }
+        }
+        Err(reason) => {
+            let _ = events
+                .send(ChatEvent::HistoryPageFailed {
+                    surface,
+                    channel,
+                    root: root.map(str::to_owned),
+                    request,
+                    direction,
+                    reason,
+                })
+                .await;
+        }
+    }
+}
+
+/// The newest window of one surface, behind `G`. The thread surface reads its
+/// root plus the newest reply bound; a channel or context surface reads the
+/// conversation's newest timeline window. Rows go out before the aux query,
+/// the same ordering an open keeps, so an overlay cannot land before the row
+/// it belongs to.
+async fn newest_window(
+    client: &Client,
+    surface: HistorySurface,
+    channel: Uuid,
+    root: Option<String>,
+    request: u64,
+    subs: &mpsc::Sender<SubControl>,
+    events: &mpsc::Sender<ChatEvent>,
+) {
+    let root_ref = root.as_deref();
+    let result = match (surface, root_ref) {
+        (HistorySurface::Thread, Some(root)) => match event_id(root) {
+            Ok(id) => client
+                .thread(id, Some(channel))
+                .await
+                .map(|read| crate::client::HistoryPage {
+                    events: read.events,
+                    saturated: read.partial,
+                })
+                .map_err(|failure| failure.to_string()),
+            Err(failure) => Err(failure.to_string()),
+        },
+        (HistorySurface::Thread, None) => Err("thread root is missing".to_owned()),
+        _ => client
+            .latest(channel, HISTORY_LIMIT)
+            .await
+            .map_err(|failure| failure.to_string()),
+    };
+    match result {
+        Ok(page) => {
+            let ids: Vec<String> = page.events.iter().map(|event| event.id.to_hex()).collect();
+            let _ = events
+                .send(ChatEvent::NewestWindow {
+                    surface,
+                    channel,
+                    root: root_ref.map(str::to_owned),
+                    request,
+                    events: page.events,
+                    saturated: page.saturated,
+                })
+                .await;
+            if !ids.is_empty() {
+                let _ = subs.send(SubControl::AuxAdd { channel, ids }).await;
+            }
+        }
+        Err(reason) => {
+            let _ = events
+                .send(ChatEvent::NewestWindowFailed {
+                    surface,
+                    channel,
+                    root: root_ref.map(str::to_owned),
+                    request,
+                    reason,
+                })
+                .await;
+        }
     }
 }
 

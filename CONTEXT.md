@@ -112,7 +112,8 @@ Its product boundary is defined in [core.md](core.md).
 
 **Web surface**:
 The browser interface to a locally running buzzx session, with the TUI's
-conversation capabilities. It is another view of the client, not a relay.
+conversation capabilities. The two surfaces share the
+[interactive capability contract](docs/interactive.md).
 
 **core**:
 The relay operations that both the TUI and the CLI perform. One call per
@@ -178,3 +179,10 @@ Do not use these words for a `buzzx` concept:
 - **server** for the relay. The relay is the server.
 - **session** for a channel view. A session is the whole run; a channel view
   is the selection.
+
+## Reader
+
+**reader**:
+A focused view of one loaded, confirmed row's complete rendered text. It
+scrolls within that row and retains the originating conversation and event
+identity. Its behavior is specified in [complete-message reading](docs/tui-reading.md).

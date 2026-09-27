@@ -9,9 +9,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::agents;
-use crate::app::{AgentStatus, App, ConnState, Context, Marker, Mode, Sections};
-use crate::content::short_pubkey;
+use crate::app::{AgentStatus, App, ConnState, Context, Marker, Mode, ReaderOrigin, Sections};
+use crate::content::{Row, short_pubkey};
 use crate::layout::{self, LayoutMode};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
@@ -419,8 +420,10 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     let mode = layout::mode(area.width, area.height);
     match mode {
         LayoutMode::TooSmall => draw_size_message(frame, area),
-        // The thread is a surface of its own: it replaces the whole column
-        // rather than covering part of the timeline.
+        // Full-message reading replaces the channel or thread surface.
+        _ if app.reader.open => draw_reader(frame, app, now, area),
+        _ if app.context.open => draw_context(frame, app, now, area),
+        _ if app.search.open => draw_search(frame, app, now, area),
         _ if app.thread.open => draw_thread(frame, app, now, area, mode),
         LayoutMode::Wide => draw_wide(frame, app, now, area),
         LayoutMode::Narrow => draw_narrow(frame, app, now, area),
@@ -435,6 +438,437 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     if app.help {
         draw_help(frame, app, area, mode);
     }
+}
+
+fn reader_label(app: &App, channel: Uuid) -> String {
+    match app.channels.iter().find(|entry| entry.id == channel) {
+        Some(entry) if entry.is_dm() => app.label(entry),
+        Some(entry) => format!("#{}", app.label(entry)),
+        None => channel.to_string(),
+    }
+}
+
+fn draw_reader(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let compact = area.width < 80;
+    let channel = app.reader.channel();
+    let thread = matches!(app.reader.origin, Some(ReaderOrigin::Thread { .. }));
+    let title = match channel {
+        Some(channel) if compact => format!("Message {}", reader_label(app, channel)),
+        Some(channel) if thread => format!("Message / Thread {}", reader_label(app, channel)),
+        Some(channel) => format!("Message / {}", reader_label(app, channel)),
+        None => "Message".to_owned(),
+    };
+    let title = format!(
+        "{}  {}",
+        clip_with_ellipsis(&title, area.width.saturating_sub(12) as usize),
+        if compact { "Esc:back" } else { "Esc: back" }
+    );
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    frame.render_widget(Paragraph::new(title), rows[0]);
+
+    let metadata = app
+        .reader
+        .row
+        .as_ref()
+        .map(|row| {
+            let edited = if row.edited { " · edited" } else { "" };
+            format!("{} · {}{}", row.author, age(row.created_at, now), edited)
+        })
+        .unwrap_or_else(|| "Message deleted".to_owned());
+    frame.render_widget(
+        Paragraph::new(clip_with_ellipsis(&metadata, rows[1].width as usize)),
+        rows[1],
+    );
+
+    let body_lines = app
+        .reader
+        .row
+        .as_ref()
+        .map(|row| reader_lines(row, rows[2].width))
+        .unwrap_or_else(|| vec!["Message deleted".to_owned()]);
+    let total = body_lines.len();
+    let max_scroll = total.saturating_sub(rows[2].height as usize);
+    let start = app.reader.scroll.min(max_scroll);
+    let visible = body_lines
+        .iter()
+        .skip(start)
+        .take(rows[2].height as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible.join("\n")), rows[2]);
+
+    let actions = if compact {
+        "Enter reply · j/k scroll · Esc/v back · ?"
+    } else {
+        "j/k scroll · PgUp/PgDn · Enter reply · Esc/v back · ? help"
+    };
+    frame.render_widget(
+        Paragraph::new(clip_with_ellipsis(actions, rows[3].width as usize)),
+        rows[3],
+    );
+    let state = if let Some(notice) = &app.reader.notice {
+        notice.clone()
+    } else if app.reader.deleted {
+        "Message deleted".to_owned()
+    } else {
+        let end = (start + rows[2].height as usize).min(total);
+        format!(
+            "{} · lines {}-{} of {}",
+            conn_word(app.conn),
+            start + 1,
+            end,
+            total
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clip_with_ellipsis(&state, rows[4].width as usize),
+            status_style(&state),
+        )),
+        rows[4],
+    );
+}
+
+fn draw_search(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let compact = area.width < 80;
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let title = if compact {
+        "Search".to_owned()
+    } else {
+        format!(
+            "Search · {} · {}",
+            app.search_scope_label(app.search.applied_scope),
+            app.search.applied_time.label()
+        )
+    };
+    frame.render_widget(Paragraph::new(title), rows[0]);
+    let line = if app.search.scope_pick.is_some() {
+        "choose conversation".to_owned()
+    } else if let Some(pick) = &app.search.author_pick {
+        if pick.pubkey_mode {
+            format!("pubkey> {}_", pick.pubkey_entry)
+        } else if compact {
+            "authors · incomplete".to_owned()
+        } else {
+            "author picker · known profiles · the list may be incomplete".to_owned()
+        }
+    } else if app.search.editing {
+        format!("search> {}_", app.search.query)
+    } else {
+        let mut line = format!("search: {}", app.search.applied_query);
+        if let Some(author) = &app.search.applied_author {
+            line.push_str(&format!(" · author {}", app.author_label(author)));
+        }
+        line
+    };
+    frame.render_widget(
+        Paragraph::new(clip_with_ellipsis(&line, rows[1].width as usize)),
+        rows[1],
+    );
+    if let Some(pick) = &app.search.author_pick {
+        draw_author_pick(frame, app, pick, rows[2]);
+    } else if let Some(pick) = &app.search.scope_pick {
+        draw_scope_pick(frame, app, pick, rows[2]);
+    } else if app.search.form {
+        draw_filter_form(frame, app, rows[2], compact);
+    } else {
+        // In the all-accessible scope each result names its conversation;
+        // the label is presentation, identity stays the event id.
+        let results: Vec<crate::content::Row> =
+            if app.search.applied_scope == crate::app::SearchScope::All {
+                app.search
+                    .results
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let mut row = row.clone();
+                        if let Some(channel) = app.search.channels.get(index) {
+                            row.body = format!("[{}] {}", app.label_for(*channel), row.body);
+                        }
+                        row
+                    })
+                    .collect()
+            } else {
+                app.search.results.clone()
+            };
+        draw_rows(
+            frame,
+            &results,
+            app.search.focus,
+            rows[2],
+            now,
+            compact,
+            RowOptions {
+                roomy: area.width >= 40 && area.height >= 16,
+                focus_visible: !app.search.editing,
+                head: RootMark::None,
+            },
+        );
+    }
+    let footer = if app.search.scope_pick.is_some() {
+        "j/k move · Enter choose · Esc back"
+    } else if app.search.author_pick.is_some() {
+        "j/k move · Enter select · p exact pubkey · Esc back"
+    } else if app.search.form {
+        "Enter apply · Esc cancel"
+    } else if app.search.loading {
+        "searching… · Esc back"
+    } else if app.search.failed.is_some() {
+        "search failed · Enter retry · / edit · f filters · Esc back"
+    } else {
+        "j/k move · Enter open context · / edit · f filters · Esc back"
+    };
+    frame.render_widget(
+        Paragraph::new(clip_with_ellipsis(footer, rows[3].width as usize)),
+        rows[3],
+    );
+    let status = search_status(app);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clip_with_ellipsis(&status, rows[4].width as usize),
+            status_style(&status),
+        )),
+        rows[4],
+    );
+}
+
+/// Loading, no returned matches, a failed read, a bounded page, and the
+/// previous successful query after a failure are all distinct states. When
+/// visibility filtering hid returned hits, the visible list is labeled
+/// bounded rather than presented as the whole search space.
+fn search_status(app: &App) -> String {
+    let hidden = if app.search.hidden > 0 {
+        format!(" · bounded: {} hidden by visibility", app.search.hidden)
+    } else {
+        String::new()
+    };
+    if let Some(reason) = &app.search.failed {
+        let mut status = format!("search failed: {reason}");
+        if let Some(previous) = &app.search.previous {
+            status.push_str(&format!(" · results from previous query {previous}"));
+        }
+        return status;
+    }
+    if app.search.loading {
+        let mut status = "searching…".to_owned();
+        if let Some(previous) = &app.search.previous {
+            status.push_str(&format!(" · showing previous query {previous}"));
+        }
+        return status;
+    }
+    if app.search.results.is_empty() {
+        if app.search.applied_query.is_empty() && app.search.applied_author.is_none() {
+            // Nothing has been submitted yet: invite, do not search.
+            return match app.status.is_empty() {
+                true => "type a keyword, Enter submit".to_owned(),
+                false => app.status.clone(),
+            };
+        }
+        return format!("no returned matches{hidden}");
+    }
+    if app.search.bounded {
+        return format!("Top 50; narrow filters{hidden}");
+    }
+    format!("{} results returned{hidden}", app.search.results.len())
+}
+
+/// The filter form replaces the results while it is open. The letters work
+/// from any row, so every value stays reachable at the smallest width.
+fn draw_filter_form(frame: &mut Frame, app: &App, body: Rect, compact: bool) {
+    let controls = [
+        ("scope", app.search_scope_label(app.search.scope)),
+        (
+            "author",
+            app.search
+                .author
+                .as_deref()
+                .map(|author| app.author_label(author))
+                .unwrap_or_else(|| "any author".to_owned()),
+        ),
+        ("time", app.search.time.label().to_owned()),
+    ];
+    let hints = ["  s cycle · o choose", "  a pick · h clear", "  t cycle"];
+    let lines: Vec<Line> = controls
+        .iter()
+        .enumerate()
+        .map(|(index, (label, value))| {
+            let marker = if app.search.form_row == index {
+                "> "
+            } else {
+                "  "
+            };
+            let hint = if compact { "" } else { hints[index] };
+            Line::from(format!("{marker}{label:6} {value}{hint}"))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
+fn draw_author_pick(frame: &mut Frame, app: &App, pick: &crate::app::AuthorPick, body: Rect) {
+    let lines: Vec<Line> = pick
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let marker = if pick.focus == index { "> " } else { "  " };
+            Line::from(format!("{marker}{}", app.author_label(&candidate.pubkey)))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
+fn draw_scope_pick(frame: &mut Frame, app: &App, pick: &crate::app::ScopePick, body: Rect) {
+    let lines: Vec<Line> = pick
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let marker = if pick.focus == index { "> " } else { "  " };
+            Line::from(format!("{marker}{}", app.label_for(*id)))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body);
+}
+fn draw_context(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let compact = area.width < 80;
+    let composing = app.mode == Mode::Composer;
+    let roomy = area.width >= 40 && area.height >= 16;
+    let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
+    let target_rows = u16::from(composing);
+    let column = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(target_rows),
+        Constraint::Length(input_rows),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let label = reader_label(app, app.context.channel);
+    let title = if compact {
+        format!("Context {label}")
+    } else {
+        format!("Context / {label} · {}", app.context.target)
+    };
+    frame.render_widget(Paragraph::new(title), column[0]);
+    draw_rows(
+        frame,
+        &app.context.rows,
+        app.context.focus,
+        column[1],
+        now,
+        compact,
+        RowOptions {
+            roomy,
+            focus_visible: !composing,
+            head: RootMark::None,
+        },
+    );
+    if composing {
+        draw_composer_target(frame, app, column[2]);
+        draw_composer(frame, app, column[3]);
+    }
+    let keys = if composing {
+        "Enter: send · Esc: cancel compose"
+    } else if compact {
+        "j/k move · t thread · v read · [/] more · Esc back"
+    } else {
+        "j/k move · Enter reply · t thread · v read · [/] older/newer · Esc back"
+    };
+    frame.render_widget(
+        Paragraph::new(clip_with_ellipsis(keys, column[4].width as usize)),
+        column[4],
+    );
+    let status = if let Some(notice) = &app.context.notice {
+        notice.clone()
+    } else if let Some(reason) = &app.context.failed {
+        format!("context failed: {reason}")
+    } else if app.context.loading && app.context.rows.is_empty() {
+        "loading context…".to_owned()
+    } else if app.context.older_loading || app.context.newer_loading {
+        "loading more context…".to_owned()
+    } else if !app.context.before_complete || !app.context.after_complete {
+        "partial context · [ older · ] newer".to_owned()
+    } else {
+        conn_word(app.conn).to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clip_with_ellipsis(&status, column[5].width as usize),
+            status_style(&status),
+        )),
+        column[5],
+    );
+}
+
+/// Split a message into source-preserving display lines. Unlike timeline
+/// wrapping, this keeps indentation, repeated spaces, blank lines, and tabs.
+fn reader_lines(row: &Row, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut lines = row
+        .body
+        .split('\n')
+        .flat_map(|line| wrap_reader_line(line, width))
+        .collect::<Vec<_>>();
+    if let Some(attachment) = &row.attachment {
+        lines.push(format!("[file] {attachment}"));
+    }
+    if !row.reactions.is_empty() {
+        lines.push(
+            row.reactions
+                .iter()
+                .map(|(emoji, count)| format!("{emoji} x{count}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    lines
+}
+
+fn wrap_reader_line(line: &str, width: usize) -> Vec<String> {
+    let mut expanded = String::new();
+    let mut cells = 0;
+    for grapheme in line.graphemes(true) {
+        if grapheme == "\t" {
+            let spaces = 4 - cells % 4;
+            expanded.push_str(&" ".repeat(spaces));
+            cells += spaces;
+        } else {
+            expanded.push_str(grapheme);
+            cells += grapheme.width();
+        }
+    }
+    if expanded.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+    for grapheme in expanded.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if used > 0 && used + grapheme_width > width {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push_str(grapheme);
+        used += grapheme_width;
+    }
+    lines.push(current);
+    lines
 }
 
 /// Channels, timeline, and composer side by side. This is the desktop shape,
@@ -1169,13 +1603,6 @@ fn draw_picker(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let items = list_items(app, &rows, width, now);
     // The hint stays even when the list is empty: a filter with nothing in it
     // still has to be escapable and changeable.
-    // The operation hint lives in the bottom border, at any size: a filter
-    // with nothing in it still has to be escapable and changeable.
-    // The hint names the three actions a filter with nothing in it still has
-    // to offer. It gives up words, never an action: at 24 columns the inner
-    // border is 22 cells, and a clipped hint reads as a missing key.
-    // The width that matters is the border's inner cells: the hint is the
-    // block's bottom title, so a hint longer than those cells is cut.
     let inner = area.width.saturating_sub(2);
     let hint = if inner >= 41 {
         "enter open · f filter · esc close · ? help"
@@ -1184,9 +1611,20 @@ fn draw_picker(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     } else {
         "enter f filter esc"
     };
+    let title = if app.picker_editing || !app.picker_query.is_empty() {
+        let mark = if app.inbox_incomplete() { " ?" } else { "" };
+        Line::raw(format!(
+            "Inbox: {}{mark} · name: {}{}",
+            app.filter.name(),
+            app.picker_query,
+            if app.picker_editing { "_" } else { "" }
+        ))
+    } else {
+        inbox_title(app)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(inbox_title(app))
+        .title(title)
         .title_bottom(Line::raw(hint));
     let list = List::new(items)
         .block(block)
@@ -1588,11 +2026,21 @@ fn scroll_window(len: usize, rows: usize, focus: usize) -> std::ops::Range<usize
 /// terminal width is not the whole name, and the help text may wrap and
 /// scroll to show it.
 fn help_text(app: &App, mode: LayoutMode) -> String {
-    let mut text = match (app.thread.open, mode) {
-        (true, LayoutMode::Wide) => THREAD_WIDE_HELP.to_owned(),
-        (true, _) => THREAD_COMPACT_HELP.to_owned(),
-        (false, LayoutMode::Wide) => WIDE_HELP.to_owned(),
-        (false, _) => COMPACT_HELP.to_owned(),
+    let mut text = if app.reader.open {
+        if mode == LayoutMode::Wide {
+            READER_WIDE_HELP.to_owned()
+        } else {
+            READER_COMPACT_HELP.to_owned()
+        }
+    } else {
+        match (app.thread.open, mode) {
+            (true, LayoutMode::Wide) => THREAD_WIDE_HELP.to_owned(),
+            (true, _) => THREAD_COMPACT_HELP.to_owned(),
+            (false, _) if app.search.open => SEARCH_HELP.to_owned(),
+            (false, _) if app.context.open => CONTEXT_HELP.to_owned(),
+            (false, LayoutMode::Wide) => WIDE_HELP.to_owned(),
+            (false, _) => COMPACT_HELP.to_owned(),
+        }
     };
     if app.thread.open {
         text.push_str(&format!("\nthread / {}\n", app.thread.root));
@@ -1644,10 +2092,10 @@ navigation
   a              Agents: owned roster, working now
   f              Inbox filter
   g G PgUp PgDn  move the focused row
-  i              compose new           Enter  reply
+  v              read full message        Enter  reply
+  i              compose new
   r e d          react / edit / delete
   ?              help                  q quit
-composer
   Enter send     Alt+Enter newline
   Esc leaves the composer, keeps the text
 picker
@@ -1662,18 +2110,33 @@ const COMPACT_HELP: &str = "\
 i compose  Enter send
 j k move row  c picker
 a agents  f filter
-Enter reply  r react
+Enter reply  v read message  r react
 e edit  d delete
 1-9 jump  g G start/end
 PgUp/PgDn move ten rows
 ? help  j k scroll  q quit
-Esc close  Alt+Enter nl
+Esc/v back  Alt+Enter nl
 ● unread  @ mention  ? unknown";
+
+const READER_WIDE_HELP: &str = "\
+reader
+  j k up down    scroll one displayed line
+  PgUp PgDn      scroll a page
+  g/Home G/End   start/end
+  Enter          reply to this message
+  Esc/v          return to the origin
+  ?              close help                  q quit";
+
+const READER_COMPACT_HELP: &str = "\
+reader: j/k scroll  PgUp/PgDn page
+g/Home start  G/End end
+Enter reply  Esc/v back
+? close help  q quit";
 
 const THREAD_WIDE_HELP: &str = "\
 thread
   j k up down    move focused row    g G PgUp PgDn ends
-  Enter          reply to focused row    i Tab reply to root
+  v              read full message
   t              retry failed read
   r e d          react / edit / delete on focused row
   Esc            back to the channel
@@ -1683,11 +2146,40 @@ composer
   Esc leaves composing in one press and keeps its target";
 
 const THREAD_COMPACT_HELP: &str = "\
-thread: j k move  g G ends  PgUp/PgDn
-Enter reply  i/Tab root  t retry read
+thread: j k move  v read  g G ends  PgUp/PgDn
 r/e/d react/edit/delete  Esc back
 ? help  q quit
 composer: Esc leaves; Enter sends";
+
+const SEARCH_HELP: &str = "\
+search
+  / edit query    Enter submit or open context
+  f filter form   j k move results
+  Enter retry after a failure     Esc back to the origin
+  ? help          q quit
+editing
+  printable characters are query text
+  Enter submits   Esc restores the applied query
+filter form
+  j k move        h l adjust the focused control
+  s scope         t time range     a pick author
+  o choose a conversation
+  Enter applies the form and submits
+  Esc cancels and restores the applied filters
+author picker
+  j k move        Enter select     p exact pubkey
+  the known-profile list may be incomplete; duplicate
+  names stay distinguishable by their short keys
+scope and time
+  current conversation, all accessible, or one chosen
+  conversation; all time, 7 days, 30 days
+  filters apply only on submit";
+
+const CONTEXT_HELP: &str = "\
+context
+  j k move        g G ends         PgUp/PgDn page
+  v read message  t thread         Enter reply
+  [ older         ] newer          Esc back to results";
 
 /// Wrap the help text to a width, so the popup can be sized to what it holds
 /// and scrolled by line rather than by paragraph.
@@ -1728,6 +2220,9 @@ fn help_lines(text: &str, width: usize) -> Vec<String> {
     lines
 }
 fn help_context(app: &App) -> String {
+    if app.reader.open {
+        return "Reader".to_owned();
+    }
     if app.thread.open {
         return "Thread".to_owned();
     }
@@ -2093,6 +2588,38 @@ mod tests {
         assert!(text.contains("the reply"), "loaded rows stay: {text}");
     }
 
+    #[test]
+    fn reader_preserves_blank_lines_indentation_tabs_and_wide_text() {
+        let row = message_row(
+            0,
+            "  first\tline\n\n链接 https://example.test/very-long-path",
+        );
+        let lines = reader_lines(&row, 12);
+        assert_eq!(lines[0], "  first line");
+        assert_eq!(lines[1], "");
+        assert!(
+            lines.iter().any(|line| line.contains("链接")),
+            "CJK text remains in the reader: {lines:?}"
+        );
+        assert!(
+            lines.join("").contains("https://"),
+            "URLs remain literal rather than word-normalized: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn reader_uses_fixed_metadata_and_state_rows_at_the_floor_size() {
+        let mut app = chat_app(vec![message_row(0, "line one\nline two\nline three")]);
+        app.handle(crate::keys::Action::OpenReader, 130);
+        let text = frame_text(&app, 24, 6);
+        assert!(text.contains("Message"), "{text}");
+        assert!(text.contains("alice"), "{text}");
+        assert!(text.contains("Enter reply"), "{text}");
+        assert!(text.contains("connected"), "{text}");
+        assert!(text.contains("line one"), "{text}");
+        assert!(text.contains("line two"), "{text}");
+    }
+
     fn frame_text(app: &App, width: u16, height: u16) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -2278,6 +2805,186 @@ mod tests {
         );
     }
 
+    #[test]
+    fn smoke_search_and_context_views_render() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.handle(crate::keys::Action::OpenSearch, 0);
+        assert!(app.search.open);
+        app.handle(crate::keys::Action::SearchInput('b'), 0);
+        app.handle(crate::keys::Action::SearchInput('o'), 0);
+        app.handle(crate::keys::Action::SearchSubmit, 0);
+        let mut tokens = Vec::new();
+        for command in app.take_outbox() {
+            if let crate::session::SessionCommand::Search { token, .. } = command {
+                tokens.push(token);
+            }
+        }
+        assert_eq!(tokens.len(), 1, "one search command leaves the outbox");
+        app.apply(
+            crate::session::ChatEvent::Search {
+                request: tokens[0],
+                events: Vec::new(),
+            },
+            0,
+        );
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Search · general · all time"), "{text}");
+        assert!(text.contains("search: bo"), "{text}");
+        app.search.results.push(message_row(0, "hit one"));
+        app.search.channels.push(app.channels[0].id);
+        let text = frame_text(&app, 40, 10);
+        assert!(text.contains("hit one"), "{text}");
+        app.handle(crate::keys::Action::SearchSubmit, 0);
+        assert!(app.context.open);
+        app.context.rows = vec![message_row(1, "around it")];
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Context / #general"), "{text}");
+        assert!(text.contains("around it"), "{text}");
+    }
+
+    /// The token of the only outstanding search command.
+    fn take_search_token(app: &mut App) -> u64 {
+        app.take_outbox()
+            .into_iter()
+            .find_map(|command| match command {
+                crate::session::SessionCommand::Search { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("a search command")
+    }
+
+    fn one_hit_event(id: uuid::Uuid, body: &str, at: u64) -> nostr::Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(9), body)
+            .tags(vec![nostr::Tag::parse(["h", &id.to_string()]).unwrap()])
+            .custom_created_at(nostr::Timestamp::from(at))
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap()
+    }
+
+    #[test]
+    fn the_filter_form_replaces_results_and_shows_every_control() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.handle(crate::keys::Action::OpenSearch, 0);
+        // Esc leaves the empty query editing; the results surface owns f now.
+        app.handle(crate::keys::Action::Dismiss, 0);
+        app.handle(crate::keys::Action::SearchFilter, 0);
+        assert!(app.search.form);
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("scope"), "{text}");
+        assert!(
+            text.contains("general"),
+            "the current scope is named: {text}"
+        );
+        assert!(text.contains("any author"), "{text}");
+        assert!(text.contains("all time"), "{text}");
+        assert!(text.contains("Enter apply"), "{text}");
+
+        // At the floor size the form still names its controls and values.
+        let text = frame_text(&app, 24, 6);
+        assert!(text.contains("scope"), "{text}");
+        assert!(text.contains("general"), "{text}");
+
+        // The form replaces the results while it is open.
+        app.search.results.push(message_row(0, "a visible hit"));
+        app.search.channels.push(app.channels[0].id);
+        let text = frame_text(&app, 80, 12);
+        assert!(!text.contains("a visible hit"), "{text}");
+    }
+
+    #[test]
+    fn the_author_picker_says_its_list_may_be_incomplete() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.handle(crate::keys::Action::OpenSearch, 0);
+        app.handle(crate::keys::Action::Dismiss, 0);
+        app.handle(crate::keys::Action::SearchFilter, 0);
+        app.handle(crate::keys::Action::SearchInput('a'), 0);
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("incomplete"), "{text}");
+        assert!(text.contains("pubkey"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_retry_names_the_previous_query_and_keeps_its_results() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.handle(crate::keys::Action::OpenSearch, 0);
+        app.handle(crate::keys::Action::SearchInput('b'), 0);
+        app.handle(crate::keys::Action::SearchInput('o'), 0);
+        app.handle(crate::keys::Action::SearchSubmit, 0);
+        let token = take_search_token(&mut app);
+        let id = app.channels[0].id;
+        app.apply(
+            crate::session::ChatEvent::Search {
+                request: token,
+                events: vec![one_hit_event(id, "the kept hit", 100)],
+            },
+            0,
+        );
+        assert_eq!(app.search.results.len(), 1);
+
+        app.handle(crate::keys::Action::SearchEdit, 0);
+        app.handle(crate::keys::Action::SearchSubmit, 0);
+        let retry = take_search_token(&mut app);
+        app.apply(
+            crate::session::ChatEvent::SearchFailed {
+                request: retry,
+                reason: "relay 500".into(),
+            },
+            0,
+        );
+        let text = frame_text(&app, 80, 12);
+        assert!(
+            text.contains("the kept hit"),
+            "the previous results stay visible: {text}"
+        );
+        assert!(text.contains("previous query"), "{text}");
+        assert!(text.contains("relay 500"), "{text}");
+    }
+
+    #[test]
+    fn result_counts_say_returned_and_name_the_50_bound() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.handle(crate::keys::Action::OpenSearch, 0);
+        app.handle(crate::keys::Action::SearchInput('b'), 0);
+        app.handle(crate::keys::Action::SearchSubmit, 0);
+        let token = take_search_token(&mut app);
+        let id = app.channels[0].id;
+        let events: Vec<nostr::Event> = (0..50)
+            .map(|n| one_hit_event(id, &format!("hit {n}"), 100 + n))
+            .collect();
+        app.apply(
+            crate::session::ChatEvent::Search {
+                request: token,
+                events,
+            },
+            0,
+        );
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Top 50; narrow filters"), "{text}");
+
+        // Hidden hits make the visible list bounded, never exhaustive.
+        app.search.hidden = 3;
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("bounded"), "{text}");
+        assert!(text.contains("3 hidden by visibility"), "{text}");
+
+        // A shorter page counts what came back without claiming totality.
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.handle(crate::keys::Action::OpenSearch, 0);
+        app.handle(crate::keys::Action::SearchInput('b'), 0);
+        app.handle(crate::keys::Action::SearchSubmit, 0);
+        let token = take_search_token(&mut app);
+        let id = app.channels[0].id;
+        app.apply(
+            crate::session::ChatEvent::Search {
+                request: token,
+                events: vec![one_hit_event(id, "only one", 100)],
+            },
+            0,
+        );
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("1 results returned"), "{text}");
+        assert!(!text.contains("Top 50"), "{text}");
+    }
     #[test]
     fn the_help_overlay_scrolls_and_carries_the_whole_selected_label() {
         let mut app = chat_app(vec![message_row(0, "hello")]);
