@@ -8,10 +8,29 @@ use nostr::Keys;
 use uuid::Uuid;
 
 use crate::agents;
-use crate::client::{CatchUp, ChannelInfo, ChannelKind, Roster};
+use crate::client::{CatchUp, ChannelInfo, ChannelKind, HistoryDirection, Roster};
 use crate::content::{self, Row};
 use crate::keys::{self, Action, PAGE_ROWS};
-use crate::session::{ChatEvent, SessionCommand};
+use crate::session::{ChatEvent, HistorySurface, SessionCommand};
+
+/// One answered history page, grouped the way the view that asked reads it.
+struct HistoryPageRead {
+    surface: HistorySurface,
+    channel: Uuid,
+    root: Option<String>,
+    request: u64,
+    direction: HistoryDirection,
+    saturated: bool,
+    events: Vec<nostr::Event>,
+}
+struct NewestWindowRead {
+    surface: HistorySurface,
+    channel: Uuid,
+    root: Option<String>,
+    request: u64,
+    saturated: bool,
+    events: Vec<nostr::Event>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -181,6 +200,9 @@ pub struct ChannelEntry {
     pub participants: Vec<String>,
     pub rows: Vec<Row>,
     pub seen: HashSet<String>,
+    /// Whether an adjacent history boundary has been proven exhausted.
+    older_complete: bool,
+    newer_complete: bool,
     /// Events delivered by the live feed but not yet covered by a history
     /// answer. They survive the HTTP/live race without preserving stale rows.
     live_ids: HashSet<String>,
@@ -500,7 +522,7 @@ pub struct AgentView {
 ///
 /// Nothing here is persistent read state: reading a thread leaves the
 /// channel's own read frontier alone.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadView {
     /// Whether the view is on screen.
     pub open: bool,
@@ -522,6 +544,9 @@ pub struct ThreadView {
     pub loading: bool,
     /// Why the last read failed. The rows the view already holds stay.
     pub failed: Option<String>,
+    /// The loaded reply window has proven a boundary exhausted.
+    older_complete: bool,
+    newer_complete: bool,
     /// The reply query reached its bound: the view must not claim complete
     /// history.
     pub partial: bool,
@@ -576,6 +601,295 @@ impl ThreadView {
     }
 }
 
+/// Where the full-message reader returns. The saved focus is an index
+/// fallback when the bound row is deleted while the reader is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderOrigin {
+    Channel { channel: Uuid, focus: usize },
+    Thread { channel: Uuid, focus: usize },
+    Context { channel: Uuid, focus: usize },
+}
+#[derive(Debug, Clone, Default)]
+pub struct ReaderView {
+    pub open: bool,
+    pub origin: Option<ReaderOrigin>,
+    pub event_id: String,
+    pub row: Option<Row>,
+    /// Offset in source display lines. The renderer clamps it to its current
+    /// viewport, so a resize preserves the source-line anchor.
+    pub scroll: usize,
+    pub notice: Option<String>,
+    pub deleted: bool,
+}
+
+impl ReaderView {
+    pub fn channel(&self) -> Option<Uuid> {
+        self.origin.map(|origin| match origin {
+            ReaderOrigin::Channel { channel, .. }
+            | ReaderOrigin::Thread { channel, .. }
+            | ReaderOrigin::Context { channel, .. } => channel,
+        })
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    /// The conversation search was opened from, thread or composer included.
+    Current,
+    /// Every listed, accessible conversation on this relay.
+    All,
+    /// One conversation chosen from the accessible roster.
+    Conversation(Uuid),
+}
+
+impl SearchScope {
+    /// One `s` or `h`/`l` step inside the filter form. A chosen conversation
+    /// is never part of the cycle: picking one is an explicit choice made in
+    /// the conversation picker, and `s` returns to the simple two-value
+    /// cycle from there.
+    fn next(self) -> Self {
+        match self {
+            Self::Current | Self::Conversation(_) => Self::All,
+            Self::All => Self::Current,
+        }
+    }
+
+    /// The inverse step. A chosen conversation is not part of the cycle, so
+    /// stepping back from it lands on `all` rather than reviving a choice.
+    fn prev(self) -> Self {
+        match self {
+            Self::All => Self::Current,
+            Self::Current | Self::Conversation(_) => Self::All,
+        }
+    }
+}
+
+/// The relative time restriction on a search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTime {
+    All,
+    Days7,
+    Days30,
+}
+
+impl SearchTime {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Days7,
+            Self::Days7 => Self::Days30,
+            Self::Days30 => Self::All,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::All => Self::Days30,
+            Self::Days7 => Self::All,
+            Self::Days30 => Self::Days7,
+        }
+    }
+
+    fn bounds(self, now: u64) -> (Option<u64>, Option<u64>) {
+        let since = match self {
+            Self::All => None,
+            Self::Days7 => Some(now.saturating_sub(7 * 24 * 60 * 60)),
+            Self::Days30 => Some(now.saturating_sub(30 * 24 * 60 * 60)),
+        };
+        (since, Some(now))
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all time",
+            Self::Days7 => "7 days",
+            Self::Days30 => "30 days",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOrigin {
+    Channel { channel: Uuid, focus: usize },
+    Thread { channel: Uuid, focus: usize },
+    Composer { channel: Uuid },
+}
+
+/// One candidate in the author picker. Identity is the full public key; the
+/// display name is a label only, and duplicate names stay distinguishable by
+/// the short key shown beside them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorCandidate {
+    pub pubkey: String,
+    pub name: String,
+}
+
+/// The author picker: known, accessible participant profiles, or an exact
+/// public key typed by hand. The candidate list is never known to be
+/// complete, and the UI says so.
+#[derive(Debug, Clone, Default)]
+pub struct AuthorPick {
+    pub candidates: Vec<AuthorCandidate>,
+    pub focus: usize,
+    /// Typing an exact 64-character public key instead of picking a profile.
+    pub pubkey_mode: bool,
+    pub pubkey_entry: String,
+}
+
+/// The conversation picker behind the `one conversation` scope.
+#[derive(Debug, Clone)]
+pub struct ScopePick {
+    pub options: Vec<Uuid>,
+    pub focus: usize,
+    /// The scope restored when the picker is dismissed.
+    pub previous: SearchScope,
+}
+
+/// Full-screen search state. Results remain stable until an explicit submit,
+/// and filters apply only on that submit.
+#[derive(Debug, Clone)]
+pub struct SearchView {
+    pub open: bool,
+    /// Query text entry. Characters append to `query`; Esc restores the
+    /// applied query.
+    pub editing: bool,
+    pub query: String,
+    pub applied_query: String,
+    pub applied_author: Option<String>,
+    /// The pending author: always a full public key, never a display name.
+    pub author: Option<String>,
+    pub scope: SearchScope,
+    pub time: SearchTime,
+    /// What the results on screen actually answer to. Pending values may
+    /// differ until the next explicit submit.
+    pub applied_scope: SearchScope,
+    pub applied_time: SearchTime,
+    pub origin: Option<SearchOrigin>,
+    /// Parallel to `channels`: one row, one conversation, one index. Both
+    /// are rebuilt together only in `load_search`.
+    pub results: Vec<Row>,
+    pub channels: Vec<Uuid>,
+    pub focus: usize,
+    pub loading: bool,
+    /// The relay returned the requested bound of 50; the visible list is a
+    /// first page, not the total.
+    pub bounded: bool,
+    /// Returned hits hidden here because their conversation is unlisted or
+    /// the event is known deleted. The visible list is then bounded, and the
+    /// state line says so.
+    pub hidden: usize,
+    /// Whose results are on screen while a newer request is in flight or
+    /// failed: a description of the last successful query. Results are never
+    /// cleared because a request failed.
+    pub previous: Option<String>,
+    pub failed: Option<String>,
+    /// The filter form, open while scope/author/time are edited. It replaces
+    /// the results until applied or cancelled.
+    pub form: bool,
+    pub form_row: usize,
+    pub author_pick: Option<AuthorPick>,
+    pub scope_pick: Option<ScopePick>,
+    request: u64,
+}
+
+impl SearchView {
+    /// Which search sub-surface owns the keys right now.
+    pub fn key_mode(&self) -> keys::SearchMode {
+        if self.author_pick.is_some() {
+            keys::SearchMode::AuthorPick
+        } else if self.scope_pick.is_some() {
+            keys::SearchMode::ScopePick
+        } else if self.form {
+            keys::SearchMode::Form
+        } else if self.editing {
+            keys::SearchMode::QueryEdit
+        } else {
+            keys::SearchMode::Results
+        }
+    }
+}
+
+impl Default for SearchView {
+    fn default() -> Self {
+        Self {
+            open: false,
+            editing: true,
+            query: String::new(),
+            applied_query: String::new(),
+            applied_author: None,
+            author: None,
+            scope: SearchScope::Current,
+            time: SearchTime::All,
+            applied_scope: SearchScope::Current,
+            applied_time: SearchTime::All,
+            origin: None,
+            results: Vec::new(),
+            channels: Vec::new(),
+            focus: 0,
+            loading: false,
+            bounded: false,
+            hidden: 0,
+            previous: None,
+            failed: None,
+            form: false,
+            form_row: 0,
+            author_pick: None,
+            scope_pick: None,
+            request: 0,
+        }
+    }
+}
+
+pub struct ContextView {
+    pub open: bool,
+    pub channel: Uuid,
+    pub target: String,
+    pub request: u64,
+    pub rows: Vec<Row>,
+    pub focus: usize,
+    pub loading: bool,
+    pub failed: Option<String>,
+    pub notice: Option<String>,
+    pub before_complete: bool,
+    pub after_complete: bool,
+    pub older_loading: bool,
+    pub newer_loading: bool,
+}
+
+impl Default for ContextView {
+    fn default() -> Self {
+        Self {
+            open: false,
+            channel: Uuid::nil(),
+            target: String::new(),
+            request: 0,
+            rows: Vec::new(),
+            focus: 0,
+            loading: false,
+            failed: None,
+            notice: None,
+            before_complete: false,
+            after_complete: false,
+            older_loading: false,
+            newer_loading: false,
+        }
+    }
+}
+
+impl ContextView {
+    pub fn focused(&self) -> Option<&Row> {
+        self.rows.get(self.focus)
+    }
+}
+
+struct SearchJourney {
+    channel: Uuid,
+    focused: Option<String>,
+    focus: usize,
+    composer: Composer,
+    thread: Option<ThreadView>,
+    thread_return_context: bool,
+    composing: bool,
+}
+
 pub struct App {
     pub me: String,
     pub relay_label: String,
@@ -597,6 +911,10 @@ pub struct App {
     /// were first assigned. A slot is never reused: a number keeps its
     /// conversation for the session, whatever a filter hides.
     shortcuts: Vec<Uuid>,
+    /// The channel picker's local name query. It never changes Inbox state.
+    pub picker_query: String,
+    picker_saved_query: String,
+    pub picker_editing: bool,
     /// The channel picker's state while it is open. Compact layouts open it
     /// with `c`; the picker is the only channel list they show.
     pub picker: Option<Picker>,
@@ -630,10 +948,19 @@ pub struct App {
     pub composer: Composer,
     /// The owned Agents and what the observer feed says about their work.
     pub agents: AgentView,
-    /// The focused thread view. One view at a time: it replaces the channel
-    /// timeline instead of covering it.
+    /// Search and context are inspection surfaces; the normal timeline stays
+    /// behind them and keeps its selection and read rules.
+    pub search: SearchView,
+    pub context: ContextView,
+    /// The full-screen reader bound to one loaded message.
+    pub reader: ReaderView,
     pub thread: ThreadView,
     thread_request: u64,
+    thread_return_context: bool,
+    /// Body rows available to the reader's page controls in the last frame.
+    reader_page_rows: usize,
+    journey: Option<SearchJourney>,
+    context_draft: bool,
     /// A thread draft whose channel closed cannot be sent to the replacement
     /// selection. It is cleared only after the user clears the draft.
     draft_blocked: bool,
@@ -671,6 +998,9 @@ impl App {
             filter: Filter::All,
             views: HashMap::new(),
             shortcuts: Vec::new(),
+            picker_query: String::new(),
+            picker_saved_query: String::new(),
+            picker_editing: false,
             picker: None,
             roster_complete: false,
             inbox_failed: HashSet::new(),
@@ -684,8 +1014,15 @@ impl App {
             status: "connecting".to_owned(),
             composer: Composer::new(),
             agents: AgentView::default(),
+            search: SearchView::default(),
+            context: ContextView::default(),
+            reader: ReaderView::default(),
             thread: ThreadView::default(),
             thread_request: 0,
+            thread_return_context: false,
+            reader_page_rows: PAGE_ROWS,
+            journey: None,
+            context_draft: false,
             draft_blocked: false,
             quit: false,
             exit_code: 0,
@@ -705,6 +1042,10 @@ impl App {
     pub fn take_outbox(&mut self) -> Vec<SessionCommand> {
         std::mem::take(&mut self.outbox)
     }
+    /// Update the reader's body viewport after the current frame is laid out.
+    pub fn set_reader_page_rows(&mut self, body_rows: usize) {
+        self.reader_page_rows = body_rows.max(1);
+    }
 
     /// Report one outcome to the reader. The thread view draws its own status
     /// row over the channel's, so an outcome that belongs to the thread has to
@@ -714,6 +1055,9 @@ impl App {
         if self.thread.open {
             self.thread.notice = Some(message.clone());
         }
+        if self.context.open {
+            self.context.notice = Some(message.clone());
+        }
         self.status = message;
     }
 
@@ -721,6 +1065,8 @@ impl App {
     pub fn overlay(&self) -> keys::Overlay {
         if self.help {
             keys::Overlay::Help
+        } else if self.picker_editing {
+            keys::Overlay::PickerSearch
         } else if self.picker.is_some() {
             keys::Overlay::Picker
         } else if self.agents.open {
@@ -916,7 +1262,9 @@ impl App {
     /// The row the content keys act on: the focused thread row while a thread
     /// is on screen, the focused channel row otherwise.
     fn action_row(&self) -> Option<&Row> {
-        if self.thread.open {
+        if self.context.open {
+            self.context.focused()
+        } else if self.thread.open {
             self.thread.focused()
         } else {
             self.focused_row()
@@ -925,7 +1273,9 @@ impl App {
 
     /// The conversation the content keys act on.
     fn action_channel(&self) -> Option<Uuid> {
-        if self.thread.open {
+        if self.context.open {
+            Some(self.context.channel)
+        } else if self.thread.open {
             Some(self.thread.channel)
         } else {
             self.selected_entry().map(|entry| entry.id)
@@ -937,11 +1287,12 @@ impl App {
         }
     }
 
-    /// One row by event id, in the channel or in the thread on screen.
+    /// One row by event id, in the channel, context, or thread on screen.
     fn row(&self, id: &str) -> Option<&Row> {
         self.channels
             .iter()
             .flat_map(|entry| entry.rows.iter())
+            .chain(self.context.rows.iter())
             .chain(self.thread.rows.iter())
             .find(|row| row.event_id == id)
     }
@@ -970,11 +1321,24 @@ impl App {
         for row in &mut self.thread.rows {
             row.author = author_name(&profiles, &me, &row.pubkey);
         }
+        if let Some(row) = &mut self.reader.row {
+            row.author = author_name(&profiles, &me, &row.pubkey);
+        }
+        for row in &mut self.search.results {
+            row.author = author_name(&profiles, &me, &row.pubkey);
+        }
+        for row in &mut self.context.rows {
+            row.author = author_name(&profiles, &me, &row.pubkey);
+        }
     }
-
-    /// Which timeline the key map is driving, for the key map.
     pub fn surface(&self) -> keys::Surface {
-        if self.thread.open {
+        if self.reader.open {
+            keys::Surface::Reader
+        } else if self.context.open {
+            keys::Surface::Context
+        } else if self.search.open {
+            keys::Surface::Search
+        } else if self.thread.open {
             keys::Surface::Thread
         } else {
             keys::Surface::Channel
@@ -996,8 +1360,10 @@ impl App {
                     // short key where a name belongs.
                     .chain(entry.participants.iter().cloned())
             })
-            // A thread on screen carries authors the channel never loaded:
-            // its root may sit outside the loaded history.
+            // Inspection views can carry events the ordinary channel never
+            // loaded, so their authors need the same profile lookup.
+            .chain(self.search.results.iter().map(|row| row.pubkey.clone()))
+            .chain(self.context.rows.iter().map(|row| row.pubkey.clone()))
             .chain(self.thread.rows.iter().map(|row| row.pubkey.clone()))
             .filter(|pubkey| pubkey != &me && !self.profiles.contains_key(pubkey))
             .collect::<HashSet<String>>()
@@ -1147,6 +1513,82 @@ impl App {
             } => {
                 self.thread_failed(channel, root, request, reason);
             }
+            ChatEvent::Search { request, events } => self.load_search(request, events),
+            ChatEvent::SearchFailed { request, reason } => self.search_failed(request, reason),
+            ChatEvent::Context {
+                channel,
+                target,
+                request,
+                events,
+                before_complete,
+                after_complete,
+            } => self.load_context(
+                channel,
+                target,
+                request,
+                events,
+                before_complete,
+                after_complete,
+            ),
+            ChatEvent::ContextFailed {
+                channel,
+                target,
+                request,
+                reason,
+            } => self.context_failed(channel, target, request, reason),
+            ChatEvent::HistoryPage {
+                surface,
+                channel,
+                root,
+                request,
+                direction,
+                events,
+                saturated,
+            } => self.apply_history_page(
+                HistoryPageRead {
+                    surface,
+                    channel,
+                    root,
+                    request,
+                    direction,
+                    saturated,
+                    events,
+                },
+                now,
+            ),
+            ChatEvent::NewestWindow {
+                surface,
+                channel,
+                root,
+                request,
+                events,
+                saturated,
+            } => self.apply_newest_window(
+                NewestWindowRead {
+                    surface,
+                    channel,
+                    root,
+                    request,
+                    saturated,
+                    events,
+                },
+                now,
+            ),
+            ChatEvent::NewestWindowFailed {
+                surface,
+                channel,
+                root,
+                request,
+                reason,
+            } => self.newest_window_failed(surface, channel, root, request, reason),
+            ChatEvent::HistoryPageFailed {
+                surface,
+                channel,
+                root,
+                request,
+                direction,
+                reason,
+            } => self.history_page_failed(surface, channel, root, request, direction, reason),
             ChatEvent::Profiles(resolved) => {
                 for (pubkey, name) in resolved {
                     self.profiles.insert(pubkey, name);
@@ -1196,6 +1638,46 @@ impl App {
             }
             ChatEvent::Overlay(event) => self.apply_overlay(event),
             ChatEvent::ChannelGone { channel, reason } => {
+                let inspection_revoked = self.search_origin_channel() == Some(channel)
+                    || (self.context.open && self.context.channel == channel);
+                let preserve_inspection_draft =
+                    inspection_revoked && !self.composer.text().is_empty();
+                if inspection_revoked {
+                    self.search = SearchView::default();
+                    self.context = ContextView::default();
+                    self.journey = None;
+                    self.context_draft = false;
+                } else if self.search.open {
+                    let mut results = Vec::with_capacity(self.search.results.len());
+                    let mut result_channels = Vec::with_capacity(self.search.channels.len());
+                    let mut removed = 0;
+                    for (row, result_channel) in self
+                        .search
+                        .results
+                        .drain(..)
+                        .zip(self.search.channels.drain(..))
+                    {
+                        if result_channel == channel {
+                            removed += 1;
+                        } else {
+                            results.push(row);
+                            result_channels.push(result_channel);
+                        }
+                    }
+                    self.search.results = results;
+                    self.search.channels = result_channels;
+                    self.search.hidden += removed;
+                    self.search.focus = self
+                        .search
+                        .focus
+                        .min(self.search.results.len().saturating_sub(1));
+                }
+                if preserve_inspection_draft {
+                    self.draft_blocked = true;
+                }
+                if self.reader.open && self.reader.channel() == Some(channel) {
+                    self.reader = ReaderView::default();
+                }
                 let preserve_thread_draft = self.thread.open && !self.composer.text().is_empty();
                 if preserve_thread_draft {
                     self.draft_blocked = true;
@@ -1216,14 +1698,14 @@ impl App {
                 // exception: keep it visible, but block it from crossing to
                 // the replacement conversation.
                 self.selected = at.min(self.channels.len().saturating_sub(1));
-                if !preserve_thread_draft {
+                if !preserve_thread_draft && !preserve_inspection_draft {
                     self.adopt_draft();
                 }
                 self.refresh_views();
                 self.set_focus(self.focus);
                 self.clamp_picker();
                 self.status = format!("channel closed: {reason}");
-                if preserve_thread_draft {
+                if preserve_thread_draft || preserve_inspection_draft {
                     self.mode = Mode::Composer;
                     self.note(format!("channel closed: {reason}; draft kept"));
                 }
@@ -1510,10 +1992,16 @@ impl App {
     /// and sitting at its latest message. Reading older history, previewing the
     /// picker and a failed load all leave it where it was.
     pub fn note_presented(&mut self) {
-        if self.picker.is_some() || self.help || self.agents.open || self.thread.open {
-            // The list covers the conversation: nothing is being read. A
-            // thread on screen is a different conversation's sub-discussion:
-            // reading it says nothing about the channel's own frontier.
+        if self.picker.is_some()
+            || self.help
+            || self.agents.open
+            || self.thread.open
+            || self.search.open
+            || self.context.open
+            || self.reader.open
+        {
+            // Inspection surfaces never present the ordinary latest timeline:
+            // searching or reading a hit must not advance its channel marker.
             return;
         }
         let Some(entry) = self.channels.get(self.selected) else {
@@ -1689,6 +2177,8 @@ impl App {
                         participants: item.participants.clone(),
                         rows: Vec::new(),
                         seen: HashSet::new(),
+                        older_complete: false,
+                        newer_complete: true,
                         live_ids: HashSet::new(),
                         loading: true,
                         draft: Composer::new(),
@@ -1810,6 +2300,8 @@ impl App {
             participants: Vec::new(),
             rows: Vec::new(),
             seen: HashSet::new(),
+            older_complete: true,
+            newer_complete: true,
             live_ids: HashSet::new(),
             loading: false,
             draft: Composer::default(),
@@ -1857,9 +2349,42 @@ impl App {
     /// where the full list would put it.
     pub fn picker_view(&self) -> Sections {
         let mut view = self.view().clone();
+        let query = self.picker_query.trim().to_lowercase();
+        if !query.is_empty() {
+            let rank = |id: Uuid| {
+                let label = self
+                    .entry(id)
+                    .map(|entry| self.label(entry).to_lowercase())
+                    .unwrap_or_default();
+                if label == query {
+                    0
+                } else if label.starts_with(&query) {
+                    1
+                } else {
+                    2
+                }
+            };
+            view.channels.retain(|id| {
+                self.entry(*id)
+                    .is_some_and(|entry| self.label(entry).to_lowercase().contains(&query))
+            });
+            view.dms.retain(|id| {
+                self.entry(*id)
+                    .is_some_and(|entry| self.label(entry).to_lowercase().contains(&query))
+            });
+            view.channels.sort_by_key(|id| rank(*id));
+            view.dms.sort_by_key(|id| rank(*id));
+        }
         let Some(picker) = &self.picker else {
             return view;
         };
+        if !query.is_empty()
+            && !self
+                .entry(picker.cursor)
+                .is_some_and(|entry| self.label(entry).to_lowercase().contains(&query))
+        {
+            return view;
+        }
         if view.contains(picker.cursor) {
             return view;
         }
@@ -2023,6 +2548,7 @@ impl App {
 
     fn load_history(&mut self, channel: Uuid, events: Vec<nostr::Event>, now: u64) {
         let history_retry = self.history_failed.remove(&channel);
+        let deleted_rows = self.deleted_rows.clone();
         if let Some(ids) = self.aux_seen.remove(&channel) {
             for id in ids {
                 self.seen_aux.remove(&id);
@@ -2047,6 +2573,7 @@ impl App {
             .collect();
         let mut rows: Vec<Row> = events
             .iter()
+            .filter(|event| !deleted_rows.contains(&event.id.to_hex()))
             .map(|e| content::row_from_event(e, &me))
             .collect();
         // The relay returns events in a stable order; the client keeps it,
@@ -2077,6 +2604,8 @@ impl App {
             .map(|r| (r.pubkey.clone(), r.created_at))
             .collect();
         entry.rows = rows;
+        entry.older_complete = false;
+        entry.newer_complete = true;
         entry.loading = false;
         if history_retry {
             // The timeline is repaired, but an earlier failed load may have
@@ -2202,9 +2731,12 @@ impl App {
         self.thread.rows = rows;
         self.thread.loading = false;
         self.thread.loaded = true;
-        self.thread.partial = partial;
-        self.thread.failed = None;
         self.thread.stale = false;
+        self.thread.partial = partial;
+        self.thread.older_complete = !partial;
+        self.thread.newer_complete = true;
+
+        self.thread.failed = None;
         let preferred = if was_loaded {
             previous_focus
         } else {
@@ -2298,6 +2830,1029 @@ impl App {
         self.thread.focus = index.min(self.thread.rows.len() - 1);
     }
 
+    fn begin_search_journey(&mut self, from_composer: bool) {
+        if self.journey.is_some() {
+            return;
+        }
+        let Some(channel) = self.selected_entry().map(|entry| entry.id) else {
+            return;
+        };
+        self.journey = Some(SearchJourney {
+            channel,
+            focused: self.focused_row().map(|row| row.event_id.clone()),
+            focus: self.focus,
+            composer: self.composer.clone(),
+            thread: self.thread.open.then(|| self.thread.clone()),
+            thread_return_context: self.thread_return_context,
+            composing: from_composer,
+        });
+    }
+
+    fn origin_draft_blocks(&self) -> bool {
+        self.journey
+            .as_ref()
+            .is_some_and(|journey| !journey.composer.text().is_empty())
+    }
+
+    fn leave_search_journey(&mut self) {
+        if self.context_draft && !self.composer.text().is_empty() {
+            self.note("Draft kept; Esc back");
+            return;
+        }
+        self.search.open = false;
+        let Some(journey) = self.journey.take() else {
+            return;
+        };
+        let SearchJourney {
+            channel,
+            focused,
+            focus,
+            composer,
+            thread,
+            thread_return_context,
+            composing,
+        } = journey;
+        self.context_draft = false;
+        self.composer = composer;
+        let keep_live_thread = thread.as_ref().is_some_and(|saved| {
+            self.thread.loaded
+                && self.thread.channel == saved.channel
+                && self.thread.root == saved.root
+        });
+        if keep_live_thread {
+            self.thread.open = true;
+        } else {
+            self.thread = thread.unwrap_or_default();
+        }
+        self.thread_return_context = thread_return_context;
+        self.mode = if composing {
+            Mode::Composer
+        } else {
+            Mode::Navigation
+        };
+        let mut saved_message_missing = false;
+        if let Some(index) = self.index_of(channel) {
+            self.selected = index;
+            let restored = focused.as_ref().and_then(|id| {
+                self.channels[index]
+                    .rows
+                    .iter()
+                    .position(|row| row.event_id == *id)
+            });
+            self.focus = restored
+                .unwrap_or_else(|| focus.min(self.channels[index].rows.len().saturating_sub(1)));
+            saved_message_missing = focused.is_some() && restored.is_none();
+        } else {
+            self.draft_blocked = !self.composer.text().is_empty();
+            self.note("Original conversation is no longer accessible");
+        }
+        if saved_message_missing {
+            self.note("Original message was deleted; returned to nearest row");
+        }
+    }
+    fn open_search(&mut self, from_composer: bool, now: u64) {
+        if self.search.open || self.context.open {
+            return;
+        }
+        let Some(channel) = self.action_channel() else {
+            self.note("no conversation to search");
+            return;
+        };
+        if from_composer
+            && (self.thread.send_pending()
+                || self
+                    .pending
+                    .values()
+                    .any(|op| matches!(op, PendingOp::Send { .. })))
+        {
+            self.note("wait for the pending write before searching");
+            return;
+        }
+        self.help = false;
+        self.picker = None;
+        self.picker_editing = false;
+        self.agents.open = false;
+        // The search surface owns the keys while it is open; the composer
+        // mode it was opened from is restored by the origin on Esc.
+        self.mode = Mode::Navigation;
+        self.search.open = true;
+        self.search.editing = true;
+        self.search.query.clear();
+        self.search.applied_query.clear();
+        self.search.applied_author = None;
+        self.search.author = None;
+        self.search.scope = SearchScope::Current;
+        self.search.time = SearchTime::All;
+        self.search.applied_scope = SearchScope::Current;
+        self.search.applied_time = SearchTime::All;
+        self.search.results.clear();
+        self.search.channels.clear();
+        self.search.focus = 0;
+        self.search.loading = false;
+        self.search.bounded = false;
+        self.search.hidden = 0;
+        self.search.previous = None;
+        self.search.failed = None;
+        self.search.form = false;
+        self.search.form_row = 0;
+        self.search.author_pick = None;
+        self.search.scope_pick = None;
+        self.search.origin = Some(if from_composer {
+            SearchOrigin::Composer { channel }
+        } else if self.thread.open {
+            SearchOrigin::Thread {
+                channel,
+                focus: self.thread.focus,
+            }
+        } else {
+            SearchOrigin::Channel {
+                channel,
+                focus: self.focus,
+            }
+        });
+        self.begin_search_journey(from_composer);
+        self.status = format!(
+            "searching in {} · type a keyword, Enter submit",
+            self.label_for(channel)
+        );
+        let _ = now;
+    }
+
+    pub fn label_for(&self, channel: Uuid) -> String {
+        self.entry(channel)
+            .map(|entry| self.label(entry))
+            .unwrap_or_else(|| channel.to_string())
+    }
+
+    /// A short label for one scope value: the conversation name for the
+    /// current and chosen scopes, `all accessible` for the whole roster.
+    pub fn search_scope_label(&self, scope: SearchScope) -> String {
+        match scope {
+            SearchScope::Current => self
+                .search_origin_channel()
+                .map(|channel| self.label_for(channel))
+                .unwrap_or_else(|| "current".to_owned()),
+            SearchScope::All => "all accessible".to_owned(),
+            SearchScope::Conversation(id) => self.label_for(id),
+        }
+    }
+
+    /// The author as a display label with the short public key that keeps
+    /// duplicate names distinguishable. Display text alone is never an
+    /// identity filter, so the key always travels with the name.
+    pub fn author_label(&self, pubkey: &str) -> String {
+        format!(
+            "{} ({})",
+            author_name(&self.profiles, &self.me, pubkey),
+            content::short_pubkey(pubkey)
+        )
+    }
+
+    fn search_origin_channel(&self) -> Option<Uuid> {
+        self.search.origin.map(|origin| match origin {
+            SearchOrigin::Channel { channel, .. }
+            | SearchOrigin::Thread { channel, .. }
+            | SearchOrigin::Composer { channel } => channel,
+        })
+    }
+
+    /// What the current applied query is called in a `previous query` note.
+    fn describe_search(&self, query: &str, author: Option<&str>) -> String {
+        match (query.is_empty(), author) {
+            (true, None) => "empty".to_owned(),
+            (true, Some(author)) => format!("by {}", self.author_label(author)),
+            (false, None) => format!("“{query}”"),
+            (false, Some(author)) => format!("“{query}” by {}", self.author_label(author)),
+        }
+    }
+
+    fn submit_search(&mut self, now: u64) {
+        // An explicit submission leaves every editing surface at once.
+        self.search.editing = false;
+        self.search.form = false;
+        self.search.author_pick = None;
+        self.search.scope_pick = None;
+        let channel = match self.search.scope {
+            SearchScope::Current => self.search_origin_channel(),
+            SearchScope::All => None,
+            SearchScope::Conversation(id) => {
+                if !self.channels.iter().any(|entry| entry.id == id) {
+                    // An unsupported scope is reported and kept, never
+                    // silently broadened to the whole roster.
+                    self.search.failed =
+                        Some("the chosen conversation is no longer accessible".to_owned());
+                    return;
+                }
+                Some(id)
+            }
+        };
+        let query = self.search.query.trim().to_owned();
+        if query.is_empty() && self.search.author.is_none() {
+            // An invitation to type, never a load of the entire archive.
+            self.search.failed = Some("enter a keyword or an exact author".to_owned());
+            return;
+        }
+        let (since, until) = self.search.time.bounds(now);
+        self.search.request = self.search.request.wrapping_add(1);
+        // The results on screen still belong to the previous successful
+        // query until this one answers; they stay visible and labeled
+        // through a failure.
+        if self.search.previous.is_none() && !self.search.results.is_empty() {
+            self.search.previous = Some(self.describe_search(
+                &self.search.applied_query,
+                self.search.applied_author.as_deref(),
+            ));
+        }
+        self.search.applied_query = self.search.query.clone();
+        self.search.applied_author = self.search.author.clone();
+        self.search.applied_scope = self.search.scope;
+        self.search.applied_time = self.search.time;
+        self.search.failed = None;
+        self.search.loading = true;
+        self.outbox.push(SessionCommand::Search {
+            request: crate::client::SearchRequest {
+                query,
+                channel,
+                author: self.search.author.clone(),
+                since,
+                until,
+            },
+            token: self.search.request,
+        });
+    }
+
+    fn search_focus(&mut self, step: isize) {
+        if self.search.results.is_empty() {
+            return;
+        }
+        let max = self.search.results.len() - 1;
+        self.search.focus = (self.search.focus as isize + step).clamp(0, max as isize) as usize;
+    }
+
+    /// Drop one search result by event identity. `search.channels` stays
+    /// index-aligned with `search.results`: a deletion overlay removes the
+    /// hit here so a known deleted event is never shown as a result.
+    fn remove_search_row(&mut self, event_id: &str) {
+        let Some(index) = self
+            .search
+            .results
+            .iter()
+            .position(|row| row.event_id == event_id)
+        else {
+            return;
+        };
+        self.search.results.remove(index);
+        if index < self.search.channels.len() {
+            self.search.channels.remove(index);
+        }
+        if index < self.search.focus {
+            self.search.focus -= 1;
+        }
+        if self.search.focus >= self.search.results.len() {
+            self.search.focus = self.search.results.len().saturating_sub(1);
+        }
+    }
+
+    fn open_context_from_search(&mut self) {
+        let Some(row) = self.search.results.get(self.search.focus).cloned() else {
+            self.status = "no search result selected".to_owned();
+            return;
+        };
+        let Some(channel) = self.search.channels.get(self.search.focus).copied() else {
+            self.status = "search result is no longer accessible".to_owned();
+            return;
+        };
+        if !self.channels.iter().any(|entry| entry.id == channel) {
+            self.remove_search_row(&row.event_id);
+            self.status = "search result is no longer accessible".to_owned();
+            return;
+        }
+        if !is_event_id(&row.event_id) {
+            self.status = "search result is not a confirmed event".to_owned();
+            return;
+        }
+        self.thread_request = self.thread_request.wrapping_add(1);
+        self.context = ContextView {
+            open: true,
+            channel,
+            target: row.event_id.clone(),
+            request: self.thread_request,
+            rows: Vec::new(),
+            focus: 0,
+            loading: true,
+            failed: None,
+            notice: None,
+            before_complete: false,
+            after_complete: false,
+            older_loading: false,
+            newer_loading: false,
+        };
+        self.search.open = false;
+        self.outbox.push(SessionCommand::OpenContext {
+            channel,
+            target: row.event_id,
+            request: self.context.request,
+        });
+    }
+
+    fn context_focus(&mut self, index: usize) {
+        if !self.context.rows.is_empty() {
+            self.context.focus = index.min(self.context.rows.len() - 1);
+        }
+    }
+
+    fn request_context_page(&mut self, direction: HistoryDirection) -> bool {
+        if !self.context.open
+            || self.context.rows.is_empty()
+            || self.context.loading
+            || self.context.older_loading
+            || self.context.newer_loading
+        {
+            return false;
+        }
+        if matches!(direction, HistoryDirection::Older) && self.context.before_complete {
+            return false;
+        }
+        if matches!(direction, HistoryDirection::Newer) && self.context.after_complete {
+            return false;
+        }
+        let loading = match direction {
+            HistoryDirection::Older => &mut self.context.older_loading,
+            HistoryDirection::Newer => &mut self.context.newer_loading,
+        };
+        let cursor = match direction {
+            HistoryDirection::Older => self.context.rows.first().map(|row| row.created_at),
+            HistoryDirection::Newer => self.context.rows.last().map(|row| row.created_at),
+        };
+        let Some(cursor) = cursor else {
+            return false;
+        };
+        self.thread_request = self.thread_request.wrapping_add(1);
+        self.context.request = self.thread_request;
+        *loading = true;
+        self.outbox.push(SessionCommand::HistoryPage {
+            surface: HistorySurface::Context,
+            channel: self.context.channel,
+            root: None,
+            request: self.context.request,
+            direction,
+            cursor,
+        });
+        true
+    }
+
+    fn context_step(&mut self, step: isize) {
+        if self.context.rows.is_empty() {
+            return;
+        }
+        if step > 0 && self.context.focus + 1 >= self.context.rows.len() {
+            if !self.request_context_page(HistoryDirection::Newer) {
+                self.context_focus(usize::MAX);
+            }
+            return;
+        }
+        if step < 0 && self.context.focus == 0 {
+            if !self.request_context_page(HistoryDirection::Older) {
+                self.context_focus(0);
+            }
+            return;
+        }
+        self.context_focus((self.context.focus as isize + step).max(0) as usize);
+    }
+
+    fn context_reply(&mut self) {
+        let Some(row) = self.context.focused().cloned() else {
+            return;
+        };
+        if self.origin_draft_blocks() {
+            self.note("Draft kept; Esc back");
+            return;
+        }
+        if self.context_draft && !self.composer.text().is_empty() {
+            self.mode = Mode::Composer;
+            return;
+        }
+        let Some(index) = self.index_of(self.context.channel) else {
+            self.note("conversation is no longer accessible");
+            return;
+        };
+        if index != self.selected && !self.channels[index].draft.text().is_empty() {
+            self.note("Draft kept; Esc back");
+            return;
+        }
+        if index != self.selected {
+            self.save_draft();
+            self.selected = index;
+            self.adopt_draft();
+        }
+        self.context_draft = true;
+        self.composer.edit = None;
+        self.composer.reply = Some(ReplyTarget {
+            event_id: row.event_id,
+            author: row.author,
+        });
+        self.mode = Mode::Composer;
+    }
+
+    fn open_context_thread(&mut self) {
+        let Some(row) = self.context.focused().cloned() else {
+            return;
+        };
+        if self.context_draft && !self.composer.text().is_empty() {
+            self.note(DRAFT_BLOCKED);
+            return;
+        }
+        let root = row.root_id.clone().unwrap_or_else(|| row.event_id.clone());
+        self.thread_request = self.thread_request.wrapping_add(1);
+        self.thread_return_context = true;
+        self.context.open = false;
+        self.thread = ThreadView {
+            open: true,
+            channel: self.context.channel,
+            root: root.clone(),
+            request: self.thread_request,
+            entered: row.event_id,
+            rows: Vec::new(),
+            focus: 0,
+            loading: true,
+            failed: None,
+            partial: false,
+            older_complete: false,
+            newer_complete: true,
+            root_deleted: false,
+            notice: None,
+            loaded: false,
+            stale: self.conn != ConnState::Connected,
+            live_ids: HashSet::new(),
+            deleted: HashSet::new(),
+            pending_writes: HashSet::new(),
+            buffered_overlays: Vec::new(),
+            saved_row: None,
+            saved_index: self.context.focus,
+        };
+        self.outbox.push(SessionCommand::OpenThread {
+            channel: self.thread.channel,
+            root,
+            request: self.thread.request,
+        });
+    }
+
+    /// Open the loaded, confirmed focused row without changing read progress.
+    fn open_reader(&mut self) {
+        if self.reader.open {
+            return;
+        }
+        let selected = if self.context.open {
+            self.context.focused().map(|row| {
+                (
+                    ReaderOrigin::Context {
+                        channel: self.context.channel,
+                        focus: self.context.focus,
+                    },
+                    row.clone(),
+                )
+            })
+        } else if self.thread.open {
+            self.thread.focused().map(|row| {
+                (
+                    ReaderOrigin::Thread {
+                        channel: self.thread.channel,
+                        focus: self.thread.focus,
+                    },
+                    row.clone(),
+                )
+            })
+        } else {
+            self.focused_row().and_then(|row| {
+                self.selected_entry().map(|entry| {
+                    (
+                        ReaderOrigin::Channel {
+                            channel: entry.id,
+                            focus: self.focus,
+                        },
+                        row.clone(),
+                    )
+                })
+            })
+        };
+        let (origin, row) = selected.unzip();
+        let Some((origin, row)) = origin.zip(row) else {
+            self.note("no message to read");
+            return;
+        };
+        if row.pending {
+            self.note("Wait for confirmation");
+            return;
+        }
+        if row.uncertain {
+            self.note("Unconfirmed message");
+            return;
+        }
+        if !is_event_id(&row.event_id) {
+            self.note("Wait for confirmation");
+            return;
+        }
+        self.help = false;
+        self.picker = None;
+        self.agents.open = false;
+        self.reader = ReaderView {
+            open: true,
+            origin: Some(origin),
+            event_id: row.event_id.clone(),
+            row: Some(row),
+            scroll: 0,
+            notice: None,
+            deleted: false,
+        };
+    }
+
+    /// Return to the exact origin surface without presenting a new row.
+    fn close_reader(&mut self) {
+        if !self.reader.open {
+            return;
+        }
+        let reader = std::mem::take(&mut self.reader);
+        let notice = reader.notice;
+        let Some(origin) = reader.origin else {
+            return;
+        };
+        match origin {
+            ReaderOrigin::Channel { channel, focus } => {
+                if let Some(index) = self.channels.iter().position(|entry| entry.id == channel) {
+                    self.selected = index;
+                    let selected = &self.channels[index];
+                    self.focus = reader
+                        .event_id
+                        .is_empty()
+                        .then_some(focus)
+                        .or_else(|| {
+                            selected
+                                .rows
+                                .iter()
+                                .position(|row| row.event_id == reader.event_id)
+                        })
+                        .unwrap_or_else(|| focus.min(selected.rows.len().saturating_sub(1)));
+                }
+            }
+            ReaderOrigin::Thread { focus, .. } => {
+                if self.thread.open {
+                    self.thread.focus = self
+                        .thread
+                        .rows
+                        .iter()
+                        .position(|row| row.event_id == reader.event_id)
+                        .unwrap_or_else(|| focus.min(self.thread.rows.len().saturating_sub(1)));
+                }
+            }
+            ReaderOrigin::Context { focus, .. } => {
+                if self.context.open {
+                    self.context.focus = self
+                        .context
+                        .rows
+                        .iter()
+                        .position(|row| row.event_id == reader.event_id)
+                        .unwrap_or_else(|| focus.min(self.context.rows.len().saturating_sub(1)));
+                }
+            }
+        }
+        if let Some(notice) = notice {
+            self.status = notice;
+        }
+    }
+
+    fn reader_reply(&mut self) {
+        if !self.reader.open {
+            return;
+        }
+        if self.origin_draft_blocks() || !self.composer.text().is_empty() {
+            self.reader.notice = Some("Draft kept; Esc back".to_owned());
+            self.status = "Draft kept; Esc back".to_owned();
+            return;
+        }
+        if self.reader.deleted {
+            self.note("Message deleted");
+            return;
+        }
+        let Some(row) = self.reader.row.clone() else {
+            self.note("Message deleted");
+            return;
+        };
+        let target = ReplyTarget {
+            event_id: row.event_id,
+            author: row.author,
+        };
+        self.close_reader();
+        if self.context.open {
+            self.context_reply();
+            return;
+        }
+        if self.thread_return_context {
+            self.thread_compose(false);
+            return;
+        }
+        self.composer.edit = None;
+        self.composer.reply = Some(target);
+        self.mode = Mode::Composer;
+    }
+    fn handle_search(&mut self, action: Action, now: u64) {
+        if self.help {
+            match action {
+                Action::Dismiss | Action::ToggleHelp => self.help = false,
+                Action::HelpScroll(step) => {
+                    self.help_scroll = self.help_scroll.saturating_add_signed(step as i16)
+                }
+                Action::Quit => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
+        if self.search.author_pick.is_some() {
+            self.handle_author_pick(action);
+            return;
+        }
+        if self.search.scope_pick.is_some() {
+            self.handle_scope_pick(action);
+            return;
+        }
+        if self.search.form {
+            self.handle_filter_form(action, now);
+            return;
+        }
+        if self.search.editing {
+            match action {
+                Action::SearchInput(c) => self.search.query.push(c),
+                Action::SearchBackspace => {
+                    self.search.query.pop();
+                }
+                Action::SearchSubmit => self.submit_search(now),
+                Action::Dismiss => {
+                    // Editing never destroys the applied query: Esc restores
+                    // it, together with the applied author.
+                    self.search.query = self.search.applied_query.clone();
+                    self.search.author = self.search.applied_author.clone();
+                    self.search.editing = false;
+                }
+                Action::Quit => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
+        match action {
+            Action::SearchInput('s') => self.search.scope = self.search.scope.next(),
+            Action::SearchInput('t') => self.search.time = self.search.time.next(),
+            Action::SearchNext => self.search_focus(1),
+            Action::SearchPrev => self.search_focus(-1),
+            Action::SearchEdit => self.search.editing = true,
+            Action::SearchFilter => self.open_filter_form(),
+            Action::SearchSubmit => {
+                if self.search.failed.is_some() {
+                    // A failed read is retryable; query and filters are kept.
+                    self.submit_search(now);
+                } else {
+                    self.open_context_from_search();
+                }
+            }
+            Action::ToggleHelp => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
+            Action::Quit => self.quit = true,
+            Action::Dismiss => self.leave_search_journey(),
+            _ => {}
+        }
+    }
+
+    fn open_filter_form(&mut self) {
+        self.search.form = true;
+        self.search.form_row = 0;
+        self.search.author_pick = None;
+        self.search.scope_pick = None;
+    }
+
+    /// A cancelled form restores the applied filters. Nothing was submitted,
+    /// so nothing about the visible results changes.
+    fn cancel_filter_form(&mut self) {
+        self.search.scope = self.search.applied_scope;
+        self.search.time = self.search.applied_time;
+        self.search.author = self.search.applied_author.clone();
+        self.search.form = false;
+        self.search.author_pick = None;
+        self.search.scope_pick = None;
+    }
+
+    fn handle_filter_form(&mut self, action: Action, now: u64) {
+        match action {
+            Action::SearchNext => self.search.form_row = (self.search.form_row + 1).min(2),
+            Action::SearchPrev => self.search.form_row = self.search.form_row.saturating_sub(1),
+            Action::SearchSubmit => self.submit_search(now),
+            Action::Dismiss => self.cancel_filter_form(),
+            Action::Quit => self.quit = true,
+            Action::SearchInput(c) => match c {
+                'j' => self.search.form_row = (self.search.form_row + 1).min(2),
+                'k' => self.search.form_row = self.search.form_row.saturating_sub(1),
+                'h' => self.form_adjust(false),
+                'l' => self.form_adjust(true),
+                's' => self.search.scope = self.search.scope.next(),
+                't' => self.search.time = self.search.time.next(),
+                'a' => self.open_author_pick(),
+                'o' => self.open_scope_pick(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// `h`/`l` on the focused control: change its value without leaving the
+    /// form. Filters still apply only when the form is submitted.
+    fn form_adjust(&mut self, forward: bool) {
+        match self.search.form_row {
+            0 => {
+                self.search.scope = if forward {
+                    self.search.scope.next()
+                } else {
+                    self.search.scope.prev()
+                };
+            }
+            1 => {
+                if forward {
+                    self.open_author_pick();
+                } else {
+                    self.search.author = None;
+                }
+            }
+            _ => {
+                self.search.time = if forward {
+                    self.search.time.next()
+                } else {
+                    self.search.time.prev()
+                };
+            }
+        }
+    }
+
+    /// The author picker over known, accessible participants. The relay
+    /// never hands over a complete participant list, so the picker shows
+    /// every author the session has seen in listed conversations plus the
+    /// profiles it knows, and labels itself as incomplete.
+    fn open_author_pick(&mut self) {
+        let mut candidates: Vec<AuthorCandidate> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let me = self.me.clone();
+        let mut push = |pubkey: &str| {
+            if pubkey == me || !seen.insert(pubkey.to_owned()) {
+                return;
+            }
+            let name = author_name(&self.profiles, &self.me, pubkey);
+            candidates.push(AuthorCandidate {
+                pubkey: pubkey.to_owned(),
+                name,
+            });
+        };
+        for entry in &self.channels {
+            for pubkey in &entry.participants {
+                push(pubkey);
+            }
+            for row in &entry.rows {
+                push(&row.pubkey);
+            }
+        }
+        for pubkey in self.profiles.keys() {
+            push(pubkey);
+        }
+        candidates.sort_by(|a, b| a.name.cmp(&b.name).then(a.pubkey.cmp(&b.pubkey)));
+        self.search.author_pick = Some(AuthorPick {
+            candidates,
+            focus: 0,
+            pubkey_mode: false,
+            pubkey_entry: String::new(),
+        });
+    }
+
+    fn handle_author_pick(&mut self, action: Action) {
+        let pubkey_mode = self
+            .search
+            .author_pick
+            .as_ref()
+            .is_some_and(|pick| pick.pubkey_mode);
+        match action {
+            Action::SearchNext if !pubkey_mode => {
+                if let Some(pick) = self.search.author_pick.as_mut() {
+                    let max = pick.candidates.len().saturating_sub(1);
+                    pick.focus = (pick.focus + 1).min(max);
+                }
+            }
+            Action::SearchPrev if !pubkey_mode => {
+                if let Some(pick) = self.search.author_pick.as_mut() {
+                    pick.focus = pick.focus.saturating_sub(1);
+                }
+            }
+            Action::SearchInput('p') if !pubkey_mode => {
+                if let Some(pick) = self.search.author_pick.as_mut() {
+                    pick.pubkey_mode = true;
+                }
+            }
+            Action::SearchInput(c) if pubkey_mode => {
+                if let Some(pick) = self.search.author_pick.as_mut() {
+                    pick.pubkey_entry.push(c);
+                }
+            }
+            Action::SearchBackspace if pubkey_mode => {
+                if let Some(pick) = self.search.author_pick.as_mut() {
+                    pick.pubkey_entry.pop();
+                }
+            }
+            Action::SearchSubmit => self.confirm_author_pick(),
+            Action::Dismiss => self.search.author_pick = None,
+            _ => {}
+        }
+    }
+
+    /// Selecting a candidate stores its full public key. A typed entry must
+    /// be a whole 64-character public key: a partial key is an error to
+    /// report, never an identity to guess.
+    fn confirm_author_pick(&mut self) {
+        let Some(pick) = self.search.author_pick.as_ref() else {
+            return;
+        };
+        let author = if pick.pubkey_mode {
+            let entry = pick.pubkey_entry.trim().to_owned();
+            if entry.len() != 64 || !entry.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                self.search.failed =
+                    Some("author must be a 64-character hex public key".to_owned());
+                return;
+            }
+            entry
+        } else {
+            let Some(candidate) = pick.candidates.get(pick.focus) else {
+                return;
+            };
+            candidate.pubkey.clone()
+        };
+        self.search.author_pick = None;
+        self.search.author = Some(author);
+    }
+
+    fn open_scope_pick(&mut self) {
+        let options: Vec<Uuid> = self.channels.iter().map(|entry| entry.id).collect();
+        let previous = self.search.scope;
+        // The cursor starts on the conversation the scope already points at,
+        // or on the one search was opened from.
+        let chosen = match self.search.scope {
+            SearchScope::Conversation(id) => Some(id),
+            _ => self.search_origin_channel(),
+        };
+        let focus = chosen
+            .and_then(|id| options.iter().position(|option| *option == id))
+            .unwrap_or(0);
+        self.search.scope_pick = Some(ScopePick {
+            options,
+            focus,
+            previous,
+        });
+    }
+
+    fn handle_scope_pick(&mut self, action: Action) {
+        match action {
+            Action::SearchNext => {
+                if let Some(pick) = self.search.scope_pick.as_mut() {
+                    let max = pick.options.len().saturating_sub(1);
+                    pick.focus = (pick.focus + 1).min(max);
+                }
+            }
+            Action::SearchPrev => {
+                if let Some(pick) = self.search.scope_pick.as_mut() {
+                    pick.focus = pick.focus.saturating_sub(1);
+                }
+            }
+            Action::SearchSubmit => {
+                let chosen = self
+                    .search
+                    .scope_pick
+                    .as_ref()
+                    .and_then(|pick| pick.options.get(pick.focus).copied());
+                self.search.scope_pick = None;
+                if let Some(id) = chosen {
+                    self.search.scope = SearchScope::Conversation(id);
+                }
+            }
+            Action::Dismiss => {
+                let previous = self
+                    .search
+                    .scope_pick
+                    .as_ref()
+                    .map(|pick| pick.previous)
+                    .unwrap_or(self.search.applied_scope);
+                self.search.scope_pick = None;
+                self.search.scope = previous;
+            }
+            Action::Quit => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn handle_context(&mut self, action: Action) {
+        if self.help {
+            match action {
+                Action::Dismiss | Action::ToggleHelp => self.help = false,
+                Action::HelpScroll(step) => {
+                    self.help_scroll = self.help_scroll.saturating_add_signed(step as i16)
+                }
+                Action::Quit => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
+        match action {
+            Action::Quit => self.quit = true,
+            Action::ToggleHelp => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
+            Action::NextRow | Action::ContextNext => self.context_step(1),
+            Action::PrevRow | Action::ContextPrev => self.context_step(-1),
+            Action::Top | Action::ContextTop => self.context_focus(0),
+            Action::Bottom | Action::ContextBottom => {
+                if !self.request_newest_window(HistorySurface::Context) && !self.context.loading {
+                    self.context_focus(usize::MAX);
+                }
+            }
+            Action::PageUp | Action::ContextPageUp => {
+                self.context_focus(self.context.focus.saturating_sub(PAGE_ROWS))
+            }
+            Action::PageDown | Action::ContextPageDown => {
+                self.context_focus(self.context.focus.saturating_add(PAGE_ROWS))
+            }
+            Action::ContextOpenReader => self.open_reader(),
+            Action::ContextOpenThread => self.open_context_thread(),
+            Action::ContextReply | Action::ComposeReply => self.context_reply(),
+            Action::ContextLoadOlder => {
+                self.request_context_page(HistoryDirection::Older);
+            }
+            Action::ContextLoadNewer => {
+                self.request_context_page(HistoryDirection::Newer);
+            }
+            Action::ContextLeave | Action::Dismiss => {
+                if self.context_draft && !self.composer.text().is_empty() {
+                    self.note("Draft kept; Esc back");
+                    return;
+                }
+                if self
+                    .pending
+                    .values()
+                    .any(|op| matches!(op, PendingOp::Send { .. }))
+                {
+                    self.note("Wait for send result");
+                    return;
+                }
+                self.context.open = false;
+                self.search.open = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_reader(&mut self, action: Action) {
+        match action {
+            Action::Dismiss => {
+                if self.help {
+                    self.help = false;
+                } else {
+                    self.close_reader();
+                }
+            }
+            Action::Quit => self.quit = true,
+            Action::ToggleHelp => {
+                self.help = !self.help;
+                if self.help {
+                    self.help_scroll = 0;
+                }
+            }
+            Action::HelpScroll(step) => {
+                self.help_scroll = self.help_scroll.saturating_add_signed(step as i16);
+            }
+            Action::ReaderNextLine => {
+                self.reader.scroll = self.reader.scroll.saturating_add(1);
+            }
+            Action::ReaderPageUp => {
+                self.reader.scroll = self
+                    .reader
+                    .scroll
+                    .saturating_sub(self.reader_page_rows.saturating_sub(1).max(1));
+            }
+            Action::ReaderPageDown => {
+                self.reader.scroll = self
+                    .reader
+                    .scroll
+                    .saturating_add(self.reader_page_rows.saturating_sub(1).max(1));
+            }
+            Action::ReaderTop => self.reader.scroll = 0,
+            Action::ReaderBottom => self.reader.scroll = usize::MAX,
+            Action::ReaderReply => self.reader_reply(),
+            Action::ReaderClose => self.close_reader(),
+            _ => {}
+        }
+    }
+
     /// `t` in the channel timeline: open the focused message's thread. A
     /// top-level message is its own root; a reply names the root it belongs
     /// to, which may sit outside the loaded channel history.
@@ -2342,6 +3897,8 @@ impl App {
             loading: true,
             failed: None,
             partial: false,
+            older_complete: false,
+            newer_complete: true,
             root_deleted: false,
             notice: None,
             loaded: false,
@@ -2366,7 +3923,9 @@ impl App {
         if !self.thread.open {
             return;
         }
-        if !self.composer.text().is_empty() {
+        if !self.composer.text().is_empty()
+            && !(self.thread_return_context && self.origin_draft_blocks())
+        {
             // Leaving with a draft would either lose it or send it somewhere
             // else; the reader clears it with the ordinary editor instead.
             self.note(DRAFT_BLOCKED);
@@ -2376,10 +3935,18 @@ impl App {
             self.note("Wait for send result");
             return;
         }
+        if self.thread_return_context {
+            self.thread_return_context = false;
+            self.thread.open = false;
+            self.context.open = true;
+            return;
+        }
         // An empty buffer leaves no thread-only target behind: the next
         // channel composition cannot inherit a thread reply or edit.
         self.composer.reply = None;
         self.composer.edit = None;
+        let return_context = self.thread_return_context;
+        self.thread_return_context = false;
         self.thread.open = false;
         self.thread.loading = false;
         self.thread.notice = None;
@@ -2396,7 +3963,60 @@ impl App {
         }
         // From here the ordinary channel presentation rules decide when read
         // progress advances.
+        if return_context {
+            self.context.open = true;
+        }
         self.set_focus(self.focus);
+    }
+    fn request_thread_page(&mut self, direction: HistoryDirection) -> bool {
+        if !self.thread.open
+            || self.thread.loading
+            || self.thread.rows.len() <= 1
+            || match direction {
+                HistoryDirection::Older => self.thread.older_complete,
+                HistoryDirection::Newer => self.thread.newer_complete,
+            }
+        {
+            return false;
+        }
+        let cursor = match direction {
+            HistoryDirection::Older => self.thread.rows.get(1).map(|row| row.created_at),
+            HistoryDirection::Newer => self.thread.rows.last().map(|row| row.created_at),
+        };
+        let Some(cursor) = cursor else {
+            return false;
+        };
+        self.thread_request = self.thread_request.wrapping_add(1);
+        self.thread.request = self.thread_request;
+        self.thread.loading = true;
+        self.outbox.push(SessionCommand::HistoryPage {
+            surface: HistorySurface::Thread,
+            channel: self.thread.channel,
+            root: Some(self.thread.root.clone()),
+            request: self.thread.request,
+            direction,
+            cursor,
+        });
+        true
+    }
+
+    fn thread_step(&mut self, step: isize) {
+        if self.thread.rows.is_empty() {
+            return;
+        }
+        if step > 0 && self.thread.focus + 1 >= self.thread.rows.len() {
+            if !self.request_thread_page(HistoryDirection::Newer) {
+                self.thread_focus(usize::MAX);
+            }
+            return;
+        }
+        if step < 0 && self.thread.focus <= 1 {
+            if !self.request_thread_page(HistoryDirection::Older) {
+                self.thread_focus(0);
+            }
+            return;
+        }
+        self.thread_focus((self.thread.focus as isize + step).max(0) as usize);
     }
 
     /// `t` inside a thread: retry a read that failed. It never retries a
@@ -2414,6 +4034,20 @@ impl App {
         if !self.thread.open || !self.thread.loaded {
             // Content-targeted actions wait for the first read: a row that is
             // not loaded cannot be replied to.
+            return;
+        }
+        if self.origin_draft_blocks()
+            || (self.thread_return_context
+                && self.thread.channel
+                    != self
+                        .selected_entry()
+                        .map(|entry| entry.id)
+                        .unwrap_or_default()
+                && self
+                    .entry(self.thread.channel)
+                    .is_some_and(|entry| !entry.draft.text().is_empty()))
+        {
+            self.note("Draft kept; Esc back");
             return;
         }
         // A draft already in the buffer keeps its own destination: none of
@@ -2442,6 +4076,9 @@ impl App {
             event_id: row.event_id.clone(),
             author: row.author.clone(),
         };
+        if self.thread_return_context {
+            self.context_draft = true;
+        }
         self.thread.notice = None;
         self.composer.edit = None;
         self.composer.reply = Some(target);
@@ -2486,13 +4123,22 @@ impl App {
                     self.help = false;
                 }
             }
-            Action::NextRow => self.thread_focus(self.thread.focus.saturating_add(1)),
-            Action::PrevRow => self.thread_focus(self.thread.focus.saturating_sub(1)),
             Action::Top => self.thread_focus(0),
-            Action::Bottom => self.thread_focus(usize::MAX),
-            Action::PageUp => self.thread_focus(self.thread.focus.saturating_sub(PAGE_ROWS)),
-            Action::PageDown => self.thread_focus(self.thread.focus.saturating_add(PAGE_ROWS)),
+            Action::Bottom => {
+                if !self.request_newest_window(HistorySurface::Thread) && !self.thread.loading {
+                    self.thread_focus(usize::MAX);
+                }
+            }
+            Action::NextRow => self.thread_step(1),
+            Action::PrevRow => self.thread_step(-1),
+            Action::ContextLoadOlder => {
+                self.request_thread_page(HistoryDirection::Older);
+            }
+            Action::ContextLoadNewer => {
+                self.request_thread_page(HistoryDirection::Newer);
+            }
             Action::ThreadLeave => self.leave_thread(),
+            Action::OpenReader => self.open_reader(),
             Action::ThreadRetry => self.retry_thread(),
             Action::ThreadReplyRoot => self.thread_compose(true),
             Action::ThreadReplyFocused => self.thread_compose(false),
@@ -2517,16 +4163,563 @@ impl App {
         self.refresh_views();
     }
 
+    fn load_search(&mut self, request: u64, events: Vec<nostr::Event>) {
+        // A response that does not name the current request is stale: a
+        // later query's results can never be overwritten by an earlier one.
+        if !self.search.open || self.search.request != request {
+            return;
+        }
+        // Selection is an event identity, not an index: after the list is
+        // replaced, the same hit keeps the selection if it is still there.
+        let selected = self
+            .search
+            .results
+            .get(self.search.focus)
+            .map(|row| row.event_id.clone());
+        let bounded = events.len() >= 50;
+        let listed: HashSet<Uuid> = self.channels.iter().map(|entry| entry.id).collect();
+        let mut rows: Vec<Row> = Vec::new();
+        let mut channels: Vec<Uuid> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let existing: HashMap<String, Row> = self
+            .channels
+            .iter()
+            .flat_map(|entry| entry.rows.iter())
+            .chain(self.context.rows.iter())
+            .chain(self.thread.rows.iter())
+            .chain(self.search.results.iter())
+            .cloned()
+            .map(|row| (row.event_id.clone(), row))
+            .collect();
+        let mut hidden = 0usize;
+        for event in &events {
+            let Some(channel) = buzz_sdk::extract_channel_id(event) else {
+                continue;
+            };
+            // All-accessible scope still shows only listed, accessible
+            // conversations, and a known deleted event is never shown.
+            if !listed.contains(&channel) {
+                hidden += 1;
+                continue;
+            }
+            let event_id = event.id.to_hex();
+            if self.deleted_rows.contains(&event_id) {
+                hidden += 1;
+                continue;
+            }
+            // Duplicate deliveries keep the first occurrence, so the relay's
+            // relevance order is never reshuffled.
+            if !seen.insert(event_id.clone()) {
+                continue;
+            }
+            let mut row = existing
+                .get(&event_id)
+                .cloned()
+                .unwrap_or_else(|| content::row_from_event(event, &self.me));
+            row.author = author_name(&self.profiles, &self.me, &row.pubkey);
+            rows.push(row);
+            channels.push(channel);
+        }
+        let mut aux_by_channel: HashMap<Uuid, Vec<String>> = HashMap::new();
+        for (row, channel) in rows.iter().zip(channels.iter().copied()) {
+            aux_by_channel
+                .entry(channel)
+                .or_default()
+                .push(row.event_id.clone());
+        }
+        self.search.results = rows;
+        self.search.channels = channels;
+        self.search.focus = selected
+            .and_then(|id| {
+                self.search
+                    .results
+                    .iter()
+                    .position(|row| row.event_id == id)
+            })
+            .unwrap_or(0);
+        self.search.loading = false;
+        self.search.failed = None;
+        self.search.previous = None;
+        self.search.hidden = hidden;
+        self.search.bounded = bounded;
+        for (channel, ids) in aux_by_channel {
+            self.outbox.push(SessionCommand::AddAux { channel, ids });
+        }
+        self.request_profiles();
+    }
+    fn search_failed(&mut self, request: u64, reason: String) {
+        if self.search.open && self.search.request == request {
+            self.search.loading = false;
+            self.search.failed = Some(reason);
+        }
+    }
+
+    fn load_context(
+        &mut self,
+        channel: Uuid,
+        target: String,
+        request: u64,
+        events: Vec<nostr::Event>,
+        before_complete: bool,
+        after_complete: bool,
+    ) {
+        if !self.context.open
+            || self.context.channel != channel
+            || self.context.target != target
+            || self.context.request != request
+        {
+            return;
+        }
+        if self.deleted_rows.contains(&target) {
+            self.context.rows.clear();
+            self.context.loading = false;
+            self.context.failed = Some("message deleted".to_owned());
+            return;
+        }
+        let mut rows: Vec<Row> = events
+            .iter()
+            .filter(|event| !self.deleted_rows.contains(&event.id.to_hex()))
+            .map(|event| content::row_from_event(event, &self.me))
+            .collect();
+        for row in &mut rows {
+            row.author = author_name(&self.profiles, &self.me, &row.pubkey);
+        }
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.event_id.cmp(&b.event_id))
+        });
+        if !rows.iter().any(|row| row.event_id == target) {
+            self.context.rows.clear();
+            self.context.loading = false;
+            self.context.failed = Some("message unavailable".to_owned());
+            return;
+        }
+        self.context.rows = rows;
+        self.context.focus = self
+            .context
+            .rows
+            .iter()
+            .position(|row| row.event_id == target)
+            .unwrap_or(0);
+        self.context.loading = false;
+        self.context.failed = None;
+        self.context.before_complete = before_complete;
+        self.context.after_complete = after_complete;
+        self.context.older_loading = false;
+        self.context.newer_loading = false;
+        self.request_profiles();
+    }
+
+    fn context_failed(&mut self, channel: Uuid, target: String, request: u64, reason: String) {
+        if self.context.open
+            && self.context.channel == channel
+            && self.context.target == target
+            && self.context.request == request
+        {
+            self.context.loading = false;
+            self.context.failed = Some(reason);
+        }
+    }
+
+    fn merge_rows(
+        rows: &mut Vec<Row>,
+        incoming: Vec<Row>,
+        direction: HistoryDirection,
+        pinned: Option<&str>,
+    ) -> bool {
+        let mut known: HashSet<String> = rows.iter().map(|row| row.event_id.clone()).collect();
+        let mut added = false;
+        rows.extend(incoming.into_iter().filter(|row| {
+            if known.insert(row.event_id.clone()) {
+                added = true;
+                true
+            } else {
+                false
+            }
+        }));
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.event_id.cmp(&b.event_id))
+        });
+        while rows.len() > 2000 {
+            let index = match direction {
+                HistoryDirection::Older => (0..rows.len())
+                    .rev()
+                    .find(|index| !pinned.is_some_and(|id| rows[*index].event_id == id)),
+                HistoryDirection::Newer => (0..rows.len())
+                    .find(|index| !pinned.is_some_and(|id| rows[*index].event_id == id)),
+            }
+            .unwrap_or(0);
+            rows.remove(index);
+        }
+        added
+    }
+
+    fn apply_newest_window(&mut self, read: NewestWindowRead, now: u64) {
+        let NewestWindowRead {
+            surface,
+            channel,
+            root,
+            request,
+            saturated,
+            events,
+        } = read;
+
+        match surface {
+            HistorySurface::Channel => {
+                let fetched: HashSet<String> =
+                    events.iter().map(|event| event.id.to_hex()).collect();
+                let deleted_rows = self.deleted_rows.clone();
+                let me = self.me.clone();
+                let profiles = self.profiles.clone();
+                let selected =
+                    self.channels.get(self.selected).map(|entry| entry.id) == Some(channel);
+                let Some(entry) = self.entry_mut(&channel) else {
+                    return;
+                };
+                let existing: HashMap<String, Row> = entry
+                    .rows
+                    .iter()
+                    .cloned()
+                    .map(|row| (row.event_id.clone(), row))
+                    .collect();
+                let mut rows: Vec<Row> = events
+                    .iter()
+                    .filter(|event| !deleted_rows.contains(&event.id.to_hex()))
+                    .map(|event| {
+                        existing
+                            .get(&event.id.to_hex())
+                            .cloned()
+                            .unwrap_or_else(|| content::row_from_event(event, &me))
+                    })
+                    .collect();
+                rows.extend(
+                    entry
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            (row.pending || entry.live_ids.contains(&row.event_id))
+                                && !fetched.contains(&row.event_id)
+                        })
+                        .cloned(),
+                );
+                for row in &mut rows {
+                    if !row.pending {
+                        row.author = author_name(&profiles, &me, &row.pubkey);
+                    }
+                }
+                rows.sort_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then(a.event_id.cmp(&b.event_id))
+                });
+                entry.rows = rows;
+                entry.seen = entry
+                    .rows
+                    .iter()
+                    .filter(|row| !row.pending)
+                    .map(|row| row.event_id.clone())
+                    .collect();
+                entry.older_complete = !saturated;
+                entry.newer_complete = true;
+                entry.loading = false;
+                if selected {
+                    self.focus = self
+                        .entry(channel)
+                        .map(|entry| entry.rows.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    self.set_focus(self.focus);
+                }
+            }
+            HistorySurface::Context => {
+                if !self.context.open
+                    || self.context.channel != channel
+                    || self.context.request != request
+                {
+                    return;
+                }
+                let deleted_rows = self.deleted_rows.clone();
+                let me = self.me.clone();
+                let profiles = self.profiles.clone();
+                let existing: HashMap<String, Row> = self
+                    .context
+                    .rows
+                    .iter()
+                    .cloned()
+                    .map(|row| (row.event_id.clone(), row))
+                    .collect();
+                let mut rows: Vec<Row> = events
+                    .iter()
+                    .filter(|event| !deleted_rows.contains(&event.id.to_hex()))
+                    .map(|event| {
+                        existing
+                            .get(&event.id.to_hex())
+                            .cloned()
+                            .unwrap_or_else(|| content::row_from_event(event, &me))
+                    })
+                    .collect();
+                for row in &mut rows {
+                    row.author = author_name(&profiles, &me, &row.pubkey);
+                }
+                rows.sort_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then(a.event_id.cmp(&b.event_id))
+                });
+                self.context.rows = rows;
+                self.context.focus = self.context.rows.len().saturating_sub(1);
+                self.context.loading = false;
+                self.context.failed = None;
+                self.context.before_complete = !saturated;
+                self.context.after_complete = true;
+                self.context.notice = None;
+            }
+            HistorySurface::Thread => {
+                let Some(root) = root else {
+                    return;
+                };
+                if !self.thread.open
+                    || self.thread.channel != channel
+                    || self.thread.root != root
+                    || self.thread.request != request
+                {
+                    return;
+                }
+                self.load_thread(channel, root, request, events, saturated, now);
+                self.thread.focus = self.thread.rows.len().saturating_sub(1);
+            }
+        }
+        self.request_profiles();
+    }
+
+    fn newest_window_failed(
+        &mut self,
+        surface: HistorySurface,
+        channel: Uuid,
+        root: Option<String>,
+        request: u64,
+        reason: String,
+    ) {
+        let matches = match surface {
+            HistorySurface::Channel => self.selected_entry().map(|entry| entry.id) == Some(channel),
+            HistorySurface::Context => {
+                self.context.open
+                    && self.context.channel == channel
+                    && self.context.request == request
+            }
+            HistorySurface::Thread => {
+                self.thread.open
+                    && self.thread.channel == channel
+                    && root.as_deref() == Some(self.thread.root.as_str())
+                    && self.thread.request == request
+            }
+        };
+        if !matches {
+            return;
+        }
+        match surface {
+            HistorySurface::Channel => {
+                if let Some(entry) = self.entry_mut(&channel) {
+                    entry.loading = false;
+                }
+            }
+            HistorySurface::Context => self.context.loading = false,
+            HistorySurface::Thread => self.thread.loading = false,
+        }
+        self.note(format!("newest history failed: {reason}"));
+    }
+
+    fn apply_history_page(&mut self, page: HistoryPageRead, now: u64) {
+        let HistoryPageRead {
+            surface,
+            channel,
+            root,
+            request,
+            direction,
+            saturated,
+            events,
+        } = page;
+        let mut incoming: Vec<Row> = events
+            .iter()
+            .filter(|event| !self.deleted_rows.contains(&event.id.to_hex()))
+            .map(|event| content::row_from_event(event, &self.me))
+            .collect();
+        for row in &mut incoming {
+            row.author = author_name(&self.profiles, &self.me, &row.pubkey);
+        }
+        let mut no_progress = false;
+        match surface {
+            HistorySurface::Channel => {
+                let selected =
+                    self.channels.get(self.selected).map(|entry| entry.id) == Some(channel);
+                let focus_before = self.focus;
+                let new_focus = self.entry_mut(&channel).map(|entry| {
+                    let focus_id = entry.rows.get(focus_before).map(|row| row.event_id.clone());
+                    no_progress = !Self::merge_rows(&mut entry.rows, incoming, direction, None);
+                    entry
+                        .seen
+                        .extend(entry.rows.iter().map(|row| row.event_id.clone()));
+                    match direction {
+                        HistoryDirection::Older if !saturated => entry.older_complete = true,
+                        HistoryDirection::Newer if !saturated => entry.newer_complete = true,
+                        _ => {}
+                    }
+                    entry.loading = false;
+                    selected.then(|| {
+                        focus_id
+                            .and_then(|id| entry.rows.iter().position(|row| row.event_id == id))
+                            .unwrap_or_else(|| match direction {
+                                HistoryDirection::Older => 0,
+                                HistoryDirection::Newer => entry.rows.len().saturating_sub(1),
+                            })
+                    })
+                });
+                if let Some(focus) = new_focus.flatten() {
+                    self.focus = focus;
+                    self.set_focus(focus);
+                }
+                if selected && no_progress && saturated {
+                    self.note("History limit reached");
+                }
+            }
+            HistorySurface::Context => {
+                if self.context.open
+                    && self.context.channel == channel
+                    && self.context.request == request
+                {
+                    let focus_id = self.context.focused().map(|row| row.event_id.clone());
+                    let pinned = self.context.target.clone();
+                    no_progress = !Self::merge_rows(
+                        &mut self.context.rows,
+                        incoming,
+                        direction,
+                        Some(&pinned),
+                    );
+                    self.context.focus = focus_id
+                        .and_then(|id| self.context.rows.iter().position(|row| row.event_id == id))
+                        .unwrap_or(self.context.focus);
+                    if !saturated {
+                        match direction {
+                            HistoryDirection::Older => self.context.before_complete = true,
+                            HistoryDirection::Newer => self.context.after_complete = true,
+                        }
+                    }
+                    self.context.older_loading = false;
+                    self.context.newer_loading = false;
+                    if no_progress && saturated {
+                        self.context.notice = Some("History limit reached".to_owned());
+                    }
+                }
+            }
+            HistorySurface::Thread => {
+                if self.thread.open
+                    && self.thread.channel == channel
+                    && root.as_deref() == Some(self.thread.root.as_str())
+                    && self.thread.request == request
+                {
+                    let focus_id = self.thread.focused().map(|row| row.event_id.clone());
+                    let pinned = self.thread.root.clone();
+                    no_progress = !Self::merge_rows(
+                        &mut self.thread.rows,
+                        incoming,
+                        direction,
+                        Some(&pinned),
+                    );
+                    if let Some(at) = self
+                        .thread
+                        .rows
+                        .iter()
+                        .position(|row| row.event_id == self.thread.root)
+                    {
+                        let root_row = self.thread.rows.remove(at);
+                        self.thread.rows.insert(0, root_row);
+                    }
+                    self.thread.focus = focus_id
+                        .and_then(|id| self.thread.rows.iter().position(|row| row.event_id == id))
+                        .unwrap_or(self.thread.focus);
+                    match direction {
+                        HistoryDirection::Older if !saturated => self.thread.older_complete = true,
+                        HistoryDirection::Newer if !saturated => self.thread.newer_complete = true,
+                        _ => {}
+                    }
+                    self.thread.loading = false;
+                    self.thread.partial =
+                        !(self.thread.older_complete && self.thread.newer_complete);
+                    if no_progress && saturated {
+                        self.note("History limit reached");
+                    }
+                }
+            }
+        }
+        let _ = now;
+        self.request_profiles();
+    }
+
+    fn history_page_failed(
+        &mut self,
+        surface: HistorySurface,
+        channel: Uuid,
+        root: Option<String>,
+        request: u64,
+        direction: HistoryDirection,
+        reason: String,
+    ) {
+        let matches = match surface {
+            HistorySurface::Context => {
+                self.context.open
+                    && self.context.channel == channel
+                    && self.context.request == request
+            }
+            HistorySurface::Thread => {
+                self.thread.open
+                    && self.thread.channel == channel
+                    && root.as_deref() == Some(self.thread.root.as_str())
+                    && self.thread.request == request
+            }
+            HistorySurface::Channel => self.selected_entry().map(|entry| entry.id) == Some(channel),
+        };
+        if !matches {
+            return;
+        }
+        match surface {
+            HistorySurface::Context => match direction {
+                HistoryDirection::Older => self.context.older_loading = false,
+                HistoryDirection::Newer => self.context.newer_loading = false,
+            },
+            HistorySurface::Thread => self.thread.loading = false,
+            HistorySurface::Channel => {
+                if let Some(entry) = self.entry_mut(&channel) {
+                    entry.loading = false;
+                }
+            }
+        }
+        self.note(format!(
+            "{} history failed: {reason}",
+            match direction {
+                HistoryDirection::Older => "older",
+                HistoryDirection::Newer => "newer",
+            }
+        ));
+    }
+
     fn apply_timeline(&mut self, channel: Uuid, event: nostr::Event, _now: u64) {
         if buzz_sdk::extract_channel_id(&event) != Some(channel) {
             return;
         }
         let id = event.id.to_hex();
+        let at = event.created_at.as_secs();
         let me = self.me.clone();
         let profiles = self.profiles.clone();
         let author_key = event.pubkey.to_hex();
+        if let Some(typing) = self.typing.get_mut(&channel) {
+            typing.retain(|pubkey, entry| pubkey != &author_key || entry.since > at);
+            if typing.is_empty() {
+                self.typing.remove(&channel);
+            }
+        }
         let author = author_name(&profiles, &me, &author_key);
-        let known_author = profiles.contains_key(&author_key) || author_key == me;
         let selected = self.selected_entry().map(|e| e.id) == Some(channel);
         if !selected {
             // A previously opened conversation may still have a timeline feed
@@ -2584,19 +4777,8 @@ impl App {
             channel,
             ids: vec![id],
         });
-        // The message itself is the end of that author's indicator: typing is
-        // a pre-message signal, so it never outlives the message it announced.
-        // A replay of an older message leaves a live claim standing.
-        self.end_typing(channel, &author_key, event.created_at.as_secs());
-        if !known_author {
-            self.outbox
-                .push(SessionCommand::LoadProfiles(vec![author_key]));
-        }
-        if was_at_bottom {
-            // The message was presented where the reader already sat.
-            self.note_presented();
-        }
     }
+
     fn channel_for_row(&self, target: &str) -> Option<Uuid> {
         if let Some(entry) = self
             .channels
@@ -2604,6 +4786,17 @@ impl App {
             .find(|entry| entry.rows.iter().any(|row| row.event_id == target))
         {
             return Some(entry.id);
+        }
+        if self.context.open && self.context.rows.iter().any(|row| row.event_id == target) {
+            return Some(self.context.channel);
+        }
+        if let Some(index) = self
+            .search
+            .results
+            .iter()
+            .position(|row| row.event_id == target)
+        {
+            return self.search.channels.get(index).copied();
         }
         // The thread shows rows its channel may never have loaded - its root
         // can sit outside the loaded history - and they belong to the same
@@ -2719,6 +4912,7 @@ impl App {
                     }
                     content::apply_overlay(row, &content::Overlay::Edit { body: body.clone() })
                 });
+                self.sync_reader_row(&target, true);
                 if let Some(candidate) = self
                     .channels
                     .iter_mut()
@@ -2752,13 +4946,86 @@ impl App {
                 apply(row);
             }
         }
+        for row in self
+            .context
+            .rows
+            .iter_mut()
+            .filter(|row| row.event_id == target)
+        {
+            apply(row);
+        }
         for row in self.thread.rows.iter_mut().filter(|r| r.event_id == target) {
             apply(row);
+        }
+        for row in self
+            .search
+            .results
+            .iter_mut()
+            .filter(|row| row.event_id == target)
+        {
+            apply(row);
+        }
+        self.sync_reader_row(target, false);
+    }
+
+    fn sync_reader_row(&mut self, target: &str, reset: bool) {
+        if !self.reader.open || self.reader.event_id != target {
+            return;
+        }
+        let row = self
+            .channels
+            .iter()
+            .flat_map(|entry| entry.rows.iter())
+            .chain(self.context.rows.iter())
+            .chain(self.thread.rows.iter())
+            .find(|row| row.event_id == target)
+            .cloned();
+        if let Some(row) = row {
+            self.reader.row = Some(row);
+            self.reader.deleted = false;
+            if reset {
+                self.reader.scroll = 0;
+                self.reader.notice = Some("Updated; at start".to_owned());
+            }
+        }
+    }
+
+    fn mark_reader_deleted(&mut self, target: &str) {
+        if self.reader.open && self.reader.event_id == target {
+            self.reader.row = None;
+            self.reader.deleted = true;
+            self.reader.scroll = 0;
+            self.reader.notice = Some("Message deleted".to_owned());
         }
     }
 
     fn remove_row(&mut self, target: &str) {
+        self.mark_reader_deleted(target);
         self.deleted_rows.insert(target.to_owned());
+        self.remove_search_row(target);
+        if self.context.open {
+            let focused_id = self.context.focused().map(|row| row.event_id.clone());
+            if target == self.context.target {
+                self.context.rows.clear();
+                self.context.focus = 0;
+                self.context.loading = false;
+                self.context.failed = Some("message deleted".to_owned());
+            } else if let Some(position) = self
+                .context
+                .rows
+                .iter()
+                .position(|row| row.event_id == target)
+            {
+                self.context.rows.remove(position);
+                self.context.focus = focused_id
+                    .and_then(|id| self.context.rows.iter().position(|row| row.event_id == id))
+                    .unwrap_or_else(|| {
+                        self.context
+                            .focus
+                            .min(self.context.rows.len().saturating_sub(1))
+                    });
+            }
+        }
         // Record deletion before the thread read arrives. The channel cache is
         // the only proof that a root belongs to the active thread at that
         // point; otherwise a late read could resurrect it.
@@ -2852,6 +5119,18 @@ impl App {
     }
 
     fn handle_navigation(&mut self, action: Action, now: u64) {
+        if self.reader.open {
+            self.handle_reader(action);
+            return;
+        }
+        if self.context.open {
+            self.handle_context(action);
+            return;
+        }
+        if self.search.open {
+            self.handle_search(action, now);
+            return;
+        }
         if self.thread.open {
             // The thread view is the surface: it isolates the conversation
             // keys instead of laying an overlay over the timeline.
@@ -2865,31 +5144,37 @@ impl App {
             Action::ToggleHelp => {
                 self.help = !self.help;
                 if self.help {
-                    // The help draws over the picker, so it replaces it, and
-                    // it opens at its top: the full label of the selected
-                    // conversation is part of it.
                     self.picker = None;
+                    self.picker_editing = false;
                     self.agents.open = false;
                     self.help_scroll = 0;
                 }
-            }
-            Action::HelpScroll(step) => {
-                self.help_scroll = self.help_scroll.saturating_add_signed(step as i16);
             }
             Action::Dismiss => {
                 if self.help {
                     self.help = false;
                     self.note_presented();
+                } else if self.picker_editing {
+                    self.picker_query = self.picker_saved_query.clone();
+                    self.picker_saved_query.clear();
+                    self.picker_editing = false;
                 } else if self.picker.take().is_some() {
+                    self.picker_query.clear();
+                    self.picker_saved_query.clear();
                     self.note_presented();
                 } else {
                     self.dismiss_agents();
                 }
             }
             Action::NextChannel => self.step_channel(1),
-            Action::PrevChannel => self.step_channel(-1),
-            Action::NextRow => self.set_focus(self.focus.saturating_add(1)),
-            Action::PrevRow => self.set_focus(self.focus.saturating_sub(1)),
+            Action::PrevChannel => {
+                let at_boundary = self.focus == 0 && !self.selected_rows().is_empty();
+                if !at_boundary || !self.request_channel_page(HistoryDirection::Older) {
+                    self.step_channel(-1);
+                }
+            }
+            Action::NextRow => self.channel_step(1),
+            Action::PrevRow => self.channel_step(-1),
             Action::Channel(n) => {
                 let target = self.shortcut_target(n).and_then(|id| self.index_of(id));
                 self.picker = None;
@@ -2899,12 +5184,24 @@ impl App {
             }
             Action::FilterNext => self.set_filter(self.filter.next()),
             Action::ToggleAgents => self.toggle_agents(),
-            Action::AgentsNext => self.move_agents(1),
-            Action::AgentsPrev => self.move_agents(-1),
-            Action::AgentsConfirm => self.confirm_agents(),
-            Action::TogglePicker => self.toggle_picker(),
-            Action::PickerNext => self.move_picker(1),
+            Action::PickerInput(c) => {
+                if self.picker_editing {
+                    self.picker_query.push(c);
+                } else if c == '/' {
+                    self.picker_saved_query = self.picker_query.clone();
+                    self.picker_editing = true;
+                }
+            }
+            Action::PickerBackspace => {
+                self.picker_query.pop();
+            }
             Action::PickerConfirm => {
+                if self.picker_editing {
+                    self.picker_saved_query = self.picker_query.clone();
+                    self.picker_editing = false;
+                    self.refresh_views();
+                    return;
+                }
                 let confirmed = self
                     .picker
                     .take()
@@ -2914,8 +5211,16 @@ impl App {
                 }
                 self.note_presented();
             }
+            Action::PickerNext => self.step_picker(1),
+            Action::PickerPrev => self.step_picker(-1),
             Action::Top => self.set_focus(0),
-            Action::Bottom => self.set_focus(usize::MAX),
+            Action::Bottom => {
+                if !self.request_newest_window(HistorySurface::Channel)
+                    && !self.selected_entry().is_some_and(|entry| entry.loading)
+                {
+                    self.set_focus(usize::MAX);
+                }
+            }
             Action::PageUp => {
                 let next = self.focus.saturating_sub(PAGE_ROWS);
                 self.set_focus(next);
@@ -2951,15 +5256,187 @@ impl App {
             Action::React => self.react_focused(),
             Action::EditRow => self.edit_focused(),
             Action::DeleteRow => self.delete_focused(),
+            Action::OpenSearch => self.open_search(false, now),
             Action::OpenThread => self.open_thread(),
+            Action::OpenReader => self.open_reader(),
+            Action::TogglePicker => self.toggle_picker(),
+            Action::AgentsNext => self.move_agents(1),
+            Action::HelpScroll(step) => {
+                self.help_scroll = self.help_scroll.saturating_add_signed(step as i16);
+            }
+            Action::AgentsPrev => self.move_agents(-1),
+            Action::AgentsConfirm => self.confirm_agents(),
+            Action::ContextLoadOlder => {
+                self.request_channel_page(HistoryDirection::Older);
+            }
+            Action::ContextLoadNewer => {
+                self.request_channel_page(HistoryDirection::Newer);
+            }
             Action::Ignored => {}
             _ => {}
         }
         let _ = now;
     }
+    fn step_picker(&mut self, step: isize) {
+        let Some(picker) = self.picker.clone() else {
+            return;
+        };
+        let ids: Vec<Uuid> = self.picker_view().all().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let current = ids
+            .iter()
+            .position(|id| *id == picker.cursor)
+            .unwrap_or(picker.at.min(ids.len().saturating_sub(1)));
+        let next = current
+            .saturating_add_signed(step)
+            .min(ids.len().saturating_sub(1));
+        self.picker = Some(Picker {
+            cursor: ids[next],
+            at: next,
+        });
+    }
 
+    /// `[`/`]`: extend the selected conversation's loaded window by one page.
+    fn request_channel_page(&mut self, direction: HistoryDirection) -> bool {
+        let Some(entry) = self.selected_entry() else {
+            return false;
+        };
+        if entry.loading
+            || match direction {
+                HistoryDirection::Older => entry.older_complete,
+                HistoryDirection::Newer => entry.newer_complete,
+            }
+        {
+            return false;
+        }
+        let cursor = match direction {
+            HistoryDirection::Older => entry.rows.first().map(|row| row.created_at),
+            HistoryDirection::Newer => entry.rows.last().map(|row| row.created_at),
+        };
+        let Some(cursor) = cursor else {
+            return false;
+        };
+        let channel = entry.id;
+        if let Some(entry) = self.entry_mut(&channel) {
+            entry.loading = true;
+        }
+        self.outbox.push(SessionCommand::HistoryPage {
+            surface: HistorySurface::Channel,
+            channel,
+            root: None,
+            request: 0,
+            direction,
+            cursor,
+        });
+        true
+    }
+    fn request_newest_window(&mut self, surface: HistorySurface) -> bool {
+        match surface {
+            HistorySurface::Channel => {
+                let Some(channel) = self.selected_entry().map(|entry| entry.id) else {
+                    return false;
+                };
+                let Some(entry) = self.entry_mut(&channel) else {
+                    return false;
+                };
+                if entry.loading {
+                    return false;
+                }
+                entry.loading = true;
+                self.thread_request = self.thread_request.wrapping_add(1);
+                self.outbox.push(SessionCommand::NewestWindow {
+                    surface,
+                    channel,
+                    root: None,
+                    request: self.thread_request,
+                });
+                true
+            }
+            HistorySurface::Context => {
+                if !self.context.open
+                    || self.context.loading
+                    || self.context.older_loading
+                    || self.context.newer_loading
+                {
+                    return false;
+                }
+                self.thread_request = self.thread_request.wrapping_add(1);
+                self.context.request = self.thread_request;
+                self.context.loading = true;
+                self.outbox.push(SessionCommand::NewestWindow {
+                    surface,
+                    channel: self.context.channel,
+                    root: None,
+                    request: self.context.request,
+                });
+                true
+            }
+            HistorySurface::Thread => {
+                if !self.thread.open || self.thread.loading {
+                    return false;
+                }
+                self.thread_request = self.thread_request.wrapping_add(1);
+                self.thread.request = self.thread_request;
+                self.thread.loading = true;
+                self.outbox.push(SessionCommand::NewestWindow {
+                    surface,
+                    channel: self.thread.channel,
+                    root: Some(self.thread.root.clone()),
+                    request: self.thread.request,
+                });
+                true
+            }
+        }
+    }
+
+    fn channel_step(&mut self, step: isize) {
+        let len = self.selected_rows().len();
+        if len == 0 {
+            return;
+        }
+        if step > 0 && self.focus + 1 >= len {
+            if !self.request_channel_page(HistoryDirection::Newer) {
+                self.set_focus(usize::MAX);
+            }
+            return;
+        }
+        if step < 0 && self.focus == 0 {
+            if !self.request_channel_page(HistoryDirection::Older) {
+                self.set_focus(0);
+            }
+            return;
+        }
+        self.set_focus((self.focus as isize + step).max(0) as usize);
+    }
+
+    /// Enter inside the Agents overlay: the list opens the selected Agent's
+    /// detail, and the detail opens the selected working conversation.
+    fn confirm_agents(&mut self) {
+        if !self.agents.open {
+            return;
+        }
+        match self.agents.cursor.level {
+            agents::Level::List => {
+                if self.selected_agent().is_some() {
+                    self.agents.cursor.level = agents::Level::Detail;
+                    self.agents.cursor.context = 0;
+                }
+            }
+            agents::Level::Detail => {
+                if let Some(Context::Channel { id, .. }) = self.selected_context()
+                    && let Some(index) = self.index_of(id)
+                {
+                    self.agents.open = false;
+                    self.switch_channel(index);
+                }
+            }
+        }
+    }
     fn handle_composer(&mut self, action: Action, now: u64) {
         match action {
+            Action::OpenSearch => self.open_search(true, now),
             Action::Quit => self.quit = true,
             Action::ComposerInput(c) => self.composer.input(c),
             Action::ComposerBackspace => self.composer.backspace(),
@@ -2971,7 +5448,7 @@ impl App {
             Action::ComposerHome => self.composer.home(),
             Action::ComposerEnd => self.composer.end(),
             Action::ComposerEscape => {
-                if self.thread.open {
+                if self.thread.open || self.context.open {
                     // The thread composer leaves in one press and keeps its
                     // reply or edit destination: a cancelled thread reply must
                     // never become a top-level channel send.
@@ -3045,28 +5522,6 @@ impl App {
         }
     }
 
-    /// `c`: the picker opens on the conversation on screen, and closes when it
-    fn toggle_picker(&mut self) {
-        if self.picker.take().is_some() {
-            self.note_presented();
-            return;
-        }
-        self.picker = if !self.channels.is_empty() {
-            // Only one overlay is on screen at a time.
-            self.help = false;
-            self.agents.open = false;
-            self.channels.get(self.selected).map(|entry| {
-                let at = self.view().all().position(|id| id == entry.id).unwrap_or(0);
-                Picker {
-                    cursor: entry.id,
-                    at,
-                }
-            })
-        } else {
-            None
-        };
-    }
-
     /// `a`: open the Agents overlay, or close it when it is open. Opening it
     /// asks for the roster: that read is one query, and a session that never
     /// opens the overlay never spends it.
@@ -3103,28 +5558,29 @@ impl App {
     /// detail, and the detail opens the selected working conversation. An
     /// Agent that cannot be read, or a context this identity is not in, opens
     /// nothing.
-    fn confirm_agents(&mut self) {
-        if !self.agents.open {
+    fn toggle_picker(&mut self) {
+        if self.picker.take().is_some() {
+            self.picker_editing = false;
+            self.picker_query.clear();
+            self.picker_saved_query.clear();
+            self.note_presented();
             return;
         }
-        match self.agents.cursor.level {
-            agents::Level::List => {
-                if self.selected_agent().is_none() {
-                    return;
+        self.picker = if !self.channels.is_empty() {
+            self.help = false;
+            self.agents.open = false;
+            self.picker_query.clear();
+            self.picker_saved_query.clear();
+            self.channels.get(self.selected).map(|entry| {
+                let at = self.view().all().position(|id| id == entry.id).unwrap_or(0);
+                Picker {
+                    cursor: entry.id,
+                    at,
                 }
-                self.agents.cursor.level = agents::Level::Detail;
-                self.agents.cursor.context = 0;
-            }
-            agents::Level::Detail => {
-                let Some(Context::Channel { id, .. }) = self.selected_context() else {
-                    return;
-                };
-                self.agents.open = false;
-                if let Some(index) = self.index_of(id) {
-                    self.switch_channel(index);
-                }
-            }
-        }
+            })
+        } else {
+            None
+        };
     }
 
     /// Esc inside the Agents overlay: the detail back to the list, and the
@@ -3144,22 +5600,6 @@ impl App {
         self.agent_contexts(&agent.pubkey)
             .into_iter()
             .nth(self.agents.cursor.context)
-    }
-
-    /// Move the picker's cursor one row through the view it shows.
-    fn move_picker(&mut self, step: isize) {
-        let Some(picker) = self.picker.clone() else {
-            return;
-        };
-        let order: Vec<Uuid> = self.picker_view().all().collect();
-        let Some(at) = order.iter().position(|id| *id == picker.cursor) else {
-            return;
-        };
-        let next = (at as isize + step).clamp(0, order.len() as isize - 1) as usize;
-        self.picker = Some(Picker {
-            cursor: order[next],
-            at: next,
-        });
     }
 
     /// Keep the composer's text with the conversation it belongs to. A draft
@@ -3371,13 +5811,8 @@ impl App {
             self.note("publishing disabled while reconnecting");
             return;
         }
-        let channel_id = if self.thread.open {
-            self.thread.channel
-        } else {
-            let Some(channel) = self.selected_entry() else {
-                return;
-            };
-            channel.id
+        let Some(channel_id) = self.action_channel() else {
+            return;
         };
         if !self.channels.iter().any(|entry| entry.id == channel_id) {
             self.draft_blocked = true;
@@ -3762,6 +6197,8 @@ mod tests {
             participants: Vec::new(),
             rows: Vec::new(),
             seen: HashSet::new(),
+            older_complete: false,
+            newer_complete: true,
             live_ids: HashSet::new(),
             loading: false,
             draft: Composer::default(),
@@ -3861,6 +6298,113 @@ mod tests {
         (app, id, root, reply, author)
     }
 
+    #[test]
+    fn the_reader_binds_to_an_event_and_returns_to_its_origin() {
+        let (mut app, id, _root, reply, author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenReader, 40);
+        assert!(app.reader.open);
+        assert_eq!(app.surface(), keys::Surface::Reader);
+        assert_eq!(app.reader.event_id, reply);
+
+        let live = reply_event(&author, id, &reply, &reply, "new live row", 50);
+        app.apply(
+            ChatEvent::Timeline {
+                channel: id,
+                event: live,
+            },
+            50,
+        );
+        app.handle(Action::ReaderNextLine, 50);
+        assert_eq!(app.reader.event_id, reply);
+        assert_eq!(app.reader.scroll, 1);
+
+        app.handle(Action::ReaderClose, 50);
+        assert!(!app.reader.open);
+        assert_eq!(app.focus, 1, "return follows the bound id, not the new row");
+    }
+    #[test]
+    fn reader_page_down_uses_the_rendered_body_height() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenReader, 40);
+        app.set_reader_page_rows(2);
+        app.handle(Action::ReaderPageDown, 40);
+        assert_eq!(
+            app.reader.scroll, 1,
+            "a two-line body viewport keeps one-line overlap"
+        );
+    }
+    #[test]
+    fn bounded_history_keeps_pinned_context_and_thread_rows() {
+        let mut context_rows = vec![row("target", 0, "p")];
+        context_rows.extend((1..=2000).map(|at| row(&format!("row-{at}"), at, "p")));
+        assert!(App::merge_rows(
+            &mut context_rows,
+            vec![row("newer", 2001, "p")],
+            HistoryDirection::Newer,
+            Some("target"),
+        ));
+        assert!(context_rows.iter().any(|row| row.event_id == "target"));
+
+        let mut thread_rows = vec![row("root", 0, "p")];
+        thread_rows.extend((1..=2000).map(|at| row(&format!("reply-{at}"), at, "p")));
+        assert!(App::merge_rows(
+            &mut thread_rows,
+            vec![row("latest", 2001, "p")],
+            HistoryDirection::Newer,
+            Some("root"),
+        ));
+        assert!(thread_rows.iter().any(|row| row.event_id == "root"));
+    }
+
+    #[test]
+    fn reader_reply_preserves_target_and_refuses_to_retarget_a_draft() {
+        let (mut app, _id, _root, reply, _author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenReader, 40);
+        app.handle(Action::ReaderReply, 40);
+        assert!(!app.reader.open);
+        assert_eq!(
+            app.composer
+                .reply
+                .as_ref()
+                .map(|target| target.event_id.as_str()),
+            Some(reply.as_str())
+        );
+
+        app.mode = Mode::Navigation;
+        app.composer.clear();
+        app.handle(Action::OpenReader, 40);
+        app.composer.set_text("keep this");
+        app.handle(Action::ReaderReply, 40);
+        assert!(app.reader.open);
+        assert_eq!(app.composer.text(), "keep this");
+        assert_eq!(app.status, "Draft kept; Esc back");
+    }
+
+    #[test]
+    fn reader_tracks_edits_and_turns_deletions_into_a_nonreplyable_state() {
+        let (mut app, _id, root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenReader, 40);
+        app.reader.scroll = 7;
+        app.apply(ChatEvent::Overlay(edit_event(&root, "edited body")), 41);
+        assert_eq!(
+            app.reader.row.as_ref().map(|row| row.body.as_str()),
+            Some("edited body")
+        );
+        assert_eq!(app.reader.scroll, 0);
+        assert_eq!(app.reader.notice.as_deref(), Some("Updated; at start"));
+
+        app.apply(ChatEvent::Overlay(delete_event(&root)), 42);
+        assert!(app.reader.deleted);
+        assert_eq!(app.reader.notice.as_deref(), Some("Message deleted"));
+        app.handle(Action::ReaderReply, 42);
+        assert!(app.reader.open);
+        assert!(app.composer.reply.is_none());
+    }
+
     /// The thread read of the conversation above, as the session delivers it.
     fn thread_read(app: &mut App, id: Uuid, root: &str, events: Vec<nostr::Event>, partial: bool) {
         app.conn = ConnState::Connected;
@@ -3874,6 +6418,216 @@ mod tests {
             },
             40,
         );
+    }
+
+    #[test]
+    fn thread_top_returns_to_the_root_after_a_bounded_read() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![
+                message_event(&author, id, "the root", 10),
+                reply_event(&author, id, &root, &root, "a reply", 20),
+            ],
+            true,
+        );
+        app.thread.focus = app
+            .thread
+            .rows
+            .iter()
+            .position(|row| row.event_id == reply)
+            .expect("reply loaded");
+        app.handle(Action::Top, 41);
+        assert_eq!(app.thread.focused().unwrap().event_id, root);
+    }
+
+    #[test]
+    fn a_successful_thread_reread_clears_reconnect_staleness() {
+        let (mut app, id, root, _reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        app.thread.stale = true;
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![message_event(&author, id, "the root", 10)],
+            false,
+        );
+        assert!(!app.thread.stale);
+    }
+
+    #[test]
+    fn stepping_past_the_oldest_row_requests_one_page_and_keeps_focus() {
+        let (mut app, id, root, _reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::PrevRow, 40);
+        let commands = take_commands(&mut app);
+        let page = commands
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::HistoryPage {
+                    direction, cursor, ..
+                } => Some((direction, cursor)),
+                _ => None,
+            })
+            .expect("an older page is requested at the loaded boundary");
+        assert_eq!(
+            page,
+            (HistoryDirection::Older, 10),
+            "the cursor is the oldest row"
+        );
+
+        let older = message_event(&author, id, "older than the window", 5);
+        app.apply(
+            ChatEvent::HistoryPage {
+                surface: HistorySurface::Channel,
+                channel: id,
+                root: None,
+                request: 0,
+                direction: HistoryDirection::Older,
+                events: vec![older],
+                saturated: false,
+            },
+            41,
+        );
+        let rows = &app.channels[0].rows;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            app.channels[0].rows[app.focus].event_id, root,
+            "focus follows the row it was on, not the index"
+        );
+        assert_eq!(rows[0].body, "older than the window");
+        assert_eq!(rows[1].event_id, root);
+    }
+
+    #[test]
+    fn a_short_context_page_marks_the_boundary_and_stops_asking() {
+        let (mut app, id, _root, _reply, author) = channel_with_a_reply();
+        app.handle(Action::OpenSearch, 40);
+        app.handle(Action::SearchInput('r'), 40);
+        app.handle(Action::SearchSubmit, 40);
+        let token = take_commands(&mut app)
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::Search { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("a search command");
+        let hit = message_event(&author, id, "the hit", 20);
+        app.apply(
+            ChatEvent::Search {
+                request: token,
+                events: vec![hit],
+            },
+            41,
+        );
+        app.handle(Action::SearchSubmit, 41);
+        assert!(app.context.open);
+        app.apply(
+            ChatEvent::Context {
+                channel: id,
+                target: app.context.target.clone(),
+                request: app.context.request,
+                events: vec![message_event(&author, id, "the hit", 20)],
+                before_complete: false,
+                after_complete: true,
+            },
+            42,
+        );
+        app.handle(Action::ContextPrev, 43);
+        let asked = take_commands(&mut app)
+            .into_iter()
+            .any(|command| matches!(command, SessionCommand::HistoryPage { .. }));
+        assert!(asked, "the older boundary is asked for while incomplete");
+
+        // The empty page answers: the boundary is known complete now, so the
+        // same step must not enqueue a second request.
+        app.apply(
+            ChatEvent::HistoryPage {
+                surface: HistorySurface::Context,
+                channel: id,
+                root: None,
+                request: app.context.request,
+                direction: HistoryDirection::Older,
+                saturated: false,
+                events: Vec::new(),
+            },
+            44,
+        );
+        assert!(app.context.before_complete);
+        assert!(app.context.focus == 0);
+        app.handle(Action::ContextPrev, 45);
+        let asked_again = take_commands(&mut app)
+            .into_iter()
+            .any(|command| matches!(command, SessionCommand::HistoryPage { .. }));
+        assert!(
+            !asked_again,
+            "a known-complete boundary is not asked for again"
+        );
+    }
+
+    #[test]
+    fn the_picker_ranks_exact_prefix_then_substring_matches() {
+        let mut app = app();
+        app.apply(
+            ChatEvent::Channels(roster(vec![
+                channel_info(1),
+                channel_info(2),
+                channel_info(3),
+            ])),
+            0,
+        );
+        app.channels[0].name = "alpaca".to_owned();
+        app.channels[1].name = "alpha".to_owned();
+        app.channels[2].name = "beta-alp".to_owned();
+        app.picker_query = "alp".to_owned();
+        app.picker = Some(Picker {
+            cursor: app.channels[1].id,
+            at: 0,
+        });
+        let shown: Vec<String> = app
+            .picker_view()
+            .all()
+            .filter_map(|id| app.entry(id).map(|entry| entry.name.clone()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                "alpaca".to_owned(),
+                "alpha".to_owned(),
+                "beta-alp".to_owned()
+            ],
+            "prefix matches precede substring matches, stable within a group"
+        );
+    }
+    #[test]
+    fn reader_from_a_thread_returns_to_thread_focus() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![
+                message_event(&author, id, "the root", 10),
+                reply_event(&author, id, &root, &root, "a reply", 20),
+            ],
+            false,
+        );
+        app.thread.focus = 1;
+        app.handle(Action::OpenReader, 50);
+        assert_eq!(app.surface(), keys::Surface::Reader);
+        assert_eq!(app.reader.event_id, reply);
+        app.handle(Action::ReaderClose, 50);
+        assert_eq!(app.surface(), keys::Surface::Thread);
+        assert_eq!(app.thread.focus, 1);
     }
 
     #[test]
@@ -7011,5 +9765,519 @@ mod tests {
         );
         assert_eq!(app.agent_count(), 0);
         assert!(app.selected_agent().is_none());
+    }
+
+    /// Two listed conversations with search opened from the first and one
+    /// keyword submitted. Returns the app, the origin conversation, and that
+    /// submission's request token.
+    fn searching() -> (App, Uuid, u64) {
+        let mut app = app();
+        app.apply(
+            ChatEvent::Channels(roster(vec![channel_info(1), channel_info(2)])),
+            0,
+        );
+        app.handle(Action::OpenSearch, 10);
+        for character in "decision".chars() {
+            app.handle(Action::SearchInput(character), 10);
+        }
+        app.handle(Action::SearchSubmit, 20);
+        let token = take_commands(&mut app)
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::Search { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("a search command");
+        (app, channel(1).id, token)
+    }
+
+    /// The token of the only outstanding search command.
+    fn last_search_token(app: &mut App) -> u64 {
+        take_commands(app)
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::Search { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("a search command")
+    }
+
+    #[test]
+    fn a_failed_retry_keeps_the_previous_results_and_labels_them() {
+        let (mut app, id, token) = searching();
+        let author = keys();
+        let hit = message_event(&author, id, "the decision", 20);
+        app.apply(
+            ChatEvent::Search {
+                request: token,
+                events: vec![hit.clone()],
+            },
+            21,
+        );
+        assert_eq!(app.search.results.len(), 1);
+        assert!(app.search.previous.is_none());
+
+        // A retry is loading until it answers, and never clears the answers
+        // of the query before it.
+        app.handle(Action::SearchEdit, 22);
+        app.handle(Action::SearchSubmit, 22);
+        assert!(app.search.loading);
+        assert_eq!(
+            app.search.results.len(),
+            1,
+            "prior results stay while loading"
+        );
+        let retry = last_search_token(&mut app);
+        app.apply(
+            ChatEvent::SearchFailed {
+                request: retry,
+                reason: "relay 500".into(),
+            },
+            23,
+        );
+        assert_eq!(app.search.failed.as_deref(), Some("relay 500"));
+        assert!(!app.search.loading);
+        assert_eq!(
+            app.search.results.len(),
+            1,
+            "a failed read keeps the previous results"
+        );
+        let previous = app
+            .search
+            .previous
+            .clone()
+            .expect("the previous query is named");
+        assert!(previous.contains("decision"), "{previous}");
+
+        // A late answer to the first request is stale now: the failed
+        // retry's list is never overwritten by an earlier one.
+        let late = message_event(&author, id, "late answer", 30);
+        app.apply(
+            ChatEvent::Search {
+                request: token,
+                events: vec![late],
+            },
+            24,
+        );
+        assert_eq!(app.search.results.len(), 1, "a stale response is ignored");
+        assert_eq!(app.search.results[0].event_id, hit.id.to_hex());
+
+        // Enter on a failed search retries the kept query and filters.
+        app.handle(Action::SearchSubmit, 25);
+        assert!(app.search.loading, "Enter retries a failed search");
+        assert!(
+            take_commands(&mut app)
+                .into_iter()
+                .any(|command| matches!(command, SessionCommand::Search { .. })),
+            "the retry goes back to the relay"
+        );
+    }
+
+    #[test]
+    fn search_selection_follows_the_event_id_across_replacements() {
+        let (mut app, id, token) = searching();
+        let author = keys();
+        let a = message_event(&author, id, "hit one", 20);
+        let b = message_event(&author, id, "hit two", 21);
+        app.apply(
+            ChatEvent::Search {
+                request: token,
+                events: vec![a, b.clone()],
+            },
+            21,
+        );
+        app.handle(Action::SearchNext, 22);
+        assert_eq!(app.search.results[app.search.focus].event_id, b.id.to_hex());
+
+        // The same query again: the selected hit keeps the selection even
+        // though the replacement list orders it differently.
+        app.handle(Action::SearchEdit, 23);
+        app.handle(Action::SearchSubmit, 23);
+        let retry = last_search_token(&mut app);
+        app.apply(
+            ChatEvent::Search {
+                request: retry,
+                events: vec![b.clone(), message_event(&author, id, "hit one", 20)],
+            },
+            24,
+        );
+        assert_eq!(
+            app.search.results[app.search.focus].event_id,
+            b.id.to_hex(),
+            "selection is the event id, not an array index"
+        );
+
+        // A replacement without the selected hit resets to the top instead
+        // of keeping the old index.
+        app.handle(Action::SearchEdit, 25);
+        app.handle(Action::SearchSubmit, 25);
+        let third = last_search_token(&mut app);
+        let c = message_event(&author, id, "hit three", 22);
+        app.apply(
+            ChatEvent::Search {
+                request: third,
+                events: vec![c],
+            },
+            26,
+        );
+        assert_eq!(app.search.focus, 0);
+    }
+
+    #[test]
+    fn unlisted_and_deleted_hits_are_hidden_and_counted() {
+        let (mut app, id, token) = searching();
+        let author = keys();
+        let keep = message_event(&author, id, "kept", 20);
+        let unlisted = message_event(&author, Uuid::from_u64_pair(99, 0), "elsewhere", 21);
+        let deleted = message_event(&author, id, "deleted hit", 22);
+        app.deleted_rows.insert(deleted.id.to_hex());
+        app.apply(
+            ChatEvent::Search {
+                request: token,
+                events: vec![keep.clone(), unlisted, deleted, keep.clone()],
+            },
+            21,
+        );
+        assert_eq!(
+            app.search.results.len(),
+            1,
+            "only the listed, live hit remains"
+        );
+        assert_eq!(app.search.results[0].event_id, keep.id.to_hex());
+        assert_eq!(
+            app.search.hidden, 2,
+            "the unlisted and the deleted hit are counted, not silent"
+        );
+        assert_eq!(
+            app.search.channels,
+            vec![id],
+            "channels stay index-aligned with results"
+        );
+    }
+
+    #[test]
+    fn the_filter_form_applies_on_submit_and_esc_restores_the_applied_filters() {
+        let (mut app, _id, _token) = searching();
+        app.handle(Action::SearchFilter, 30);
+        assert!(app.search.form, "f opens the filter form");
+        app.handle(Action::SearchInput('s'), 30);
+        assert_eq!(app.search.scope, SearchScope::All);
+        app.handle(Action::SearchInput('t'), 30);
+        assert_eq!(app.search.time, SearchTime::Days7);
+        app.handle(Action::SearchInput('j'), 30);
+        assert_eq!(app.search.form_row, 1, "j moves between the controls");
+
+        // Enter applies the form: the pending filters become the applied
+        // ones in the same explicit submission.
+        app.handle(Action::SearchSubmit, 7 * 24 * 60 * 60 + 31);
+        assert!(!app.search.form);
+        assert_eq!(app.search.applied_scope, SearchScope::All);
+        assert_eq!(app.search.applied_time, SearchTime::Days7);
+        let command = take_commands(&mut app)
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::Search { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("applying the form submits the search");
+        assert_eq!(
+            command.channel, None,
+            "all accessible searches without a channel filter"
+        );
+        assert_eq!(
+            command.since,
+            Some(31),
+            "the time preset is relative to the submit time"
+        );
+        assert_eq!(command.query, "decision");
+
+        // Pending changes that are never submitted change nothing.
+        app.handle(Action::SearchFilter, 32);
+        app.handle(Action::SearchInput('s'), 32);
+        app.handle(Action::SearchInput('t'), 32);
+        app.handle(Action::Dismiss, 32);
+        assert!(!app.search.form, "Esc cancels the form");
+        assert_eq!(
+            app.search.scope,
+            SearchScope::All,
+            "the applied scope is restored"
+        );
+        assert_eq!(app.search.time, SearchTime::Days7);
+        assert!(
+            take_commands(&mut app).is_empty(),
+            "a cancelled form never searches"
+        );
+    }
+
+    #[test]
+    fn the_author_picker_selects_a_whole_pubkey_and_labels_duplicates() {
+        let (mut app, _id, _token) = searching();
+        let first = keys();
+        let second = keys();
+        let first_hex = first.public_key().to_hex();
+        let second_hex = second.public_key().to_hex();
+        app.apply(
+            ChatEvent::Profiles(vec![
+                (first_hex.clone(), "Ada".into()),
+                (second_hex.clone(), "Ada".into()),
+            ]),
+            0,
+        );
+        app.handle(Action::SearchFilter, 30);
+        app.handle(Action::SearchInput('a'), 30);
+        let pick = app
+            .search
+            .author_pick
+            .as_ref()
+            .expect("a opens the author picker");
+        assert_eq!(
+            pick.candidates
+                .iter()
+                .filter(|candidate| candidate.name == "Ada")
+                .count(),
+            2,
+            "duplicate names stay separate entries"
+        );
+        let label = app.author_label(&first_hex);
+        assert!(label.contains("Ada"), "{label}");
+        assert!(
+            label.contains(&content::short_pubkey(&first_hex)),
+            "the short key travels with the name: {label}"
+        );
+
+        app.handle(Action::SearchSubmit, 31);
+        let chosen = app.search.author.clone().expect("a candidate is chosen");
+        assert!(
+            chosen == first_hex || chosen == second_hex,
+            "the full public key is stored, never a display name"
+        );
+        assert!(app.search.form, "back to the form with the author set");
+
+        // An exact pubkey typed by hand is accepted whole.
+        app.handle(Action::SearchInput('a'), 32);
+        app.handle(Action::SearchInput('p'), 32);
+        let exact = keys().public_key().to_hex();
+        for character in exact.chars() {
+            app.handle(Action::SearchInput(character), 32);
+        }
+        app.handle(Action::SearchSubmit, 33);
+        assert_eq!(app.search.author.as_deref(), Some(exact.as_str()));
+
+        // A partial key is an error to report, not an identity to guess.
+        app.handle(Action::SearchInput('a'), 34);
+        app.handle(Action::SearchInput('p'), 34);
+        for character in "abcd".chars() {
+            app.handle(Action::SearchInput(character), 34);
+        }
+        app.handle(Action::SearchSubmit, 35);
+        assert!(app.search.failed.is_some(), "a partial pubkey is reported");
+        assert!(app.search.author_pick.is_some(), "the picker stays open");
+        assert_eq!(
+            app.search.author.as_deref(),
+            Some(exact.as_str()),
+            "the old author is kept"
+        );
+    }
+
+    #[test]
+    fn an_author_alone_is_a_search_without_a_keyword() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        let author = keys();
+        app.apply(
+            ChatEvent::Profiles(vec![(author.public_key().to_hex(), "Mina".into())]),
+            0,
+        );
+        app.handle(Action::OpenSearch, 10);
+        // Esc leaves the empty query editing; the results surface owns f now.
+        app.handle(Action::Dismiss, 10);
+        app.handle(Action::SearchFilter, 11);
+        app.handle(Action::SearchInput('a'), 11);
+        app.handle(Action::SearchSubmit, 12);
+        assert_eq!(
+            app.search.author,
+            Some(author.public_key().to_hex()),
+            "the known profile is picked"
+        );
+        app.handle(Action::SearchSubmit, 13);
+        let command = take_commands(&mut app)
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::Search { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("an author alone searches");
+        assert_eq!(command.query, "");
+        assert_eq!(
+            command.author.as_deref(),
+            Some(author.public_key().to_hex().as_str())
+        );
+        assert!(app.search.failed.is_none());
+    }
+
+    #[test]
+    fn the_scope_picker_chooses_one_listed_conversation() {
+        let (mut app, _id, _token) = searching();
+        app.handle(Action::SearchFilter, 30);
+        app.handle(Action::SearchInput('o'), 30);
+        let pick = app
+            .search
+            .scope_pick
+            .as_ref()
+            .expect("o opens the conversation picker");
+        assert_eq!(
+            pick.options.len(),
+            2,
+            "the options are the listed conversations"
+        );
+        app.handle(Action::SearchNext, 30);
+        app.handle(Action::SearchSubmit, 31);
+        let second = app.channels[1].id;
+        assert_eq!(app.search.scope, SearchScope::Conversation(second));
+        app.handle(Action::SearchSubmit, 32);
+        let command = take_commands(&mut app)
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::Search { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("the chosen conversation is searched");
+        assert_eq!(command.channel, Some(second));
+
+        // A scope whose conversation left the roster is reported, and the
+        // query is kept rather than silently broadened.
+        app.search.scope = SearchScope::Conversation(Uuid::from_u64_pair(99, 0));
+        app.handle(Action::SearchEdit, 33);
+        app.handle(Action::SearchSubmit, 33);
+        assert!(app.search.failed.is_some(), "the lost scope is reported");
+        assert_eq!(
+            app.search.applied_scope,
+            SearchScope::Conversation(second),
+            "the last applied scope is kept"
+        );
+        assert!(
+            take_commands(&mut app)
+                .into_iter()
+                .all(|command| !matches!(command, SessionCommand::Search { .. })),
+            "nothing is sent for an unsupported scope"
+        );
+    }
+
+    #[test]
+    fn an_empty_submit_invites_instead_of_loading_the_archive() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        app.handle(Action::OpenSearch, 10);
+        app.handle(Action::SearchSubmit, 11);
+        assert_eq!(
+            app.search.failed.as_deref(),
+            Some("enter a keyword or an exact author")
+        );
+        assert!(!app.search.loading);
+        assert!(
+            take_commands(&mut app)
+                .into_iter()
+                .all(|command| !matches!(command, SessionCommand::Search { .. })),
+            "an empty submit never asks the relay for everything"
+        );
+    }
+
+    #[test]
+    fn context_rows_follow_edits_and_deletions() {
+        let (mut app, id, token) = searching();
+        let author = keys();
+        let hit = message_event(&author, id, "original", 20);
+        app.apply(
+            ChatEvent::Search {
+                request: token,
+                events: vec![hit.clone()],
+            },
+            21,
+        );
+        app.handle(Action::SearchSubmit, 22);
+        let request = app.context.request;
+        app.apply(
+            ChatEvent::Context {
+                channel: id,
+                target: hit.id.to_hex(),
+                request,
+                events: vec![hit.clone()],
+                before_complete: true,
+                after_complete: true,
+            },
+            23,
+        );
+        app.apply(
+            ChatEvent::Overlay(edit_event(&hit.id.to_hex(), "edited")),
+            24,
+        );
+        assert_eq!(app.context.rows[0].body, "edited");
+        app.apply(ChatEvent::Overlay(delete_event(&hit.id.to_hex())), 25);
+        assert!(app.context.rows.is_empty());
+        assert_eq!(app.context.failed.as_deref(), Some("message deleted"));
+    }
+
+    #[test]
+    fn inspection_views_never_publish_the_underlying_channel_frontier() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        app.marker_read = true;
+        app.channels[0].read.known = true;
+        app.channels[0].read.marked = false;
+        app.channels[0].read.coverage = Coverage::Complete;
+        app.focus = app.channels[0].rows.len() - 1;
+        app.search.open = true;
+        app.note_presented();
+        assert!(
+            take_commands(&mut app)
+                .into_iter()
+                .all(|command| !matches!(command, SessionCommand::ReadProgress { .. }))
+        );
+    }
+
+    #[test]
+    fn author_picker_escape_returns_to_the_filter_form() {
+        let (mut app, _id, _token) = searching();
+        app.handle(Action::SearchFilter, 30);
+        app.handle(Action::SearchInput('a'), 30);
+        assert!(app.search.author_pick.is_some());
+        app.handle(Action::Dismiss, 31);
+        assert!(app.search.author_pick.is_none());
+        assert!(app.search.form);
+    }
+
+    #[test]
+    fn revoking_a_context_conversation_clears_inspection_content() {
+        let (mut app, id, token) = searching();
+        let author = keys();
+        let hit = message_event(&author, id, "revoked", 20);
+        app.apply(
+            ChatEvent::Search {
+                request: token,
+                events: vec![hit.clone()],
+            },
+            21,
+        );
+        app.handle(Action::SearchSubmit, 22);
+        app.apply(
+            ChatEvent::Context {
+                channel: id,
+                target: hit.id.to_hex(),
+                request: app.context.request,
+                events: vec![hit],
+                before_complete: true,
+                after_complete: true,
+            },
+            23,
+        );
+        app.apply(
+            ChatEvent::ChannelGone {
+                channel: id,
+                reason: "membership lost".into(),
+            },
+            24,
+        );
+        assert!(!app.context.open);
+        assert!(app.context.rows.is_empty());
+        assert!(!app.search.open);
     }
 }

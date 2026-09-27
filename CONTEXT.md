@@ -173,3 +173,10 @@ Do not use these words for a `buzzx` concept:
 - **server** for the relay. The relay is the server.
 - **session** for a channel view. A session is the whole run; a channel view
   is the selection.
+
+## Reader
+
+**reader**:
+A proposed full-screen view of one loaded, confirmed row's rendered text. It
+scrolls within that row and retains the originating conversation and event
+identity. Its behavior is specified in [complete-message reading](docs/tui-reading.md).

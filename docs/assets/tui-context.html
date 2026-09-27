@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Buzzx · 找回上下文，继续协作</title>
+<style>
+:root{color-scheme:light;--ink:#26372f;--muted:#5b6b61;--line:#c9d1c7;--green:#305e46;--paper:#f3f2ec}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 system-ui,sans-serif}main{max-width:1220px;margin:auto;padding:28px 36px}header{display:flex;justify-content:space-between;gap:20px;border-bottom:1px solid var(--line);padding-bottom:16px}.brand{font-size:21px;font-weight:750;letter-spacing:-.7px}.tag{font-size:12px;color:var(--muted);text-align:right}h1{font-size:40px;line-height:1.3;letter-spacing:-1px;margin:26px 0 12px}p{margin:0;color:var(--muted)}.intro{max-width:860px}.bar{display:flex;gap:25px;align-items:center;background:#e3e8dd;border-left:3px solid #729176;padding:13px 18px;margin:22px 0}.bar strong{font-size:22px;white-space:nowrap}.bar span{font-size:13px}.sectionline{display:flex;gap:18px;justify-content:space-between;align-items:center;margin:24px 0 12px}h2{font-size:18px;margin:0}small{font-size:12px;color:var(--muted)}button,select{font:inherit;font-size:13px;color:inherit;background:transparent;border:1px solid #abbcaf;border-radius:3px;padding:7px 11px;cursor:pointer}button:hover{border-color:var(--green)}button:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid #438163;outline-offset:3px}button[aria-pressed=true],button.primary{background:var(--green);border-color:var(--green);color:#fff}button:disabled{opacity:.45;cursor:default}.steps{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:14px 0}.steps button{text-align:left;border:0;border-top:2px solid var(--line);border-radius:0;padding:10px 8px;line-height:1.45}.steps button b{display:block;font-size:15px}.steps button span{font-size:12px}.steps button[aria-pressed=true]{background:#e3e8dd;color:var(--ink);border-color:var(--green)}.walkthrough{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:25px}.terminal{min-width:0;background:#151b1b;color:#e4ebe5;padding:18px 21px;border-radius:4px;font:14px/1.65 'DejaVu Sans Mono','Liberation Mono',monospace}.t-head{font-weight:700;border-bottom:1px solid #394740;padding-bottom:7px;margin-bottom:7px}.t-sub{color:#a7b9ad;margin-bottom:12px}.t-body{min-height:190px;white-space:pre-wrap;overflow-wrap:anywhere}.t-keys{border-top:1px solid #394740;padding-top:7px;margin-top:10px;color:#a7b9ad}.t-state{color:#ddc285;min-height:1.65em}.aside{border-left:1px solid var(--line);padding-left:22px}.aside h3{font-size:19px;margin:0 0 10px}.aside p{font-size:14px}.promise{margin-top:20px;padding-top:12px;border-top:1px solid var(--line);color:var(--green);font-size:13px}.controls{display:flex;gap:8px;margin-top:16px;align-items:center;flex-wrap:wrap}.modules{display:grid;grid-template-columns:repeat(3,1fr);gap:14px 28px;margin-top:16px}.module{border-top:1px solid var(--line);padding-top:10px}.module h3{font-size:16px;margin:0 0 4px}.module h3 span{font-size:12px;margin-right:8px;color:var(--green)}.module p{font-size:13px}.milestones{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-top:16px}.milestone{border-top:2px solid #91a694;padding-top:9px}.milestone b{display:block;font-size:14px}.milestone p{font-size:12px;margin-top:4px}.footer{border-top:1px solid var(--line);padding-top:13px;margin-top:22px;font-size:12px;color:var(--muted)}a{color:var(--green)}.controls a{font-size:12px}label{font-size:12px;color:var(--muted)}
+@media(max-width:850px){main{padding:22px}.walkthrough{grid-template-columns:1fr}.aside{border-left:0;padding:0}.aside h3{margin-top:3px}.promise{margin-top:10px}.modules{grid-template-columns:repeat(2,1fr)}.milestones{grid-template-columns:repeat(2,1fr)}h1{font-size:32px}.terminal{font-size:13px}}
+@media(max-width:520px){main{padding:18px}.bar{gap:12px;align-items:flex-start;flex-direction:column}.bar strong{font-size:20px}.steps{grid-template-columns:repeat(3,1fr)}.sectionline{align-items:flex-start;flex-direction:column;gap:8px}.modules{grid-template-columns:1fr}.terminal{padding:13px;font-size:12px}.t-body{min-height:155px}h1{font-size:29px}.brand{font-size:18px}.tag{max-width:160px}.milestones{gap:15px}.footer{line-height:1.8}}
+</style></head><body><main>
+<header><div class="brand">buzzx / 产品规划</div><div class="tag">CONTEXT · RELEASE PROPOSAL<br>流程评审 · 尚未实现</div></header>
+<h1>找回一段讨论，继续原来的工作。</h1>
+<p class="intro">记得一个关键词、一个频道或一位作者，就能找回旧决定，读完前后讨论，再准确回复。结束查阅后，回到原来的位置和草稿。</p>
+<div class="bar"><strong>6 项能力 · 4 个里程碑</strong><span>整版交付的是一次完整协作流程。全文阅读是其中一环；只完成阅读器，不代表这个版本完成。</span></div>
+<div class="sectionline"><h2>一条完整路径</h2><label>切换场景 <select id="scenario"><option value="phrase">记得关键词</option><option value="channel">记得频道</option><option value="draft">带着草稿查资料</option></select></label></div>
+<nav class="steps" aria-label="流程步骤">
+<button data-step="0" aria-pressed="true"><b>01 找到讨论</b><span>查会话 / 搜消息</span></button>
+<button data-step="1" aria-pressed="false"><b>02 看前后文</b><span>精确定位消息</span></button>
+<button data-step="2" aria-pressed="false"><b>03 读到结论</b><span>历史 + 全文阅读</span></button>
+<button data-step="3" aria-pressed="false"><b>04 继续协作</b><span>回复同一条消息</span></button>
+<button data-step="4" aria-pressed="false"><b>05 回到原处</b><span>保留位置与草稿</span></button>
+</nav>
+<div class="walkthrough" aria-live="polite">
+<div class="terminal" aria-label="拟议界面示意，非终端运行画面"><div class="t-head" id="head"></div><div class="t-sub" id="sub"></div><div class="t-body" id="body"></div><div class="t-keys" id="keys"></div><div class="t-state" id="state"></div></div>
+<aside class="aside"><h3 id="title"></h3><p id="description"></p><div class="promise" id="promise"></div><div class="controls"><button id="previous">上一步</button><button id="next" class="primary">下一步</button><a href="tui-reading.html">打开全文阅读交互稿</a></div></aside>
+</div>
+<div class="sectionline"><h2>版本范围</h2><small>复用现有 Inbox、线程、发送语义和视觉体系</small></div>
+<div class="modules">
+<section class="module"><h3><span>C1</span>快速找到会话</h3><p>在频道与私信列表按名称查找，保留 Inbox 筛选和未读信号。</p></section>
+<section class="module"><h3><span>C2</span>搜索历史消息</h3><p>按内容、会话、作者和时间筛选；清楚区分无结果、失败和数量上限。</p></section>
+<section class="module"><h3><span>C3</span>进入准确上下文</h3><p>打开命中的那一条，查看前后文和所属线程，不只给一段摘要。</p></section>
+<section class="module"><h3><span>C4</span>连续阅读历史</h3><p>继续加载更早或更晚的讨论，跨过当前历史和线程的加载上限。</p></section>
+<section class="module"><h3><span>C5</span>完整读完消息</h3><p>长回复按行阅读，到达文末结论；保持作者、来源和回复目标。</p></section>
+<section class="module"><h3><span>C6</span>安全继续与返回</h3><p>跨视图保留位置和草稿；查阅不清空频道未读，回复不改变目标。</p></section>
+</div>
+<div class="sectionline"><h2>按完整能力分阶段交付</h2><small>每阶段可演示；M4 后做整体验收</small></div>
+<div class="milestones">
+<div class="milestone"><b>M1 · 阅读与返回基础</b><p>读完长消息，返回并保护草稿。</p></div>
+<div class="milestone"><b>M2 · 找到并进入讨论</b><p>搜索已加载范围外的旧消息，打开准确上下文。</p></div>
+<div class="milestone"><b>M3 · 历史连续可读</b><p>跨越加载上限，保留位置并明确数据边界。</p></div>
+<div class="milestone"><b>M4 · 协作流程验收</b><p>找决定 → 读上下文 → 回复 → 回原处。</p></div>
+</div>
+<div class="footer">评审示意使用虚构消息，不发请求、不发送消息。搜索最多返回 50 条；历史翻页单独验收。同秒边界与筛选契约需实施前验证。<br>规范：<a href="../tui-context.md">tui-context.md</a> · 阅读子规范：<a href="../tui-reading.md">tui-reading.md</a> · 不含任务管理、Agent 控制或 AI 总结。</div>
+</main>
+<script>
+const view = {step:0,scenario:'phrase'};
+const screens = [
+ {head:'Search messages',sub:'All listed conversations · Any author · All time',body:'Query: release decision\n\n> #release  Mina  Sep 18 14:32\n  Final decision: revise before release.\n  Reply in: Launch checklist\n\n  #frontend  Jules  Sep 16 09:10\n  Waiting for the release decision.',keys:'j/k select  Enter context  / query  f filters',state:'2 results returned',title:'从记得的线索开始',description:'消息搜索覆盖当前加载窗口以外的记录。范围、作者和时间显式呈现，选中一条后进入上下文。',promise:'搜索结果保留原有顺序；50 条是返回上限，不是全部匹配数。'},
+ {head:'#release · Search context',sub:'Sep 18 · selected hit · thread: Launch checklist',body:'Mina 14:28\nCan we ship after the last review?\n──────────────────────────────────────\n> Mina 14:32\nFinal decision: revise before release.\nSee the complete review below.\n──────────────────────────────────────\nJules 14:35\nI will address the remaining issues.',keys:'j/k move  t thread  v read  Enter reply  Esc back',state:'Context loaded · earlier / later available',title:'结果落在真正的讨论里',description:'命中消息保持选中；可以读前后文、进入所属线程，或回复这条消息。Esc 回到原查询和原结果。',promise:'按消息身份定位；相同作者、相同时间的邻近消息不能代替命中项。'},
+ {head:'#release · Read message',sub:'Mina · Sep 18 14:32 · Launch checklist',body:'56  Resize preserves the selected event.\n57  New arrivals must not steal focus.\n58\n59  Review conclusion\n60  Final decision: revise before release.',keys:'j/k line  PgUp/PgDn page  G end  Enter reply',state:'56–60 / 60 · End',title:'既读完整消息，也读完整过程',description:'历史视图继续加载前后讨论；长消息再进入全文阅读。两种阅读各自保留位置，来信不把你拉回底部。',promise:'无法跨越的数据边界明确显示；不能把有限的加载窗口说成完整历史。'},
+ {head:'#release · Search context',sub:'Reply to Mina · Launch checklist',body:'> Mina 14:32\nFinal decision: revise before release.\n\nReply to Mina\nI reviewed the conclusion. The fixes are ready.▌\n\nThe target remains the selected reply.',keys:'Enter send  Esc navigation  Ctrl+f search',state:'Composing · reply target retained',title:'沿着原讨论继续',description:'回复目标仍是刚读过的消息，嵌套回复保留所属线程与直接父消息。发送结果在当前会话显示。',promise:'发送结果不确定时如实显示；不能把“重试查阅”变成重复发送。'},
+ {head:'#build · Original work',sub:'Inbox: Unread · original event restored',body:'> Jules 10:42\nPlease review the terminal changes.\n\nYour original selection is restored.\nNew arrivals remain in the background.\n\nContinue where you left off.',keys:'j/k move  / search  v read  Enter reply',state:'Returned · original filter and position',title:'查阅结束，工作接得上',description:'Esc 按实际访问路径返回：全文、线程、上下文、搜索、原工作。恢复原来的筛选和选中消息。',promise:'查阅页面不会清空整个频道的未读；回到最新时间线才沿用现有已读规则。'},
+];
+function screen(){
+ const s={...screens[view.step]};
+ if(view.scenario==='channel' && view.step===0) Object.assign(s,{head:'Conversations',sub:'Inbox: All · Name: release',body:'> #release\n  Launch decisions and review\n\n  #release-notes\n  Weekly release notes\n\nEnter opens the selected conversation.',keys:'/ name filter  j/k select  Enter open  Esc back',state:'2 matching listed conversations',title:'记得频道，先找到会话',description:'在现有会话列表直接按名称筛选。打开频道后，可以继续阅读历史，或用 / 在这个会话内搜索旧决定。',promise:'频道名筛选只查已列出的可访问会话；不会搜索、加入陌生频道。'});
+ if(view.scenario==='channel' && view.step===1) s.description='从 #release 的历史找到消息，或在该会话中搜索后打开命中项。这里示意后者；查找会话与查消息是相接的入口。';
+ if(view.scenario==='channel' && view.step===4) Object.assign(s,{head:'#release · Original work',sub:'Inbox: All · search origin restored',body:'> Jules 16:42\nThe next review starts tomorrow.\n\nReturned to the event selected before search.\nContinue in #release.',description:'在 #release 内开始搜索，查阅结束后回到这个会话的原选中消息。会话查找入口沿用现有切换行为。'});
+ if(view.scenario==='draft' && view.step===0) s.promise='Ctrl+f 从输入区进入查阅；原文字、回复目标和输入光标都保留。';
+ if(view.scenario==='draft' && view.step===3) Object.assign(s,{head:'#release · Read message',sub:'Mina · Sep 18 14:32 · Launch checklist',body:'Final decision: revise before release.\n\nA draft already belongs to #build.\nFinish or clear it before replying here.\n\nThe existing draft was not changed.',keys:'Esc back  ? help',state:'Draft kept; Esc back',title:'草稿先于跨会话回复',description:'有未发草稿时，Enter 停留在阅读页并说明原因。原文字和原目标不变，不把草稿搬进另一段讨论。',promise:'这条路径此时不会发送；先返回完成或清理原草稿，再进行新的回复。'});
+ if(view.scenario==='draft' && view.step===4) Object.assign(s,{body:'> Jules 10:42\nPlease review the terminal changes.\n\nReply to Jules\nI checked the first part of the change...\n\nOriginal draft and target retained.',state:'Returned · draft kept in #build',description:'逐层返回后，原草稿、原发送目标、原选中消息和 Inbox 筛选仍然在。查阅过程中没有发布任何回复。'});
+ return s;
+}
+function render(){
+ const s=screen();
+ for(const id of ['head','sub','keys','state','title','description','promise']) document.getElementById(id).textContent=s[id];
+ const body=document.getElementById('body');body.replaceChildren();s.body.split('\n').forEach((line,i)=>{const span=document.createElement('span');span.textContent=(i?'\n':'')+line;if(line.startsWith('─'))span.style.color='#687f73';if(line.startsWith('>'))span.style.color='#9ed8c4';body.append(span);});
+ document.querySelectorAll('[data-step]').forEach(el=>el.setAttribute('aria-pressed',String(Number(el.dataset.step)===view.step)));
+ document.getElementById('previous').disabled=view.step===0;
+ document.getElementById('next').textContent=view.step===4?'重新查看':'下一步';
+}
+document.querySelectorAll('[data-step]').forEach(el=>el.addEventListener('click',()=>{view.step=Number(el.dataset.step);render();}));
+document.getElementById('scenario').addEventListener('change',event=>{view.scenario=event.target.value;view.step=0;render();});
+document.getElementById('previous').addEventListener('click',()=>{view.step=Math.max(0,view.step-1);render();});
+document.getElementById('next').addEventListener('click',()=>{view.step=(view.step+1)%5;render();});
+render();
+</script></body></html>

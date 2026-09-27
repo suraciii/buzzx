@@ -27,10 +27,15 @@ recipient-correctness rule for the composer: a complete `@member name` in a new
 message or reply becomes a signed recipient, and a draft that cannot be resolved
 is not published.
 
-[Focused thread reading](tui-use.md#planned-focused-thread-reading) is the next
-planned TUI slice: open one discussion, reply, and return to the channel.
-It is a product spec, not an implemented capability.
+The [Focused thread reading](tui-use.md#focused-thread-reading) section documents the implemented thread navigation: open one discussion, reply, and return to the channel.
+It is a product capability, not a planned slice.
 
 [tui-visual.md](tui-visual.md) is the approved implementation spec for the shared TUI
 visual language, with message separators, region budgets and acceptance checks.
 Its atlas shows intended appearance; the change is not yet implemented.
+
+[Complete-message reading](tui-reading.md) documents the implemented full-screen reader for a
+loaded row whose content exceeds the timeline, with line scrolling and return
+to its original reply target. It is part of the M1 foundation and the find-and-resume release.
+
+[Find and resume a conversation](tui-context.md) is the release-level specification for conversation lookup, message search, context, history, complete reading and safe return. The implementation status and acceptance evidence are tracked in the linked workspace log.
