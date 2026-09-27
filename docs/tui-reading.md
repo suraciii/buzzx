@@ -1,9 +1,10 @@
 # Read a complete message
 
-Status: proposed product spec, revision 1. Not implemented. Based on merged
-commit 88595b95b94875533e69704cda4c03f6a31eb9c2. This adds the
-[reader](../CONTEXT.md#reader) to the existing TUI; it does not change the
-approved [visual language](tui-visual.md).
+Status: M1 implemented in `buzzx-visual-spec` on the reader implementation
+branch. The full release remains incomplete: conversation filters, message
+search, context results and incremental history are not implemented. This
+spec is the contract for the reader and safe return; the implementation is
+based on merged commit 88595b95b94875533e69704cda4c03f6a31eb9c2.
 
 ## Problem and priority
 
