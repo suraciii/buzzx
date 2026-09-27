@@ -576,6 +576,37 @@ impl ThreadView {
     }
 }
 
+/// Where the full-message reader returns. The saved focus is an index
+/// fallback when the bound row is deleted while the reader is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderOrigin {
+    Channel { channel: Uuid, focus: usize },
+    Thread { channel: Uuid, focus: usize },
+}
+
+/// Full-screen reader state. It binds to an event id rather than to a row
+/// index, so incoming rows never move the document under the user's eyes.
+#[derive(Debug, Clone, Default)]
+pub struct ReaderView {
+    pub open: bool,
+    pub origin: Option<ReaderOrigin>,
+    pub event_id: String,
+    pub row: Option<Row>,
+    /// Offset in source display lines. The renderer clamps it to its current
+    /// viewport, so a resize preserves the source-line anchor.
+    pub scroll: usize,
+    pub notice: Option<String>,
+    pub deleted: bool,
+}
+
+impl ReaderView {
+    pub fn channel(&self) -> Option<Uuid> {
+        self.origin.map(|origin| match origin {
+            ReaderOrigin::Channel { channel, .. } | ReaderOrigin::Thread { channel, .. } => channel,
+        })
+    }
+}
+
 pub struct App {
     pub me: String,
     pub relay_label: String,
@@ -631,7 +662,8 @@ pub struct App {
     /// The owned Agents and what the observer feed says about their work.
     pub agents: AgentView,
     /// The focused thread view. One view at a time: it replaces the channel
-    /// timeline instead of covering it.
+    /// The full-screen reader bound to one loaded message.
+    pub reader: ReaderView,
     pub thread: ThreadView,
     thread_request: u64,
     /// A thread draft whose channel closed cannot be sent to the replacement
@@ -684,6 +716,7 @@ impl App {
             status: "connecting".to_owned(),
             composer: Composer::new(),
             agents: AgentView::default(),
+            reader: ReaderView::default(),
             thread: ThreadView::default(),
             thread_request: 0,
             draft_blocked: false,
@@ -970,11 +1003,15 @@ impl App {
         for row in &mut self.thread.rows {
             row.author = author_name(&profiles, &me, &row.pubkey);
         }
+        if let Some(row) = &mut self.reader.row {
+            row.author = author_name(&profiles, &me, &row.pubkey);
+        }
     }
 
-    /// Which timeline the key map is driving, for the key map.
     pub fn surface(&self) -> keys::Surface {
-        if self.thread.open {
+        if self.reader.open {
+            keys::Surface::Reader
+        } else if self.thread.open {
             keys::Surface::Thread
         } else {
             keys::Surface::Channel
@@ -1196,6 +1233,9 @@ impl App {
             }
             ChatEvent::Overlay(event) => self.apply_overlay(event),
             ChatEvent::ChannelGone { channel, reason } => {
+                if self.reader.open && self.reader.channel() == Some(channel) {
+                    self.reader = ReaderView::default();
+                }
                 let preserve_thread_draft = self.thread.open && !self.composer.text().is_empty();
                 if preserve_thread_draft {
                     self.draft_blocked = true;
@@ -2298,6 +2338,181 @@ impl App {
         self.thread.focus = index.min(self.thread.rows.len() - 1);
     }
 
+    /// Open the loaded, confirmed focused row without changing read progress.
+    fn open_reader(&mut self) {
+        if self.reader.open {
+            return;
+        }
+        let selected = if self.thread.open {
+            self.thread.focused().map(|row| {
+                (
+                    ReaderOrigin::Thread {
+                        channel: self.thread.channel,
+                        focus: self.thread.focus,
+                    },
+                    row.clone(),
+                )
+            })
+        } else {
+            self.focused_row().and_then(|row| {
+                self.selected_entry().map(|entry| {
+                    (
+                        ReaderOrigin::Channel {
+                            channel: entry.id,
+                            focus: self.focus,
+                        },
+                        row.clone(),
+                    )
+                })
+            })
+        };
+        let (origin, row) = selected.unzip();
+        let Some((origin, row)) = origin.zip(row) else {
+            self.note("no message to read");
+            return;
+        };
+        if row.pending {
+            self.note("Wait for confirmation");
+            return;
+        }
+        if row.uncertain {
+            self.note("Unconfirmed message");
+            return;
+        }
+        if !is_event_id(&row.event_id) {
+            self.note("Wait for confirmation");
+            return;
+        }
+        self.help = false;
+        self.picker = None;
+        self.agents.open = false;
+        self.reader = ReaderView {
+            open: true,
+            origin: Some(origin),
+            event_id: row.event_id.clone(),
+            row: Some(row),
+            scroll: 0,
+            notice: None,
+            deleted: false,
+        };
+    }
+
+    /// Return to the exact origin surface without presenting a new row.
+    fn close_reader(&mut self) {
+        if !self.reader.open {
+            return;
+        }
+        let reader = std::mem::take(&mut self.reader);
+        let notice = reader.notice;
+        let Some(origin) = reader.origin else {
+            return;
+        };
+        match origin {
+            ReaderOrigin::Channel { channel, focus } => {
+                if let Some(index) = self.channels.iter().position(|entry| entry.id == channel) {
+                    self.selected = index;
+                    let selected = &self.channels[index];
+                    self.focus = reader
+                        .event_id
+                        .is_empty()
+                        .then_some(focus)
+                        .or_else(|| {
+                            selected
+                                .rows
+                                .iter()
+                                .position(|row| row.event_id == reader.event_id)
+                        })
+                        .unwrap_or_else(|| focus.min(selected.rows.len().saturating_sub(1)));
+                }
+            }
+            ReaderOrigin::Thread { focus, .. } => {
+                if self.thread.open {
+                    self.thread.focus = self
+                        .thread
+                        .rows
+                        .iter()
+                        .position(|row| row.event_id == reader.event_id)
+                        .unwrap_or_else(|| focus.min(self.thread.rows.len().saturating_sub(1)));
+                }
+            }
+        }
+        if let Some(notice) = notice {
+            self.status = notice;
+        }
+    }
+
+    fn reader_reply(&mut self) {
+        if !self.reader.open {
+            return;
+        }
+        if !self.composer.text().is_empty() {
+            self.reader.notice = Some("Draft kept; Esc back".to_owned());
+            self.status = "Draft kept; Esc back".to_owned();
+            return;
+        }
+        if self.reader.deleted {
+            self.note("Message deleted");
+            return;
+        }
+        let Some(row) = self.reader.row.clone() else {
+            self.note("Message deleted");
+            return;
+        };
+        let target = ReplyTarget {
+            event_id: row.event_id,
+            author: row.author,
+        };
+        self.close_reader();
+        self.composer.edit = None;
+        self.composer.reply = Some(target);
+        self.mode = Mode::Composer;
+    }
+
+    fn handle_reader(&mut self, action: Action) {
+        match action {
+            Action::Dismiss => {
+                if self.help {
+                    self.help = false;
+                } else {
+                    self.close_reader();
+                }
+            }
+            Action::Quit => self.quit = true,
+            Action::ToggleHelp => {
+                self.help = !self.help;
+                if self.help {
+                    self.help_scroll = 0;
+                }
+            }
+            Action::HelpScroll(step) => {
+                self.help_scroll = self.help_scroll.saturating_add_signed(step as i16);
+            }
+            Action::ReaderNextLine => {
+                self.reader.scroll = self.reader.scroll.saturating_add(1);
+            }
+            Action::ReaderPrevLine => {
+                self.reader.scroll = self.reader.scroll.saturating_sub(1);
+            }
+            Action::ReaderPageUp => {
+                self.reader.scroll = self
+                    .reader
+                    .scroll
+                    .saturating_sub(PAGE_ROWS.saturating_sub(1));
+            }
+            Action::ReaderPageDown => {
+                self.reader.scroll = self
+                    .reader
+                    .scroll
+                    .saturating_add(PAGE_ROWS.saturating_sub(1));
+            }
+            Action::ReaderTop => self.reader.scroll = 0,
+            Action::ReaderBottom => self.reader.scroll = usize::MAX,
+            Action::ReaderReply => self.reader_reply(),
+            Action::ReaderClose => self.close_reader(),
+            _ => {}
+        }
+    }
+
     /// `t` in the channel timeline: open the focused message's thread. A
     /// top-level message is its own root; a reply names the root it belongs
     /// to, which may sit outside the loaded channel history.
@@ -2493,6 +2708,7 @@ impl App {
             Action::PageUp => self.thread_focus(self.thread.focus.saturating_sub(PAGE_ROWS)),
             Action::PageDown => self.thread_focus(self.thread.focus.saturating_add(PAGE_ROWS)),
             Action::ThreadLeave => self.leave_thread(),
+            Action::OpenReader => self.open_reader(),
             Action::ThreadRetry => self.retry_thread(),
             Action::ThreadReplyRoot => self.thread_compose(true),
             Action::ThreadReplyFocused => self.thread_compose(false),
@@ -2719,6 +2935,7 @@ impl App {
                     }
                     content::apply_overlay(row, &content::Overlay::Edit { body: body.clone() })
                 });
+                self.sync_reader_row(&target, true);
                 if let Some(candidate) = self
                     .channels
                     .iter_mut()
@@ -2755,9 +2972,41 @@ impl App {
         for row in self.thread.rows.iter_mut().filter(|r| r.event_id == target) {
             apply(row);
         }
+        self.sync_reader_row(target, false);
+    }
+
+    fn sync_reader_row(&mut self, target: &str, reset: bool) {
+        if !self.reader.open || self.reader.event_id != target {
+            return;
+        }
+        let row = self
+            .channels
+            .iter()
+            .flat_map(|entry| entry.rows.iter())
+            .chain(self.thread.rows.iter())
+            .find(|row| row.event_id == target)
+            .cloned();
+        if let Some(row) = row {
+            self.reader.row = Some(row);
+            self.reader.deleted = false;
+            if reset {
+                self.reader.scroll = 0;
+                self.reader.notice = Some("Updated; at start".to_owned());
+            }
+        }
+    }
+
+    fn mark_reader_deleted(&mut self, target: &str) {
+        if self.reader.open && self.reader.event_id == target {
+            self.reader.row = None;
+            self.reader.deleted = true;
+            self.reader.scroll = 0;
+            self.reader.notice = Some("Message deleted".to_owned());
+        }
     }
 
     fn remove_row(&mut self, target: &str) {
+        self.mark_reader_deleted(target);
         self.deleted_rows.insert(target.to_owned());
         // Record deletion before the thread read arrives. The channel cache is
         // the only proof that a root belongs to the active thread at that
@@ -2852,6 +3101,10 @@ impl App {
     }
 
     fn handle_navigation(&mut self, action: Action, now: u64) {
+        if self.reader.open {
+            self.handle_reader(action);
+            return;
+        }
         if self.thread.open {
             // The thread view is the surface: it isolates the conversation
             // keys instead of laying an overlay over the timeline.
@@ -2952,6 +3205,7 @@ impl App {
             Action::EditRow => self.edit_focused(),
             Action::DeleteRow => self.delete_focused(),
             Action::OpenThread => self.open_thread(),
+            Action::OpenReader => self.open_reader(),
             Action::Ignored => {}
             _ => {}
         }
@@ -3861,6 +4115,79 @@ mod tests {
         (app, id, root, reply, author)
     }
 
+    #[test]
+    fn the_reader_binds_to_an_event_and_returns_to_its_origin() {
+        let (mut app, id, _root, reply, author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenReader, 40);
+        assert!(app.reader.open);
+        assert_eq!(app.surface(), keys::Surface::Reader);
+        assert_eq!(app.reader.event_id, reply);
+
+        let live = reply_event(&author, id, &reply, &reply, "new live row", 50);
+        app.apply(
+            ChatEvent::Timeline {
+                channel: id,
+                event: live,
+            },
+            50,
+        );
+        app.handle(Action::ReaderNextLine, 50);
+        assert_eq!(app.reader.event_id, reply);
+        assert_eq!(app.reader.scroll, 1);
+
+        app.handle(Action::ReaderClose, 50);
+        assert!(!app.reader.open);
+        assert_eq!(app.focus, 1, "return follows the bound id, not the new row");
+    }
+
+    #[test]
+    fn reader_reply_preserves_target_and_refuses_to_retarget_a_draft() {
+        let (mut app, _id, _root, reply, _author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenReader, 40);
+        app.handle(Action::ReaderReply, 40);
+        assert!(!app.reader.open);
+        assert_eq!(
+            app.composer
+                .reply
+                .as_ref()
+                .map(|target| target.event_id.as_str()),
+            Some(reply.as_str())
+        );
+
+        app.mode = Mode::Navigation;
+        app.composer.clear();
+        app.handle(Action::OpenReader, 40);
+        app.composer.set_text("keep this");
+        app.handle(Action::ReaderReply, 40);
+        assert!(app.reader.open);
+        assert_eq!(app.composer.text(), "keep this");
+        assert_eq!(app.status, "Draft kept; Esc back");
+    }
+
+    #[test]
+    fn reader_tracks_edits_and_turns_deletions_into_a_nonreplyable_state() {
+        let (mut app, _id, root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenReader, 40);
+        app.reader.scroll = 7;
+        app.apply(ChatEvent::Overlay(edit_event(&root, "edited body")), 41);
+        assert_eq!(
+            app.reader.row.as_ref().map(|row| row.body.as_str()),
+            Some("edited body")
+        );
+        assert_eq!(app.reader.scroll, 0);
+        assert_eq!(app.reader.notice.as_deref(), Some("Updated; at start"));
+
+        app.apply(ChatEvent::Overlay(delete_event(&root)), 42);
+        assert!(app.reader.deleted);
+        assert_eq!(app.reader.notice.as_deref(), Some("Message deleted"));
+        app.handle(Action::ReaderReply, 42);
+        assert!(app.reader.open);
+        assert!(app.composer.reply.is_none());
+    }
+
     /// The thread read of the conversation above, as the session delivers it.
     fn thread_read(app: &mut App, id: Uuid, root: &str, events: Vec<nostr::Event>, partial: bool) {
         app.conn = ConnState::Connected;
@@ -3874,6 +4201,30 @@ mod tests {
             },
             40,
         );
+    }
+    #[test]
+    fn reader_from_a_thread_returns_to_thread_focus() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![
+                message_event(&author, id, "the root", 10),
+                reply_event(&author, id, &root, &root, "a reply", 20),
+            ],
+            false,
+        );
+        app.thread.focus = 1;
+        app.handle(Action::OpenReader, 50);
+        assert_eq!(app.surface(), keys::Surface::Reader);
+        assert_eq!(app.reader.event_id, reply);
+        app.handle(Action::ReaderClose, 50);
+        assert_eq!(app.surface(), keys::Surface::Thread);
+        assert_eq!(app.thread.focus, 1);
     }
 
     #[test]

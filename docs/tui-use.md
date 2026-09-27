@@ -169,6 +169,25 @@ In navigation mode:
 - `?` toggles the key help, and `Esc` closes it.
 - `q` quits.
 
+### Full-message reader (M1)
+
+In navigation mode, `v` opens the focused confirmed message in a full-screen
+reader. The reader binds to the event id, not its timeline index:
+
+- `j`/`k` or the arrow keys scroll one displayed line.
+- `PgUp`/`PgDn` scroll a page; `g`/Home and `G`/End go to the start and end.
+- `Enter` starts a reply to the displayed message. If a nonempty draft already
+  exists, the reader stays open and says `Draft kept; Esc back`.
+- `Esc` or `v` returns to the channel or thread with its prior focus. `?` opens
+  help and `q` quits.
+
+The reader preserves blank lines, indentation, tabs, URLs, Unicode text,
+attachments, reactions, and the source-line anchor across terminal resizes. It
+does not advance channel read progress. Pending and uncertain local rows are
+not readable; edits reset to the start with `Updated; at start`, and deletion
+shows `Message deleted` and disables reply. `v` remains literal text in composer
+mode.
+
 In composer mode every printable character, `j`, `k`, `c`, `i`, `r`, and `?`
 included, is typed into the draft. The composer reserves `Enter` (send),
 `Alt+Enter` (newline), the cursor keys, `Home`, `End`, `Backspace`, and `Esc`

@@ -53,6 +53,20 @@ pub enum Action {
     ComposeReply,
     /// `t`: open the focused message's thread.
     OpenThread,
+    /// `v`: read the focused confirmed message in a full-screen reader.
+    OpenReader,
+    /// One displayed reader line.
+    ReaderNextLine,
+    ReaderPrevLine,
+    /// One reader viewport minus one line.
+    ReaderPageUp,
+    ReaderPageDown,
+    ReaderTop,
+    ReaderBottom,
+    /// Enter from the reader starts a reply to its bound message.
+    ReaderReply,
+    /// Esc or `v` returns to the reader's origin.
+    ReaderClose,
     /// Esc inside a thread: return to the channel it was opened from.
     ThreadLeave,
     /// Enter inside a thread: compose a reply to the focused row.
@@ -95,13 +109,13 @@ pub enum Overlay {
     Agents,
 }
 
-/// What the navigation keys act on. The thread view is a full-screen view of
-/// its own, not an overlay: it replaces the channel timeline, and the
-/// conversation keys that would switch the destination are not part of it.
+/// What the navigation keys act on. The thread and reader views are full-screen
+/// surfaces, not overlays: they replace the channel timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Channel,
     Thread,
+    Reader,
 }
 
 /// Map a key press to an action in navigation mode. `layout` selects the
@@ -149,6 +163,21 @@ pub fn map_navigation(
             _ => Action::Ignored,
         };
     }
+    if surface == Surface::Reader {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::ReaderNextLine,
+            KeyCode::Char('k') | KeyCode::Up => Action::ReaderPrevLine,
+            KeyCode::Char('g') | KeyCode::Home => Action::ReaderTop,
+            KeyCode::Char('G') | KeyCode::End => Action::ReaderBottom,
+            KeyCode::PageUp => Action::ReaderPageUp,
+            KeyCode::PageDown => Action::ReaderPageDown,
+            KeyCode::Enter => Action::ReaderReply,
+            KeyCode::Esc | KeyCode::Char('v') => Action::ReaderClose,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
     if overlay == Overlay::Picker {
         return match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::PickerNext,
@@ -156,7 +185,6 @@ pub fn map_navigation(
             KeyCode::Char('f') | KeyCode::Tab => Action::FilterNext,
             KeyCode::Enter => Action::PickerConfirm,
             KeyCode::Esc | KeyCode::Char('c') => Action::Dismiss,
-            KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Char(d @ '1'..='9') => Action::Channel(d as usize - '0' as usize),
             _ => Action::Ignored,
@@ -167,6 +195,7 @@ pub fn map_navigation(
         // the timeline navigation keeps its meaning, and the conversation
         // keys are not here - they must not switch the destination.
         return match key.code {
+            KeyCode::Char('v') => Action::OpenReader,
             KeyCode::Char('j') | KeyCode::Down => Action::NextRow,
             KeyCode::Char('k') | KeyCode::Up => Action::PrevRow,
             KeyCode::Char('g') | KeyCode::Home => Action::Top,
@@ -201,6 +230,7 @@ pub fn map_navigation(
         KeyCode::Char('i') => Action::ComposeNew,
         KeyCode::Enter => Action::ComposeReply,
         KeyCode::Char('t') => Action::OpenThread,
+        KeyCode::Char('v') => Action::OpenReader,
         KeyCode::Char('c') => Action::TogglePicker,
         KeyCode::Char('a') => Action::ToggleAgents,
         KeyCode::Char('f') => Action::FilterNext,
@@ -291,6 +321,29 @@ mod tests {
             Overlay::None,
             Surface::Thread,
         )
+    }
+
+    fn reader(code: KeyCode) -> Action {
+        map_navigation(
+            key(code, KeyModifiers::NONE),
+            LayoutMode::Wide,
+            Overlay::None,
+            Surface::Reader,
+        )
+    }
+
+    #[test]
+    fn the_reader_isolates_scrolling_reply_and_return_keys() {
+        assert_eq!(reader(KeyCode::Char('j')), Action::ReaderNextLine);
+        assert_eq!(reader(KeyCode::Down), Action::ReaderNextLine);
+        assert_eq!(reader(KeyCode::Char('k')), Action::ReaderPrevLine);
+        assert_eq!(reader(KeyCode::PageDown), Action::ReaderPageDown);
+        assert_eq!(reader(KeyCode::Char('g')), Action::ReaderTop);
+        assert_eq!(reader(KeyCode::Char('G')), Action::ReaderBottom);
+        assert_eq!(reader(KeyCode::Enter), Action::ReaderReply);
+        assert_eq!(reader(KeyCode::Esc), Action::ReaderClose);
+        assert_eq!(reader(KeyCode::Char('v')), Action::ReaderClose);
+        assert_eq!(reader(KeyCode::Char('i')), Action::Ignored);
     }
 
     #[test]
@@ -534,6 +587,10 @@ mod tests {
         assert_eq!(
             map_composer(key(KeyCode::Char('x'), KeyModifiers::NONE)),
             Action::ComposerInput('x')
+        );
+        assert_eq!(
+            map_composer(key(KeyCode::Char('v'), KeyModifiers::NONE)),
+            Action::ComposerInput('v')
         );
         // Alt+x is not text; terminals use it for commands.
         assert_eq!(

@@ -25,6 +25,7 @@ sha2 = "0.11"
 hex = "0.4"
 rand = "0.10"
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
 dirs = "6"
 
 [dev-dependencies]

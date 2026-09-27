@@ -9,9 +9,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::agents;
-use crate::app::{AgentStatus, App, ConnState, Context, Marker, Mode, Sections};
-use crate::content::short_pubkey;
+use crate::app::{AgentStatus, App, ConnState, Context, Marker, Mode, ReaderOrigin, Sections};
+use crate::content::{Row, short_pubkey};
 use crate::layout::{self, LayoutMode};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
@@ -419,8 +420,8 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     let mode = layout::mode(area.width, area.height);
     match mode {
         LayoutMode::TooSmall => draw_size_message(frame, area),
-        // The thread is a surface of its own: it replaces the whole column
-        // rather than covering part of the timeline.
+        // Full-message reading replaces the channel or thread surface.
+        _ if app.reader.open => draw_reader(frame, app, now, area),
         _ if app.thread.open => draw_thread(frame, app, now, area, mode),
         LayoutMode::Wide => draw_wide(frame, app, now, area),
         LayoutMode::Narrow => draw_narrow(frame, app, now, area),
@@ -435,6 +436,158 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     if app.help {
         draw_help(frame, app, area, mode);
     }
+}
+
+fn reader_label(app: &App, channel: Uuid) -> String {
+    match app.channels.iter().find(|entry| entry.id == channel) {
+        Some(entry) if entry.is_dm() => app.label(entry),
+        Some(entry) => format!("#{}", app.label(entry)),
+        None => channel.to_string(),
+    }
+}
+
+fn draw_reader(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let compact = area.width < 80;
+    let channel = app.reader.channel();
+    let thread = matches!(app.reader.origin, Some(ReaderOrigin::Thread { .. }));
+    let title = match channel {
+        Some(channel) if compact => format!("Message {}", reader_label(app, channel)),
+        Some(channel) if thread => format!("Message / Thread {}", reader_label(app, channel)),
+        Some(channel) => format!("Message / {}", reader_label(app, channel)),
+        None => "Message".to_owned(),
+    };
+    let title = format!(
+        "{}  {}",
+        clip_with_ellipsis(&title, area.width.saturating_sub(12) as usize),
+        if compact { "Esc:back" } else { "Esc: back" }
+    );
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    frame.render_widget(Paragraph::new(title), rows[0]);
+
+    let metadata = app
+        .reader
+        .row
+        .as_ref()
+        .map(|row| {
+            let edited = if row.edited { " · edited" } else { "" };
+            format!("{} · {}{}", row.author, age(row.created_at, now), edited)
+        })
+        .unwrap_or_else(|| "Message deleted".to_owned());
+    frame.render_widget(
+        Paragraph::new(clip_with_ellipsis(&metadata, rows[1].width as usize)),
+        rows[1],
+    );
+
+    let body_lines = app
+        .reader
+        .row
+        .as_ref()
+        .map(|row| reader_lines(row, rows[2].width))
+        .unwrap_or_else(|| vec!["Message deleted".to_owned()]);
+    let total = body_lines.len();
+    let max_scroll = total.saturating_sub(rows[2].height as usize);
+    let start = app.reader.scroll.min(max_scroll);
+    let visible = body_lines
+        .iter()
+        .skip(start)
+        .take(rows[2].height as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible.join("\n")), rows[2]);
+
+    let actions = if compact {
+        "Enter reply · j/k scroll · Esc/v back · ?"
+    } else {
+        "j/k scroll · PgUp/PgDn · Enter reply · Esc/v back · ? help"
+    };
+    frame.render_widget(
+        Paragraph::new(clip_with_ellipsis(actions, rows[3].width as usize)),
+        rows[3],
+    );
+    let state = if let Some(notice) = &app.reader.notice {
+        notice.clone()
+    } else if app.reader.deleted {
+        "Message deleted".to_owned()
+    } else {
+        let end = (start + rows[2].height as usize).min(total);
+        format!(
+            "{} · lines {}-{} of {}",
+            conn_word(app.conn),
+            start + 1,
+            end,
+            total
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clip_with_ellipsis(&state, rows[4].width as usize),
+            status_style(&state),
+        )),
+        rows[4],
+    );
+}
+
+/// Split a message into source-preserving display lines. Unlike timeline
+/// wrapping, this keeps indentation, repeated spaces, blank lines, and tabs.
+fn reader_lines(row: &Row, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut lines = row
+        .body
+        .split('\n')
+        .flat_map(|line| wrap_reader_line(line, width))
+        .collect::<Vec<_>>();
+    if let Some(attachment) = &row.attachment {
+        lines.push(format!("[file] {attachment}"));
+    }
+    if !row.reactions.is_empty() {
+        lines.push(
+            row.reactions
+                .iter()
+                .map(|(emoji, count)| format!("{emoji} x{count}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    lines
+}
+
+fn wrap_reader_line(line: &str, width: usize) -> Vec<String> {
+    let mut expanded = String::new();
+    let mut cells = 0;
+    for grapheme in line.graphemes(true) {
+        if grapheme == "\t" {
+            let spaces = 4 - cells % 4;
+            expanded.push_str(&" ".repeat(spaces));
+            cells += spaces;
+        } else {
+            expanded.push_str(grapheme);
+            cells += grapheme.width();
+        }
+    }
+    if expanded.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+    for grapheme in expanded.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if used > 0 && used + grapheme_width > width {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push_str(grapheme);
+        used += grapheme_width;
+    }
+    lines.push(current);
+    lines
 }
 
 /// Channels, timeline, and composer side by side. This is the desktop shape,
@@ -1588,11 +1741,19 @@ fn scroll_window(len: usize, rows: usize, focus: usize) -> std::ops::Range<usize
 /// terminal width is not the whole name, and the help text may wrap and
 /// scroll to show it.
 fn help_text(app: &App, mode: LayoutMode) -> String {
-    let mut text = match (app.thread.open, mode) {
-        (true, LayoutMode::Wide) => THREAD_WIDE_HELP.to_owned(),
-        (true, _) => THREAD_COMPACT_HELP.to_owned(),
-        (false, LayoutMode::Wide) => WIDE_HELP.to_owned(),
-        (false, _) => COMPACT_HELP.to_owned(),
+    let mut text = if app.reader.open {
+        if mode == LayoutMode::Wide {
+            READER_WIDE_HELP.to_owned()
+        } else {
+            READER_COMPACT_HELP.to_owned()
+        }
+    } else {
+        match (app.thread.open, mode) {
+            (true, LayoutMode::Wide) => THREAD_WIDE_HELP.to_owned(),
+            (true, _) => THREAD_COMPACT_HELP.to_owned(),
+            (false, LayoutMode::Wide) => WIDE_HELP.to_owned(),
+            (false, _) => COMPACT_HELP.to_owned(),
+        }
     };
     if app.thread.open {
         text.push_str(&format!("\nthread / {}\n", app.thread.root));
@@ -1644,10 +1805,10 @@ navigation
   a              Agents: owned roster, working now
   f              Inbox filter
   g G PgUp PgDn  move the focused row
-  i              compose new           Enter  reply
+  v              read full message        Enter  reply
+  i              compose new
   r e d          react / edit / delete
   ?              help                  q quit
-composer
   Enter send     Alt+Enter newline
   Esc leaves the composer, keeps the text
 picker
@@ -1662,18 +1823,33 @@ const COMPACT_HELP: &str = "\
 i compose  Enter send
 j k move row  c picker
 a agents  f filter
-Enter reply  r react
+Enter reply  v read message  r react
 e edit  d delete
 1-9 jump  g G start/end
 PgUp/PgDn move ten rows
 ? help  j k scroll  q quit
-Esc close  Alt+Enter nl
+Esc/v back  Alt+Enter nl
 ● unread  @ mention  ? unknown";
+
+const READER_WIDE_HELP: &str = "\
+reader
+  j k up down    scroll one displayed line
+  PgUp PgDn      scroll a page
+  g/Home G/End   start/end
+  Enter          reply to this message
+  Esc/v          return to the origin
+  ?              close help                  q quit";
+
+const READER_COMPACT_HELP: &str = "\
+reader: j/k scroll  PgUp/PgDn page
+g/Home start  G/End end
+Enter reply  Esc/v back
+? close help  q quit";
 
 const THREAD_WIDE_HELP: &str = "\
 thread
   j k up down    move focused row    g G PgUp PgDn ends
-  Enter          reply to focused row    i Tab reply to root
+  v              read full message
   t              retry failed read
   r e d          react / edit / delete on focused row
   Esc            back to the channel
@@ -1683,8 +1859,7 @@ composer
   Esc leaves composing in one press and keeps its target";
 
 const THREAD_COMPACT_HELP: &str = "\
-thread: j k move  g G ends  PgUp/PgDn
-Enter reply  i/Tab root  t retry read
+thread: j k move  v read  g G ends  PgUp/PgDn
 r/e/d react/edit/delete  Esc back
 ? help  q quit
 composer: Esc leaves; Enter sends";
@@ -1728,6 +1903,9 @@ fn help_lines(text: &str, width: usize) -> Vec<String> {
     lines
 }
 fn help_context(app: &App) -> String {
+    if app.reader.open {
+        return "Reader".to_owned();
+    }
     if app.thread.open {
         return "Thread".to_owned();
     }
@@ -2091,6 +2269,38 @@ mod tests {
         let text = frame_text(&app, 80, 12);
         assert!(text.contains("reconnecting; stale"), "{text}");
         assert!(text.contains("the reply"), "loaded rows stay: {text}");
+    }
+
+    #[test]
+    fn reader_preserves_blank_lines_indentation_tabs_and_wide_text() {
+        let row = message_row(
+            0,
+            "  first\tline\n\n链接 https://example.test/very-long-path",
+        );
+        let lines = reader_lines(&row, 12);
+        assert_eq!(lines[0], "  first line");
+        assert_eq!(lines[1], "");
+        assert!(
+            lines.iter().any(|line| line.contains("链接")),
+            "CJK text remains in the reader: {lines:?}"
+        );
+        assert!(
+            lines.join("").contains("https://"),
+            "URLs remain literal rather than word-normalized: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn reader_uses_fixed_metadata_and_state_rows_at_the_floor_size() {
+        let mut app = chat_app(vec![message_row(0, "line one\nline two\nline three")]);
+        app.handle(crate::keys::Action::OpenReader, 130);
+        let text = frame_text(&app, 24, 6);
+        assert!(text.contains("Message"), "{text}");
+        assert!(text.contains("alice"), "{text}");
+        assert!(text.contains("Enter reply"), "{text}");
+        assert!(text.contains("connected"), "{text}");
+        assert!(text.contains("line one"), "{text}");
+        assert!(text.contains("line two"), "{text}");
     }
 
     fn frame_text(app: &App, width: u16, height: u16) -> String {
