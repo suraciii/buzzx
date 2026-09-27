@@ -38,3 +38,7 @@ Its atlas shows intended appearance; the change is not yet implemented.
 [Complete-message reading](tui-reading.md) proposes a full-screen reader for a
 loaded row whose content exceeds the timeline, with line scrolling and return
 to its original reply target. It is a product proposal, not implemented behavior.
+
+[Find and resume a conversation](tui-context.md) is the release-level proposal
+for conversation lookup, message search, context, history, complete reading and
+safe return. The reader is one component of this proposed release.

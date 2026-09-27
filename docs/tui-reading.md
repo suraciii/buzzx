@@ -13,15 +13,16 @@ At 40x10, a 60-line result exposes its heading and first five numbered lines.
 PgDn, G and j cannot reach its final decision, in either channel or thread.
 This was reproduced with the actual merged binary and a local fake relay.
 
-Reading the result is necessary before answering it. Complete-message reading
-therefore comes before global search or richer Markdown presentation. Search
-would still land on unreadable long results; typography would not make hidden
-text reachable. This priority is based on a reproduced capability gap, not on
-measured user demand or a claim that most messages are long.
+Reading the result is necessary before answering it. This reader is now a
+required component of [find and resume a conversation](tui-context.md), which
+plans discovery, history and safe return as one release. Its early delivery
+provides a stable destination for that larger flow; it is not the whole release.
+The reproduced reading failure is evidence of a capability gap, not a claim
+that most messages are long.
 
 ## Proposed flow
 
-In channel, DM or thread navigation, press `v` on a loaded, confirmed row to
+In channel, DM, search-context or thread navigation, press `v` on a loaded, confirmed row to
 open its reader at the beginning. The reader replaces the whole terminal at
 every supported size. Use the same entry for short and long rows; it is not
 an automatic popup. The existing timeline remains a preview.
@@ -58,8 +59,9 @@ Channel shortcuts, c, a, f, t, i, r, e and d do nothing while it is open;
 keys never leak through to the covered timeline. In a composer, v is literal
 text. Help retains its existing scrolling and close keys; it cannot reply.
 
-Outside this view, PgUp/PgDn and j/k keep their existing event/conversation
-meaning. This proposal does not redesign all navigation keys.
+Outside this view, keys continue to navigate events or conversations. The
+companion release spec owns incremental history and explicit jump-to-latest
+behavior; G inside this reader always means the end of this message.
 
 ## Content and visual layout
 
@@ -114,7 +116,7 @@ activation, attachment download, clipboard integration or external programs.
 
 ## Identity, drafts and return
 
-Keep the originating conversation, surface (channel or thread), Inbox filter,
+Keep the originating conversation, surface (channel, search context or thread), Inbox filter,
 focused event and viewport. Bind reader content and Enter to an event identity,
 not an array index, display name, time or screen line.
 
