@@ -194,19 +194,39 @@ fn row_lines_with_options(
     if row.edited {
         suffix.push(Span::raw(edited));
     }
-    let suffix_width: usize = suffix
-        .iter()
-        .map(|span| span.content.as_ref().width())
-        .sum();
-    if prefix_width + 1 + suffix_width >= width as usize {
+    let suffix_width = |spans: &[Span<'static>]| {
+        spans
+            .iter()
+            .map(|span| span.content.as_ref().width())
+            .sum::<usize>()
+    };
+    let fits = |spans: &[Span<'static>]| prefix_width + 1 + suffix_width(spans) < width as usize;
+    if !fits(&suffix) {
         // Age is secondary; semantic state words are not. Drop it before
         // shortening the author, so a long name cannot hide @you or failure.
         suffix.remove(0);
     }
-    let suffix_width: usize = suffix
-        .iter()
-        .map(|span| span.content.as_ref().width())
-        .sum();
+    // Metadata yields in a fixed order when a narrow header cannot carry all
+    // of it. Attention and write-state words stay ahead of reply decoration.
+    for marker in [edited, broadcast, reply, "  [root]"] {
+        if fits(&suffix) {
+            break;
+        }
+        if let Some(index) = suffix
+            .iter()
+            .position(|span| span.content.as_ref() == marker)
+        {
+            suffix.remove(index);
+        }
+    }
+    if !fits(&suffix)
+        && let Some(index) = suffix
+            .iter()
+            .position(|span| span.content.as_ref() == " ...")
+    {
+        suffix.remove(index);
+    }
+    let suffix_width = suffix_width(&suffix);
     let author_budget = (width as usize)
         .saturating_sub(prefix_width + 1 + suffix_width)
         .max(1);
@@ -690,6 +710,8 @@ fn draw_minimal(frame: &mut Frame, app: &App, now: u64, area: Rect) {
 fn draw_channel_keys(frame: &mut Frame, width: u16, area: Rect, composing: bool) {
     let keys = if composing {
         "Enter:send Esc:nav"
+    } else if width >= 80 {
+        "j/k move · c picker · Enter reply · ? help"
     } else if width >= 40 {
         "j/k move · c picker · Enter reply"
     } else {
@@ -1094,18 +1116,31 @@ fn draw_composer_line(frame: &mut Frame, app: &App, area: Rect) {
     ));
 }
 
+fn status_detail(app: &App) -> String {
+    let connection = conn_word(app.conn);
+    if app.status == connection
+        || app.status.starts_with(&format!("{connection} "))
+        || app.status.starts_with(&format!("{connection}:"))
+    {
+        app.status.clone()
+    } else {
+        format!("{connection} | {}", app.status)
+    }
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect, wide: bool) {
     let mode = match app.mode {
         Mode::Navigation => "nav",
         Mode::Composer if wide => "composer",
         Mode::Composer => "compose",
     };
+    let detail = status_detail(app);
     let status = if wide && area.width >= 100 {
-        format!("status: {} | mode: {mode} | ?=help", app.status)
+        format!("status: {detail} | mode: {mode} | ?=help")
     } else {
         let prefix = format!("{mode} · ");
         let remaining = area.width.saturating_sub(prefix.width() as u16) as usize;
-        format!("{prefix}{}", clip_with_ellipsis(&app.status, remaining))
+        format!("{prefix}{}", clip_with_ellipsis(&detail, remaining))
     };
     frame.render_widget(
         Paragraph::new(Line::styled(status.clone(), status_style(&status))),
@@ -1696,6 +1731,12 @@ fn help_context(app: &App) -> String {
     if app.thread.open {
         return "Thread".to_owned();
     }
+    if app.agents.open
+        && matches!(app.agents.cursor.level, agents::Level::Detail)
+        && let Some(agent) = app.selected_agent()
+    {
+        return format!("My agents / {}", agent.name);
+    }
     if app.agents.open {
         return "My agents".to_owned();
     }
@@ -1861,6 +1902,15 @@ mod tests {
         assert!(lines[0].starts_with("Help /"), "{text}");
         assert!(lines[4].contains("Esc return"), "{text}");
         assert!(lines[5].starts_with("state:"), "{text}");
+    }
+
+    #[test]
+    fn wide_status_keeps_connection_state_with_a_transient_notice() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.status = "read warning".to_owned();
+        let text = frame_text(&app, 120, 19);
+        assert!(text.contains("status: connected | read warning"), "{text}");
+        assert!(text.contains("?=help"), "{text}");
     }
 
     fn chat_app(rows: Vec<crate::content::Row>) -> App {
@@ -2535,6 +2585,22 @@ mod tests {
         assert!(header.contains("@you"), "{header:?}");
     }
 
+    #[test]
+    fn narrow_headers_bound_optional_metadata_before_state_words() {
+        let mut row = message_row(0, "hi");
+        row.author = "Alexandra_Responsible_For_Customer_Support_International".to_owned();
+        row.mentions_me = true;
+        row.pending = true;
+        row.uncertain = true;
+        row.parent_id = Some("root".to_owned());
+        row.broadcast = true;
+        row.edited = true;
+        let header = row_lines(&row, 110, 38, false, RootMark::Root)[0].to_string();
+        assert!(header.width() <= 38, "{header:?}");
+        assert!(header.contains("Unconfirmed"), "{header:?}");
+        assert!(header.contains("@you"), "{header:?}");
+    }
+
     fn agent_frame(agent: &str, channel: Option<Uuid>, turn: &str) -> crate::agents::Frame {
         crate::agents::Frame {
             agent: agent.to_owned(),
@@ -2592,6 +2658,15 @@ mod tests {
         let detail = frame_text(&detail_app, 24, 6);
         assert!(detail.contains("No active turn"), "{detail}");
         assert!(detail.contains("observed"), "{detail}");
+    }
+
+    #[test]
+    fn agent_detail_help_keeps_the_selected_agent_in_context() {
+        let mut app = agent_app(true, &[("Review Agent", "aa")]);
+        app.agents.cursor.level = crate::agents::Level::Detail;
+        app.help = true;
+        let text = frame_text(&app, 40, 10);
+        assert!(text.contains("Help / My agents / Review Agent"), "{text}");
     }
 
     #[test]
