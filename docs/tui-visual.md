@@ -1,6 +1,8 @@
 # TUI visual language
 
-Status: revision 5, approved for implementation on 2026-09-27. Not implemented.
+Status: revision 5, implemented in `src/ui.rs` on the implementation branch.
+Repository checks and fake-relay PTY evidence pass; real-relay write closure
+and physical light/dark terminal coverage remain outside this revision's evidence.
 This is the implementation baseline, including the approved weak message
 separators. It replaces revisions 1-4; previous images remain historical artifacts.
 The [review atlas](assets/tui-design-system.html) contains four boards and dark,
@@ -310,12 +312,11 @@ source revision, with terminal dimensions and palette recorded:
 | V7: Shared surfaces | Inbox, Agent list/detail and help use the same selection and text hierarchy; long Agent status wraps and remains readable |
 | V8: Portable rendering | Light/dark defaults, ANSI and NO_COLOR preserve focus, target and state; no hardcoded dark fill makes text unreadable |
 
-The atlas checks geometry and appearance of static fixtures only. Runtime
-wrapping, cursor movement, resize, terminals' palette behavior and actual
-write outcomes remain unverified. Implementation still requires repository
-checks, the real terminal workflow required by [AGENTS.md](../AGENTS.md), and
-reviewed captures from the usable binary. A spec or browser image is not that
-evidence.
+The atlas checks geometry and appearance of static fixtures only. The current
+implementation has repository-check and fake-relay PTY evidence. Runtime
+wrapping, cursor movement, terminal palette behavior, real-relay write
+outcomes, and the complete live write workflow remain unverified here. A spec
+or browser image is not that evidence.
 
 ## Implementation handoff
 
@@ -331,6 +332,7 @@ the current message focus and target identities. Adding decoration must not
 turn a rendered-line index into a message identity. Keep appearance knowledge
 shared; do not grow separate per-page palettes or density policies.
 
-This handoff authorizes implementation of the approved appearance. It does
-not claim implementation, integration or release completion. Delivery must
-identify the final revision and usable binary alongside the V1-V8 evidence.
+This handoff authorized implementation of the approved appearance. Revision 5
+is implemented in the current branch; remaining acceptance gaps must stay
+explicit in the delivery record. Delivery identifies the final revision and
+usable binary alongside the V1-V8 evidence.
