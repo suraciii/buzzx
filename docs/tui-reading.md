@@ -1,10 +1,8 @@
 # Read a complete message
 
-Status: M1 implemented in `buzzx-visual-spec` on the reader implementation
-branch. The full release remains incomplete: conversation filters, message
-search, context results and incremental history are not implemented. This
-spec is the contract for the reader and safe return; the implementation is
-based on merged commit 88595b95b94875533e69704cda4c03f6a31eb9c2.
+Status: M1–M4 are implemented in the TUI worktree. This spec is the contract for
+the reader and safe return; release acceptance is tracked in
+`WORK_LOGS/BUZZX_CONTEXT_ACCEPTANCE_LOG.md`.
 
 ## Problem and priority
 

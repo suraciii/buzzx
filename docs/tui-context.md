@@ -1,6 +1,7 @@
 # Find and resume a conversation
 
-Status: proposed release-level product requirement, revision 1. Not implemented.
+Status: M2–M4 are implemented in the TUI. Release acceptance is tracked in
+the workspace evidence file `WORK_LOGS/BUZZX_CONTEXT_ACCEPTANCE_LOG.md`.
 This expands the accepted complete-message reading direction into one coherent
 TUI release. Its baseline is merged commit 88595b9. The reader remains a
 component specified in [tui-reading.md](tui-reading.md).

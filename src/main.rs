@@ -355,6 +355,8 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             let frame = terminal
                 .draw(|frame| ui::draw(frame, &app, now))
                 .map_err(|e| e.to_string())?;
+            // The reader reserves four rows outside its body.
+            app.set_reader_page_rows(frame.area.height.saturating_sub(4).max(2) as usize);
             let layout = layout::mode(frame.area.width, frame.area.height);
 
             // The terminal cursor is part of the composer affordance. Keep it
@@ -383,9 +385,13 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             };
             if let Some(key) = key {
                 let action = match app.mode {
-                    app::Mode::Navigation => {
-                        keys::map_navigation(key, layout, app.overlay(), app.surface())
-                    }
+                    app::Mode::Navigation => keys::map_navigation(
+                        key,
+                        layout,
+                        app.overlay(),
+                        app.surface(),
+                        app.search.key_mode(),
+                    ),
                     app::Mode::Composer => keys::map_composer(key),
                 };
                 app.handle(action, now);

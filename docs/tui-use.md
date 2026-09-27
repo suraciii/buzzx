@@ -169,6 +169,70 @@ In navigation mode:
 - `?` toggles the key help, and `Esc` closes it.
 - `q` quits.
 
+### Message search and context (M2)
+
+`/` in channel or thread navigation opens full-screen message search, scoped
+to the current conversation first. `Ctrl+f` opens it from the composer with
+the draft, target, and mode kept for return; a pending write blocks that entry.
+
+Search has three editing surfaces. While the query is being edited, every
+printable character is query text: `Enter` submits, `Esc` restores the applied
+query. In result navigation:
+
+- `j`/`k` or arrows move the selection; the selection is an event id, so a
+  replaced result list keeps it when the same hit is still there.
+- `Enter` opens the exact hit in a fullscreen context view, or retries the
+  kept query and filters after a failure.
+- `/` edits the query again and `f` opens the filter form.
+- Filters apply only on explicit submission. Results keep the relay's
+  relevance order and stay stable until then; up to 50 results are requested.
+- A failed read preserves the previous results, labeled `previous query`;
+  a stale response never replaces a newer list. Unlisted or deleted hits are
+  hidden and the remaining list is labeled bounded.
+- `Esc` returns to the origin; `?` opens help and `q` quits.
+
+The filter form (`f`, replacing the results while open) has one control per
+row for scope, author and time:
+
+- `j`/`k` move between the controls; `h`/`l` adjust the focused one; `s`
+  cycles the scope, `t` the time range (all time, 7 days, 30 days, relative
+  to the submission), and `Enter` applies the form and submits.
+- Scope is the current conversation, all accessible listed conversations, or
+  one chosen conversation (`o` opens the picker).
+- `a` opens the author picker over known, accessible participant profiles.
+  The list may be incomplete and says so; duplicate names carry short public
+  keys. `p` types an exact 64-character public key instead. Identity is the
+  full public key, never a display name.
+- An author alone can be searched without a keyword; an empty submit asks
+  for one instead of loading the entire archive. `Esc` cancels the form and
+  restores the applied filters.
+
+The context view reads the hit plus up to 20 rows on each side and focuses the
+hit itself. `j`/`k` move, `g`/`G` and `PgUp`/`PgDn` jump and page, `v` opens
+the full-message reader, `t` opens the focused row's thread (Esc returns to
+this context), `Enter` composes a reply under the normal draft guards, `[` and
+`]` load one older or newer page, and `Esc` returns to the same search result.
+Neither view advances channel read progress.
+
+### Full-message reader (M1)
+
+In navigation mode, `v` opens the focused confirmed message in a full-screen
+reader. The reader binds to the event id, not its timeline index:
+
+- `j`/`k` or the arrow keys scroll one displayed line.
+- `PgUp`/`PgDn` scroll a page; `g`/Home and `G`/End go to the start and end.
+- `Enter` starts a reply to the displayed message. If a nonempty draft already
+  exists, the reader stays open and says `Draft kept; Esc back`.
+- `Esc` or `v` returns to the channel or thread with its prior focus. `?` opens
+  help and `q` quits.
+
+The reader preserves blank lines, indentation, tabs, URLs, Unicode text,
+attachments, reactions, and the source-line anchor across terminal resizes. It
+does not advance channel read progress. Pending and uncertain local rows are
+not readable; edits reset to the start with `Updated; at start`, and deletion
+shows `Message deleted` and disables reply. `v` remains literal text in composer
+mode.
+
 In composer mode every printable character, `j`, `k`, `c`, `i`, `r`, and `?`
 included, is typed into the draft. The composer reserves `Enter` (send),
 `Alt+Enter` (newline), the cursor keys, `Home`, `End`, `Backspace`, and `Esc`
@@ -237,8 +301,8 @@ the last write, and the mode. The connection state is one of `connecting`,
 
 ## What `buzzx tui` does not do
 This TUI does not render images, video, or audio. Attachments show as filename
-lines. It does not join huddles or search; voice needs the relay's separate
-audio WebSocket, and search is available through the `buzz` CLI. It does not
+lines. It does not join huddles; voice needs the relay's separate audio
+WebSocket. It does not
 configure the relay, manage members, or moderate. DMs appear as first-class
 rows in the Inbox. Read progress is shared through encrypted relay markers,
 but a marker lookup or publish can fail; see
@@ -552,7 +616,7 @@ mention candidates and Mobile message recipients at upstream revision
 names from identities; this slice reuses that semantic requirement without
 copying their richer editor and non-member invitation flows.
 
-## Planned: focused thread reading
+## Focused thread reading
 
 Status: implemented. This slice lets a person follow one conversation inside a
 busy channel, reply, and return to the same channel row. It applies to stream
