@@ -106,8 +106,13 @@ download is authorized by an event in the query.
 ## buzzx terms
 
 **buzzx**:
-Buzz's extension CLI (`buzz ext`), with a TUI and non-interactive commands.
+Buzz's extension CLI (`buzz ext`), with a TUI, a planned Web surface and
+non-interactive commands.
 Its product boundary is defined in [core.md](core.md).
+
+**Web surface**:
+The browser interface to a locally running buzzx session, with the TUI's
+conversation capabilities. It is another view of the client, not a relay.
 
 **core**:
 The relay operations that both the TUI and the CLI perform. One call per
@@ -117,7 +122,7 @@ core; see [design/shared-core.md](design/shared-core.md).
 
 **CLI**:
 The non-interactive way to drive `buzzx`: one command per run, one JSON value
-on stdout, and an exit code. The TUI is the interactive one. The first CLI
+on stdout, and an exit code. TUI and Web are interactive surfaces. The first CLI
 slice is [docs/browse-collab-cli.md](docs/browse-collab-cli.md).
 
 **terminal user**:
@@ -136,7 +141,7 @@ One rendered timeline entry. A row is built from one event. Kinds that overlay
 other events never produce a row of their own.
 
 **composer**:
-The text input at the bottom of the TUI. It holds the message being written,
+The text input in an interactive surface. It holds the message being written,
 the reply target, and the edit target.
 
 **reply target**:

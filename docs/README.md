@@ -14,6 +14,8 @@ works with it.
   revision and what it provides.
 - [browse-collab-cli.md](browse-collab-cli.md) specifies the first `buzz ext`
   browse-and-collaborate flow for terminal users and agents.
+- [web.md](web.md) specifies the proposed local browser surface, its TUI
+  parity matrix, interaction flows and acceptance. It is not implemented.
 
 The design documents, which state the boundaries and the contracts to
 preserve, live in [../design/](../design/). The product contract, which states
@@ -27,10 +29,9 @@ recipient-correctness rule for the composer: a complete `@member name` in a new
 message or reply becomes a signed recipient, and a draft that cannot be resolved
 is not published.
 
-[Focused thread reading](tui-use.md#planned-focused-thread-reading) is the next
-planned TUI slice: open one discussion, reply, and return to the channel.
-It is a product spec, not an implemented capability.
+[Focused thread reading](tui-use.md#planned-focused-thread-reading) opens one
+discussion, replies, and returns to the channel. See its status in the manual.
 
 [tui-visual.md](tui-visual.md) is the approved implementation spec for the shared TUI
 visual language, with message separators, region budgets and acceptance checks.
-Its atlas shows intended appearance; the change is not yet implemented.
+Its status section separates implementation evidence from the intended atlas.

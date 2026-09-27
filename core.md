@@ -35,6 +35,13 @@ The existing clients do not do this job:
 an interactive TUI and scripts or agents through non-interactive commands.
 Both use the same relay, identity, authorization, and event semantics.
 
+The planned `buzzx web` surface gives the same person a browser interface
+started from that CLI, with the TUI's capabilities. It uses the same identity
+and relay without requiring a separate application install. Its behavior and
+implementation status live in [docs/web.md](docs/web.md). This deliberately
+extends the terminal-only presentation boundary; it does not change Buzz's
+conversation semantics or make buzzx a hosted service.
+
 Where the desktop app and the mobile app are Buzz's clients for people with a
 display, `buzzx` is Buzz's client for people in a terminal. Same product,
 fourth surface. It does not replace any of them, and it is not a tool for
@@ -89,8 +96,9 @@ disagree the person wins.
 `buzzx` does not do these things:
 
 - **It is not a relay.** It stores nothing that it did not receive from the
-  relay. Read markers are the only local state, and they are also sent to the
-  relay as events.
+  relay as conversation history. It adds no message database. Read markers
+  are sent to the relay as events; temporary view state and drafts belong to
+  the running client.
 - **It is not an agent harness.** It does not run agents, schedule tasks, or
   approve work. Agents connect to the relay directly; `buzzx` sees their
   messages the same way it sees everyone else's.
@@ -103,7 +111,8 @@ disagree the person wins.
   `buzzx` reads it from the environment or a local file. It does not mint,
   rotate, or recover keys.
 - **It is not a desktop replacement.** It renders text. It does not render
-  attachments, huddles, or voice.
+  attachments, huddles, or voice. A browser surface preserves this capability
+  boundary; it does not inherit every feature of the Buzz desktop app.
 - **It does not add relay API.** `buzzx` uses the relay as it exists: the
   HTTP bridge, the WebSocket, and the event kinds the relay already accepts.
   When `buzzx` needs behavior the relay lacks, the fix belongs in the relay.
