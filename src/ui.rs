@@ -22,16 +22,18 @@ fn no_color() -> bool {
 }
 
 fn author_style() -> Style {
-    if no_color() {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    }
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+fn action_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
 }
 
 fn pending_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
+fn separator_style() -> Style {
     Style::default().add_modifier(Modifier::DIM)
 }
 
@@ -45,8 +47,28 @@ fn mention_style() -> Style {
     }
 }
 
+fn failure_style() -> Style {
+    if no_color() {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
 fn highlight_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
+}
+
+fn target_text(app: &App) -> String {
+    if app.composer.edit.is_some() {
+        "Edit own message".to_owned()
+    } else if let Some(reply) = &app.composer.reply {
+        format!("Reply to {}", reply.author)
+    } else {
+        "New message".to_owned()
+    }
 }
 
 fn conn_word(state: ConnState) -> &'static str {
@@ -54,6 +76,30 @@ fn conn_word(state: ConnState) -> &'static str {
         ConnState::Connecting => "connecting",
         ConnState::Connected => "connected",
         ConnState::Reconnecting => "reconnecting",
+    }
+}
+fn status_style(status: &str) -> Style {
+    let lower = status.to_ascii_lowercase();
+    if ["failed", "refused", "error"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        failure_style()
+    } else if [
+        "unknown",
+        "uncertain",
+        "unconfirmed",
+        "partial",
+        "stale",
+        "reconnecting",
+        "not synced",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        mention_style()
+    } else {
+        pending_style()
     }
 }
 
@@ -82,15 +128,36 @@ enum RootMark {
     Deleted,
 }
 
-/// The lines one row renders as: the header, the wrapped body, attachments,
-/// and reactions. One-column modes ask for the compact markers, so a row
-/// spends its width on the message instead of on words like `(reply)`.
+#[derive(Clone, Copy)]
+struct RowOptions {
+    roomy: bool,
+    focus_visible: bool,
+    head: RootMark,
+}
+
+/// The default row renderer keeps the pure content tests independent from
+/// viewport decoration.
+#[cfg(test)]
 fn row_lines(
     row: &crate::content::Row,
     now: u64,
     width: u16,
     compact: bool,
     mark: RootMark,
+) -> Vec<Line<'static>> {
+    row_lines_with_options(row, now, width, compact, mark, false, false)
+}
+
+/// Render one message. Separators and focus are presentation options layered
+/// onto the same event-derived lines; neither creates a selectable row.
+fn row_lines_with_options(
+    row: &crate::content::Row,
+    now: u64,
+    width: u16,
+    compact: bool,
+    mark: RootMark,
+    focused: bool,
+    compact_rule: bool,
 ) -> Vec<Line<'static>> {
     let (reply, broadcast, edited) = if compact {
         (" <", " @c", " (ed)")
@@ -101,42 +168,96 @@ fn row_lines(
     if row.mentions_me {
         header.push(Span::styled("*".to_owned(), mention_style()));
     }
-    header.push(Span::styled(row.author.clone(), author_style()));
-    header.push(Span::raw(" "));
-    header.push(Span::raw(age(row.created_at, now)));
+    let prefix_width: usize = header
+        .iter()
+        .map(|span| span.content.as_ref().width())
+        .sum();
+    let mut suffix: Vec<Span<'static>> = vec![Span::raw(format!(" {}", age(row.created_at, now)))];
     if mark != RootMark::None {
-        // The root label belongs to the root row and nowhere else: it is not
-        // a second pinned header.
-        header.push(Span::styled("  [root]".to_owned(), pending_style()));
+        suffix.push(Span::styled("  [root]".to_owned(), pending_style()));
     }
     if row.pending {
-        header.push(Span::styled(" ...".to_owned(), pending_style()));
+        suffix.push(Span::styled(" ...".to_owned(), pending_style()));
     }
     if row.uncertain {
-        header.push(Span::styled(" ?".to_owned(), mention_style()));
+        suffix.push(Span::styled(" ? Unconfirmed".to_owned(), mention_style()));
     }
     if row.parent_id.is_some() {
-        header.push(Span::raw(reply));
+        suffix.push(Span::raw(reply));
     }
     if row.broadcast {
-        header.push(Span::raw(broadcast));
+        suffix.push(Span::raw(broadcast));
     }
     if row.mentions_me {
-        header.push(Span::styled(" @you".to_owned(), mention_style()));
+        suffix.push(Span::styled(" @you".to_owned(), mention_style()));
     }
     if row.edited {
-        header.push(Span::raw(edited));
+        suffix.push(Span::raw(edited));
     }
-    let mut lines = vec![Line::from(header)];
+    let suffix_width = |spans: &[Span<'static>]| {
+        spans
+            .iter()
+            .map(|span| span.content.as_ref().width())
+            .sum::<usize>()
+    };
+    let fits = |spans: &[Span<'static>]| prefix_width + 1 + suffix_width(spans) < width as usize;
+    if !fits(&suffix) {
+        // Age is secondary; semantic state words are not. Drop it before
+        // shortening the author, so a long name cannot hide @you or failure.
+        suffix.remove(0);
+    }
+    // Metadata yields in a fixed order when a narrow header cannot carry all
+    // of it. Attention and write-state words stay ahead of reply decoration.
+    for marker in [edited, broadcast, reply, "  [root]"] {
+        if fits(&suffix) {
+            break;
+        }
+        if let Some(index) = suffix
+            .iter()
+            .position(|span| span.content.as_ref() == marker)
+        {
+            suffix.remove(index);
+        }
+    }
+    if !fits(&suffix)
+        && let Some(index) = suffix
+            .iter()
+            .position(|span| span.content.as_ref() == " ...")
+    {
+        suffix.remove(index);
+    }
+    let suffix_width = suffix_width(&suffix);
+    let author_budget = (width as usize)
+        .saturating_sub(prefix_width + 1 + suffix_width)
+        .max(1);
+    header.push(Span::styled(
+        clip_with_ellipsis(&row.author, author_budget),
+        if focused {
+            action_style()
+        } else {
+            author_style()
+        },
+    ));
+    header.extend(suffix);
+    let header_width: usize = header
+        .iter()
+        .map(|span| span.content.as_ref().width())
+        .sum();
+    if compact_rule && header_width + 6 <= width as usize {
+        header.push(Span::raw("  "));
+        header.push(Span::styled(
+            "─".repeat(width as usize - header_width - 2),
+            separator_style(),
+        ));
+    }
 
+    let mut lines = vec![Line::from(header)];
     let body_style = if row.pending || row.uncertain {
         pending_style()
     } else {
         Style::default()
     };
     if mark == RootMark::Deleted {
-        // The replies that named it stay readable; only its own content is
-        // gone, and no root-targeted write is offered.
         lines.push(Line::styled("Root deleted".to_owned(), pending_style()));
     } else {
         for line in row.body.split('\n') {
@@ -166,7 +287,8 @@ fn row_lines(
     lines
 }
 
-/// Greedy word wrap on characters, simple and predictable for a chat body.
+/// Greedy word wrap measured in terminal cells, so wide CJK and emoji yield
+/// before decoration or a footer can be overwritten.
 fn wrap(line: &str, width: u16) -> Vec<String> {
     let width = width.max(8) as usize;
     if line.is_empty() {
@@ -175,40 +297,69 @@ fn wrap(line: &str, width: u16) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     for word in line.split(' ') {
-        let candidate_len = current.len() + word.len() + !current.is_empty() as usize;
-        if candidate_len > width && !current.is_empty() {
+        let word_width = word.width();
+        if word_width > width {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            let mut rest = word;
+            while rest.width() > width {
+                let (chunk, tail) = split_cells(rest, width);
+                out.push(chunk.to_owned());
+                rest = tail;
+            }
+            current.push_str(rest);
+            continue;
+        }
+        let candidate_width = current.width() + word_width + usize::from(!current.is_empty());
+        if candidate_width > width && !current.is_empty() {
             out.push(std::mem::take(&mut current));
         }
         if !current.is_empty() {
             current.push(' ');
         }
-        // A word longer than a line is split on character boundaries; chat
-        // bodies can carry long URLs and hashes.
-        let mut rest: &str = word;
-        while rest.chars().count() > width {
-            let take: String = rest.chars().take(width).collect();
-            out.push(take);
-            rest = &rest[rest
-                .char_indices()
-                .nth(width)
-                .map(|(i, _)| i)
-                .unwrap_or(rest.len())..];
-        }
-        current.push_str(rest);
+        current.push_str(word);
     }
     out.push(current);
     out
+}
+
+fn split_cells(text: &str, max_width: usize) -> (&str, &str) {
+    let mut used = 0;
+    for (index, ch) in text.char_indices() {
+        let width = ch.width().unwrap_or(0);
+        if used > 0 && used + width > max_width {
+            return (&text[..index], &text[index..]);
+        }
+        used += width;
+    }
+    (text, "")
+}
+
+fn cursor_window_start(line: &str, cursor: usize, width: usize) -> usize {
+    let cursor = cursor.min(line.len());
+    let before = &line[..cursor];
+    let wanted_start = before
+        .width()
+        .saturating_sub(width.max(1).saturating_sub(1));
+    let mut used = 0;
+    for (index, ch) in line.char_indices() {
+        let ch_width = ch.width().unwrap_or(0);
+        if used + ch_width > wanted_start {
+            return index;
+        }
+        used += ch_width;
+    }
+    line.len()
 }
 
 /// The visible slice of one composer line around the cursor, so a narrow
 /// composer keeps the insertion point on screen. The draft itself is
 /// unchanged; this is a view of it.
 fn cursor_window(line: &str, cursor: usize, width: usize) -> String {
-    let width = width.max(1);
     let cursor = cursor.min(line.len());
-    let skipped = line[..cursor].chars().count();
-    let start = skipped.saturating_sub(width.saturating_sub(1));
-    line.chars().skip(start).take(width).collect()
+    let start = cursor_window_start(line, cursor, width);
+    split_cells(&line[start..], width.max(1)).0.to_owned()
 }
 
 /// The typing line for the open channel: one merged sentence for everyone
@@ -293,38 +444,62 @@ fn draw_wide(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let main = Layout::horizontal([Constraint::Length(22), Constraint::Min(40)]).split(outer[0]);
 
     draw_channel_list(frame, app, now, main[0]);
+    let composing = app.mode == Mode::Composer;
+    let roomy = area.width >= 40 && area.height >= 16;
     let typing = typing_text(app, now, false);
+    let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
+    let target_rows = u16::from(composing);
+    let gap_rows = u16::from(composing && roomy);
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(u16::from(!typing.is_empty())),
-        Constraint::Length(3),
+        Constraint::Length(target_rows),
+        Constraint::Length(gap_rows),
+        Constraint::Length(input_rows),
+        Constraint::Length(1),
     ])
     .split(main[1]);
     draw_header(frame, app, column[0], false);
-    draw_timeline(frame, app, column[1], now, false);
+    draw_timeline(frame, app, column[1], now, false, roomy);
     draw_typing(frame, &typing, column[2]);
-    draw_composer(frame, app, column[3], false);
+    if composing {
+        draw_composer_target(frame, app, column[3]);
+        draw_composer(frame, app, column[5]);
+    }
+    draw_channel_keys(frame, main[1].width, column[6], composing);
     draw_status(frame, app, outer[1], true);
 }
 
 /// One column: header, timeline, composer, status hint. The channel list is
 /// behind `c`.
 fn draw_narrow(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let composing = app.mode == Mode::Composer;
+    let roomy = area.width >= 40 && area.height >= 16;
     let typing = typing_text(app, now, true);
+    let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
+    let target_rows = u16::from(composing);
+    let gap_rows = u16::from(composing && roomy);
     let column = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(3),
+        Constraint::Min(1),
         Constraint::Length(u16::from(!typing.is_empty())),
-        Constraint::Length(3),
+        Constraint::Length(target_rows),
+        Constraint::Length(gap_rows),
+        Constraint::Length(input_rows),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(area);
     draw_header(frame, app, column[0], true);
-    draw_timeline(frame, app, column[1], now, false);
+    draw_timeline(frame, app, column[1], now, false, roomy);
     draw_typing(frame, &typing, column[2]);
-    draw_composer(frame, app, column[3], true);
-    draw_status(frame, app, column[4], false);
+    if composing {
+        draw_composer_target(frame, app, column[3]);
+        draw_composer(frame, app, column[5]);
+    }
+    draw_channel_keys(frame, area.width, column[6], composing);
+    draw_status(frame, app, column[7], false);
 }
 
 /// The focused thread: one full-screen timeline at every size, with the
@@ -334,32 +509,29 @@ fn draw_narrow(frame: &mut Frame, app: &App, now: u64, area: Rect) {
 /// say who is replying to this thread, and it is left out.
 fn draw_thread(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutMode) {
     let compact = mode != LayoutMode::Wide;
-    let minimal = mode == LayoutMode::Minimal;
     let composing = app.mode == Mode::Composer;
-    // The one-row input is the minimal shape; wider terminals keep the
-    // existing multi-line composer while every other region still fits.
-    let boxed = composing && !minimal;
+    let roomy = area.width >= 40 && area.height >= 16;
+    let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
+    let target_rows = u16::from(composing);
+    let gap_rows = u16::from(composing && roomy);
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(u16::from(composing)),
-        Constraint::Length(if boxed { 3 } else { u16::from(composing) }),
+        Constraint::Length(target_rows),
+        Constraint::Length(gap_rows),
+        Constraint::Length(input_rows),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(area);
     draw_thread_header(frame, app, column[0], compact);
-    draw_thread_timeline(frame, app, column[1], now, compact);
+    draw_thread_timeline(frame, app, column[1], now, compact, roomy);
     if composing {
-        draw_thread_target(frame, app, column[2]);
-        if boxed {
-            draw_composer(frame, app, column[3], compact);
-        } else {
-            draw_composer_line(frame, app, column[3]);
-        }
+        draw_composer_target(frame, app, column[2]);
+        draw_composer(frame, app, column[4]);
     }
-    draw_thread_keys(frame, app, column[4], compact);
-    draw_thread_status(frame, app, column[5], compact);
+    draw_thread_keys(frame, app, column[5], compact);
+    draw_thread_status(frame, app, column[6], compact);
 }
 
 /// `Thread / #channel` and the way back. The back hint is reserved before the
@@ -391,7 +563,14 @@ fn draw_thread_header(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
 
 /// The thread's own rows: the root first, then the loaded replies in
 /// chronological order. The root scrolls like every other row.
-fn draw_thread_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, compact: bool) {
+fn draw_thread_timeline(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    now: u64,
+    compact: bool,
+    roomy: bool,
+) {
     if app.thread.rows.is_empty() {
         // Nothing is claimed about an unloaded thread: an empty-thread claim
         // would be a false result while the read is still out.
@@ -413,22 +592,25 @@ fn draw_thread_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, comp
         area,
         now,
         compact,
-        head,
+        RowOptions {
+            roomy,
+            focus_visible: app.mode != Mode::Composer,
+            head,
+        },
     );
 }
 
-/// What the composer is aimed at, stated rather than inferred from the
-/// focused row.
-fn draw_thread_target(frame: &mut Frame, app: &App, area: Rect) {
-    if app.composer.edit.is_some() {
-        frame.render_widget(Paragraph::new("Edit own message"), area);
+/// The composer target is an explicit destination, not a decoration attached
+/// to whichever row happens to be nearest the input.
+fn draw_composer_target(frame: &mut Frame, app: &App, area: Rect) {
+    if area.is_empty() {
         return;
     }
-    if let Some(reply) = &app.composer.reply {
-        frame.render_widget(Paragraph::new(format!("Reply to {}", reply.author)), area);
-        return;
-    }
-    frame.render_widget(Paragraph::new("New message"), area);
+    let line = Line::from(vec![
+        Span::styled("│ ", separator_style()),
+        Span::styled(target_text(app), action_style()),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_thread_keys(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
@@ -446,7 +628,11 @@ fn draw_thread_keys(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
 /// The thread's status. One transient message at a time, in the order the
 /// reader needs it: a write outcome, then the read state, then coverage.
 fn draw_thread_status(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
-    frame.render_widget(Paragraph::new(thread_status(app, compact)), area);
+    let status = thread_status(app, compact);
+    frame.render_widget(
+        Paragraph::new(Line::styled(status.clone(), status_style(&status))),
+        area,
+    );
 }
 
 fn thread_status(app: &App, compact: bool) -> String {
@@ -493,26 +679,45 @@ fn thread_status(app: &App, compact: bool) -> String {
     conn_word(app.conn).to_owned()
 }
 
-/// One column with compact rows. The composer takes a single line, and only
-/// while it is being used.
 fn draw_minimal(frame: &mut Frame, app: &App, now: u64, area: Rect) {
-    let composer_rows = u16::from(app.mode == Mode::Composer);
-    let typing = typing_text(app, now, true);
+    let composing = app.mode == Mode::Composer;
+    let typing = if !composing && area.height >= 7 {
+        typing_text(app, now, true)
+    } else {
+        String::new()
+    };
     let column = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(1),
+        Constraint::Min(if composing { 1 } else { 3 }),
         Constraint::Length(u16::from(!typing.is_empty())),
-        Constraint::Length(composer_rows),
+        Constraint::Length(u16::from(composing)),
+        Constraint::Length(u16::from(composing)),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(area);
     draw_header(frame, app, column[0], true);
-    draw_timeline(frame, app, column[1], now, true);
+    draw_timeline(frame, app, column[1], now, true, false);
     draw_typing(frame, &typing, column[2]);
-    if composer_rows == 1 {
-        draw_composer_line(frame, app, column[3]);
+    if composing {
+        draw_composer_target(frame, app, column[3]);
+        draw_composer_line(frame, app, column[4]);
     }
-    draw_status(frame, app, column[4], false);
+    draw_channel_keys(frame, area.width, column[5], composing);
+    draw_status(frame, app, column[6], false);
+}
+
+fn draw_channel_keys(frame: &mut Frame, width: u16, area: Rect, composing: bool) {
+    let keys = if composing {
+        "Enter:send Esc:nav"
+    } else if width >= 80 {
+        "j/k move · c picker · Enter reply · ? help"
+    } else if width >= 40 {
+        "j/k move · c picker · Enter reply"
+    } else {
+        "j/k · c · Enter · ?"
+    };
+    frame.render_widget(Paragraph::new(keys), area);
 }
 
 /// The channel and its loading state; the compact modes add the connection
@@ -534,12 +739,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
         }
         None => "no conversation".to_owned(),
     };
-    let text = if with_conn {
-        format!("{channel} · {}", conn_word(app.conn))
+    let line = if with_conn {
+        Line::from(vec![
+            Span::styled(channel, author_style()),
+            Span::styled(format!(" · {}", conn_word(app.conn)), pending_style()),
+        ])
     } else {
-        channel
+        Line::styled(channel, author_style())
     };
-    frame.render_widget(Paragraph::new(text), area);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// One conversation list line: `number signal name`, plus the typing marker.
@@ -692,7 +900,11 @@ fn draw_channel_list(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let list = List::new(items)
         .block(block)
         .highlight_style(highlight_style())
-        .highlight_symbol("> ");
+        .highlight_symbol(if app.mode == Mode::Composer {
+            "  "
+        } else {
+            "> "
+        });
     let mut state = ListState::default();
     state.select(item_index(&rows, selected));
     frame.render_stateful_widget(list, area, &mut state);
@@ -708,13 +920,25 @@ fn inbox_title(app: &App) -> Line<'static> {
 /// The timeline, drawn as a line window instead of a widget list. A widget
 /// list drops any item taller than its area, and in a chat one long message
 /// is exactly that; this keeps the focused row's own lines on screen.
-fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, compact: bool) {
+fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, compact: bool, roomy: bool) {
     let rows = app
         .channels
         .get(app.selected)
         .map(|e| e.rows.as_slice())
         .unwrap_or(&[]);
-    draw_rows(frame, rows, app.focus, area, now, compact, RootMark::None);
+    draw_rows(
+        frame,
+        rows,
+        app.focus,
+        area,
+        now,
+        compact,
+        RowOptions {
+            roomy,
+            focus_visible: app.mode != Mode::Composer,
+            head: RootMark::None,
+        },
+    );
 }
 
 /// One row list, focused row kept visible. The channel timeline and the
@@ -727,7 +951,7 @@ fn draw_rows(
     area: Rect,
     now: u64,
     compact: bool,
-    head: RootMark,
+    options: RowOptions,
 ) {
     if area.is_empty() {
         return;
@@ -737,18 +961,37 @@ fn draw_rows(
         return;
     }
 
+    let focus = focus.min(rows.len() - 1);
+    let compact_rule = area.width >= 40 && !options.roomy;
     // Flatten the rows, and remember where each row starts, so the window can
     // be placed in lines rather than in whole rows.
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut starts: Vec<usize> = Vec::with_capacity(rows.len() + 1);
     for (index, row) in rows.iter().enumerate() {
         starts.push(lines.len());
-        let mark = if index == 0 { head } else { RootMark::None };
-        lines.extend(row_lines(row, now, body_width, compact, mark));
+        let mark = if index == 0 {
+            options.head
+        } else {
+            RootMark::None
+        };
+        lines.extend(row_lines_with_options(
+            row,
+            now,
+            body_width,
+            compact,
+            mark,
+            options.focus_visible && index == focus,
+            compact_rule,
+        ));
+        if options.roomy && index + 1 < rows.len() {
+            lines.push(Line::styled(
+                "─".repeat(body_width as usize),
+                separator_style(),
+            ));
+        }
     }
     starts.push(lines.len());
 
-    let focus = focus.min(rows.len() - 1);
     let viewport = area.height as usize;
     let height = starts[focus + 1] - starts[focus];
     let offset = if height > viewport {
@@ -760,7 +1003,6 @@ fn draw_rows(
         starts[focus + 1].saturating_sub(viewport)
     };
 
-    let focused = highlight_style();
     let visible: Vec<Line<'static>> = lines
         .into_iter()
         .skip(offset)
@@ -772,120 +1014,138 @@ fn draw_rows(
                 Ok(index) => index,
                 Err(index) => index.saturating_sub(1),
             };
-            let symbol = if row == focus && at == starts[focus] {
+            let symbol = if options.focus_visible && row == focus && at == starts[focus] {
                 "> "
             } else {
                 "  "
             };
             let mut spans = vec![Span::raw(symbol)];
             spans.extend(line.spans);
-            let line = Line::from(spans);
-            if row == focus {
-                line.style(focused)
-            } else {
-                line
-            }
+            Line::from(spans)
         })
         .collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
 
-fn composer_hint(app: &App, compact: bool) -> String {
+fn composer_prefix(app: &App) -> &'static str {
     if app.composer.edit.is_some() {
-        if compact {
-            "edit · enter save · esc cancel".to_owned()
-        } else {
-            "editing your message - enter to save, esc to cancel".to_owned()
-        }
-    } else if let Some(reply) = &app.composer.reply {
-        if compact {
-            format!("reply {} · enter send", reply.author)
-        } else {
-            format!("reply to {} - enter to send, esc to clear", reply.author)
-        }
-    } else if app.mode == Mode::Composer {
-        if compact {
-            "new message · enter send".to_owned()
-        } else {
-            "new message - enter to send, alt+enter newline".to_owned()
-        }
-    } else if compact {
-        "i compose · enter reply".to_owned()
-    } else {
-        "i compose - enter reply".to_owned()
-    }
-}
-
-fn draw_composer(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
-    let hint = composer_hint(app, compact);
-    let block = Block::default().borders(Borders::ALL).title(hint);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if compact {
-        // The narrow composer box has one inner row: follow the cursor
-        // instead of scrolling whole lines off the top.
-        let (line, col) = app.composer.cursor;
-        let text = app.composer.lines.get(line).cloned().unwrap_or_default();
-        frame.render_widget(
-            Paragraph::new(cursor_window(&text, col, inner.width as usize)),
-            inner,
-        );
-        return;
-    }
-    let visible = inner.height as usize;
-    let lines: Vec<Line> = app
-        .composer
-        .lines
-        .iter()
-        .map(|l| Line::raw(l.clone()))
-        .collect();
-    let skip = app
-        .composer
-        .cursor
-        .0
-        .saturating_sub(visible.saturating_sub(1));
-    let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
-    frame.render_widget(Paragraph::new(shown), inner);
-}
-
-/// The minimal composer: one line, with the target it is aimed at.
-fn draw_composer_line(frame: &mut Frame, app: &App, area: Rect) {
-    let prompt = if app.composer.edit.is_some() {
         "e> "
     } else if app.composer.reply.is_some() {
         "r> "
     } else {
         "> "
+    }
+}
+
+fn cursor_offset(line: &str, cursor: usize, width: usize) -> usize {
+    let cursor = cursor.min(line.len());
+    let start = cursor_window_start(line, cursor, width);
+    line[start..cursor].width()
+}
+
+fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let prefix = composer_prefix(app);
+    let cursor_line = app.composer.cursor.0;
+    let cursor_col = app.composer.cursor.1;
+    let visible = area.height as usize;
+    let skip = cursor_line.saturating_sub(visible.saturating_sub(1));
+    let mut lines = Vec::with_capacity(visible.max(1));
+    for (index, line) in app
+        .composer
+        .lines
+        .iter()
+        .skip(skip)
+        .take(visible.max(1))
+        .enumerate()
+    {
+        let actual = skip + index;
+        let marker = if index == 0 { prefix } else { "  " };
+        let width = area.width.saturating_sub(marker.width() as u16) as usize;
+        let text = if actual == cursor_line {
+            cursor_window(line, cursor_col, width)
+        } else {
+            line.clone()
+        };
+        lines.push(Line::raw(format!("{marker}{text}")));
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw(prefix));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+
+    let marker_width = if cursor_line == 0 {
+        prefix.width()
+    } else {
+        "  ".width()
     };
+    let width = area.width.saturating_sub(marker_width as u16) as usize;
+    let cursor_y = area.y + cursor_line.saturating_sub(skip) as u16;
+    let cursor_x = area.x
+        + marker_width as u16
+        + cursor_offset(
+            app.composer
+                .lines
+                .get(cursor_line)
+                .map(String::as_str)
+                .unwrap_or_default(),
+            cursor_col,
+            width,
+        ) as u16;
+    frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+/// The minimal composer: one line, with the target it is aimed at.
+fn draw_composer_line(frame: &mut Frame, app: &App, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let prompt = composer_prefix(app);
     let (line, col) = app.composer.cursor;
     let text = app.composer.lines.get(line).cloned().unwrap_or_default();
-    let width = area.width.saturating_sub(prompt.len() as u16) as usize;
+    let width = area.width.saturating_sub(prompt.width() as u16) as usize;
     frame.render_widget(
         Paragraph::new(format!("{prompt}{}", cursor_window(&text, col, width))),
         area,
     );
+    frame.set_cursor_position((
+        area.x + prompt.width() as u16 + cursor_offset(&text, col, width) as u16,
+        area.y,
+    ));
+}
+
+fn status_detail(app: &App) -> String {
+    let connection = conn_word(app.conn);
+    if app.status == connection
+        || app.status.starts_with(&format!("{connection} "))
+        || app.status.starts_with(&format!("{connection}:"))
+    {
+        app.status.clone()
+    } else {
+        format!("{connection} | {}", app.status)
+    }
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect, wide: bool) {
-    let status = if wide {
-        let mode = match app.mode {
-            Mode::Navigation => "nav",
-            Mode::Composer => "composer",
-        };
-        format!(
-            "status: {} {} | {} | mode: {mode} | ?=help",
-            conn_word(app.conn),
-            app.relay_label,
-            app.status
-        )
-    } else {
-        let mode = match app.mode {
-            Mode::Navigation => "nav",
-            Mode::Composer => "compose",
-        };
-        format!("{mode} · {}", app.status)
+    let mode = match app.mode {
+        Mode::Navigation => "nav",
+        Mode::Composer if wide => "composer",
+        Mode::Composer => "compose",
     };
-    frame.render_widget(Paragraph::new(status), area);
+    let detail = status_detail(app);
+    let status = if wide && area.width >= 100 {
+        format!("status: {detail} | mode: {mode} | ?=help")
+    } else {
+        let prefix = format!("{mode} · ");
+        let remaining = area.width.saturating_sub(prefix.width() as u16) as usize;
+        format!("{prefix}{}", clip_with_ellipsis(&detail, remaining))
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(status.clone(), status_style(&status))),
+        area,
+    );
 }
 
 fn draw_size_message(frame: &mut Frame, area: Rect) {
@@ -1015,6 +1275,26 @@ fn draw_agent_list(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn detail_field(label: &str, value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let prefix = format!("{label} ");
+    let value_width = width.saturating_sub(prefix.width()).max(1);
+    wrap(value, value_width as u16)
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let lead = if index == 0 {
+                prefix.clone()
+            } else {
+                " ".repeat(prefix.width())
+            };
+            Line::from(vec![
+                Span::styled(lead, pending_style()),
+                Span::styled(part, style),
+            ])
+        })
+        .collect()
+}
+
 fn draw_agent_detail(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let Some(agent) = app.selected_agent() else {
         // The roster moved under the cursor: the list level says why.
@@ -1024,21 +1304,19 @@ fn draw_agent_detail(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let width = area.width.saturating_sub(2) as usize;
     let status = app.agent_status(&agent.pubkey, now);
     let mut body: Vec<Line<'static>> = Vec::new();
-    body.push(Line::from(vec![
-        Span::styled("name         ", pending_style()),
-        Span::raw(clip(&agent.name, width.saturating_sub(13))),
-    ]));
-    body.push(Line::from(vec![
-        Span::styled("key          ", pending_style()),
-        Span::raw(clip(&short_pubkey(&agent.pubkey), width.saturating_sub(13))),
-    ]));
-    body.push(Line::from(vec![
-        Span::styled("status       ", pending_style()),
-        Span::styled(
-            clip(&agent_status_word(&status), width.saturating_sub(13)),
-            agent_status_style(&status),
-        ),
-    ]));
+    body.extend(detail_field("name", &agent.name, width, Style::default()));
+    body.extend(detail_field(
+        "key",
+        &short_pubkey(&agent.pubkey),
+        width,
+        Style::default(),
+    ));
+    body.extend(detail_field(
+        "status",
+        &agent_status_word(&status),
+        width,
+        agent_status_style(&status),
+    ));
     if let Some(at) = app.agent_last_signal(&agent.pubkey) {
         // The age of the evidence, so the claim can be inspected instead of
         // believed.
@@ -1141,7 +1419,6 @@ fn agent_status_word(status: &AgentStatus) -> String {
         AgentStatus::Unknown => "Unknown".to_owned(),
     }
 }
-
 /// Only the strongest evidence is highlighted: a working turn is a claim about
 /// execution, typing is a weaker one, and the two quiet states are not claims
 /// at all.
@@ -1153,25 +1430,26 @@ fn agent_status_style(status: &AgentStatus) -> Style {
     }
 }
 
-/// One row of the Agent list: the name, and the status it carries. The status
-/// is placed first and the name is clipped around it, because a clipped name
-/// is still a name while a clipped status is a different state.
 fn agent_row(name: &str, status: &AgentStatus, width: usize) -> Vec<Line<'static>> {
     let text = agent_status_word(status);
     let style = agent_status_style(status);
-    let budget = width.saturating_sub(text.chars().count() + 1);
+    let budget = width.saturating_sub(text.width() + 1);
     if budget >= AGENT_NAME_MIN {
         let name = clip(name, budget);
-        let pad = budget - name.chars().count() + 1;
+        let pad = budget.saturating_sub(name.width()) + 1;
         return vec![Line::from(vec![
             Span::raw(format!("{name}{}", " ".repeat(pad))),
             Span::styled(text, style),
         ])];
     }
-    vec![
-        Line::raw(clip(name, width)),
-        Line::from(vec![Span::styled(format!("  {text}"), style)]),
-    ]
+    let status_width = width.saturating_sub(2).max(1);
+    let mut lines = vec![Line::raw(clip(name, width))];
+    lines.extend(
+        wrap(&text, status_width as u16)
+            .into_iter()
+            .map(|line| Line::from(vec![Span::styled(format!("  {line}"), style)])),
+    );
+    lines
 }
 
 /// What the Agents list says about the roster it does not show as rows. The
@@ -1246,7 +1524,17 @@ fn agents_hint(width: u16, open_channel: bool) -> String {
 
 /// Cut a label to the cells a row has for it.
 fn clip(text: &str, max: usize) -> String {
-    text.chars().take(max).collect()
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > max {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out
 }
 
 /// Clip a label to `max` cells, saying that it was clipped. A shortened name
@@ -1413,75 +1701,89 @@ fn help_lines(text: &str, width: usize) -> Vec<String> {
         }
         let mut current = String::new();
         for word in line.split(' ') {
-            // A word wider than the terminal - a full `nostr:npub1…`
-            // reference - breaks across lines rather than being clipped, so
-            // every character of the help text stays reachable by scrolling.
-            if word.chars().count() > width {
+            if word.width() > width {
                 if !current.is_empty() {
                     lines.push(std::mem::take(&mut current));
                 }
-                let mut chunk = String::new();
-                for ch in word.chars() {
-                    chunk.push(ch);
-                    if chunk.chars().count() == width {
-                        lines.push(std::mem::take(&mut chunk));
-                    }
+                let mut rest = word;
+                while rest.width() > width {
+                    let (chunk, tail) = split_cells(rest, width);
+                    lines.push(chunk.to_owned());
+                    rest = tail;
                 }
-                current = chunk;
+                current.push_str(rest);
                 continue;
             }
-            let mut piece = current.clone();
-            if !piece.is_empty() {
-                piece.push(' ');
-            }
-            piece.push_str(word);
-            if piece.chars().count() > width && !current.is_empty() {
+            let candidate_width = current.width() + word.width() + usize::from(!current.is_empty());
+            if candidate_width > width && !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
-                current = word.to_owned();
-            } else {
-                current = piece;
             }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
         }
         lines.push(current);
     }
     lines
 }
+fn help_context(app: &App) -> String {
+    if app.thread.open {
+        return "Thread".to_owned();
+    }
+    if app.agents.open
+        && matches!(app.agents.cursor.level, agents::Level::Detail)
+        && let Some(agent) = app.selected_agent()
+    {
+        return format!("My agents / {}", agent.name);
+    }
+    if app.agents.open {
+        return "My agents".to_owned();
+    }
+    if app.picker.is_some() {
+        return format!("Inbox / {}", app.filter.name());
+    }
+    app.channels
+        .get(app.selected)
+        .map(|entry| {
+            let label = app.label(entry);
+            if entry.is_dm() {
+                label
+            } else {
+                format!("#{label}")
+            }
+        })
+        .unwrap_or_else(|| "conversation".to_owned())
+}
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect, mode: LayoutMode) {
     frame.render_widget(Clear, area);
-    if mode != LayoutMode::Wide {
-        // No border: at the smallest sizes every row carries a key, and the
-        // text scrolls by j and k.
-        let rows = area.height as usize;
-        let lines = help_lines(&help_text(app, mode), area.width as usize);
-        let scroll = (app.help_scroll as usize).min(lines.len().saturating_sub(rows));
-        let visible: Vec<Line<'static>> = lines
+    let width = area.width as usize;
+    let fixed = area.height.min(3) as usize;
+    let content_rows = area.height as usize - fixed;
+    let lines = help_lines(&help_text(app, mode), width);
+    let scroll = (app.help_scroll as usize).min(lines.len().saturating_sub(content_rows));
+    let mut visible = Vec::with_capacity(area.height as usize);
+    visible.push(Line::raw(format!(
+        "Help / {}",
+        clip_with_ellipsis(&help_context(app), width.saturating_sub(7)),
+    )));
+    visible.extend(
+        lines
             .into_iter()
             .skip(scroll)
-            .take(rows)
-            .map(Line::raw)
-            .collect();
-        frame.render_widget(Paragraph::new(visible), area);
-        return;
-    }
-    let lines = help_lines(&help_text(app, mode), area.width.saturating_sub(4) as usize);
-    let content = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
-    let width = (content + 2).min(area.width);
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let popup = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
-        width,
-        height,
-    };
-    let rows = height.saturating_sub(2) as usize;
-    let scroll = (app.help_scroll as usize).min(lines.len().saturating_sub(rows));
-    let visible: Vec<Line<'static>> = lines.into_iter().skip(scroll).map(Line::raw).collect();
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title("keys")),
-        popup,
+            .take(content_rows)
+            .map(Line::raw),
     );
+    visible.push(Line::raw(clip_with_ellipsis(
+        "Esc return · j/k scroll",
+        width,
+    )));
+    visible.push(Line::styled(
+        clip_with_ellipsis(&format!("state: {}", app.status), width),
+        status_style(&app.status),
+    ));
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
 #[cfg(test)]
@@ -1512,9 +1814,18 @@ mod tests {
     fn a_word_longer_than_the_row_breaks_without_overflowing() {
         let url = "https://example.test/a/very/long/path/that/keeps/going";
         for chunk in wrap(url, 22) {
-            assert!(chunk.chars().count() <= 22, "{chunk:?} is wider than 22");
+            assert!(chunk.width() <= 22, "{chunk:?} is wider than 22");
         }
         assert_eq!(wrap(url, 22).concat(), url, "only the wrapping changed");
+    }
+
+    #[test]
+    fn wrapping_and_clipping_use_terminal_cells_for_wide_text() {
+        let text = "甲🙂乙🙂丙";
+        let chunks = wrap(text, 8);
+        assert!(chunks.iter().all(|chunk| chunk.width() <= 8), "{chunks:?}");
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(clip(text, 6), "甲🙂乙");
     }
 
     #[test]
@@ -1526,6 +1837,80 @@ mod tests {
         assert_eq!(cursor_window("abcdefghij", 5, 4), "cdef");
         // A multi-byte draft keeps its characters intact.
         assert_eq!(cursor_window("aé日x", 7, 3), "日x");
+    }
+
+    #[test]
+    fn timeline_density_uses_a_rule_without_making_it_a_focusable_row() {
+        let rows = vec![message_row(0, "first"), message_row(1, "second")];
+        let app = chat_app(rows);
+        let compact = frame_text(&app, 80, 12);
+        assert!(compact.lines().any(|line| line.contains("─")), "{compact}");
+        assert!(
+            compact
+                .lines()
+                .any(|line| line.get(22..).is_some_and(|tail| !tail.contains("┌"))),
+            "the timeline does not draw message boxes: {compact}"
+        );
+
+        let roomy = frame_text(&app, 80, 20);
+        let separator = roomy
+            .lines()
+            .find(|line| line.get(22..).is_some_and(|tail| tail.contains("────────")))
+            .expect("roomy messages have a separator");
+        let timeline_tail: String = separator.chars().skip(22).collect();
+        assert!(timeline_tail.starts_with("  ─"), "{separator:?}");
+        let matrix_wide = frame_text(&app, 120, 30);
+        assert!(
+            matrix_wide.lines().any(|line| line.contains("─")),
+            "the 120x30 roomy layout keeps the separator: {matrix_wide}"
+        );
+    }
+
+    #[test]
+    fn composing_keeps_roomy_density_and_moves_focus_to_the_composer() {
+        let mut app = chat_app(vec![message_row(0, "first"), message_row(1, "second")]);
+        app.mode = Mode::Composer;
+        app.composer.set_text("draft");
+        let text = frame_text(&app, 120, 19);
+        assert!(text.lines().any(|line| line.contains("─")), "{text}");
+        assert!(
+            !text.lines().any(|line| line.contains("> alice")),
+            "the timeline focus marker must yield to the composer: {text}"
+        );
+    }
+
+    #[test]
+    fn composing_at_the_floor_names_the_target_without_an_input_box() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.mode = Mode::Composer;
+        app.composer.set_text("draft");
+        let text = frame_text(&app, 24, 6);
+        assert!(text.contains("│ New message"), "{text}");
+        assert!(text.contains("> draft"), "{text}");
+        assert!(
+            !text.contains("┌"),
+            "the composer is not a full box: {text}"
+        );
+    }
+
+    #[test]
+    fn help_keeps_context_actions_and_state_at_the_screen_edges() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.help = true;
+        let text = frame_text(&app, 24, 6);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("Help /"), "{text}");
+        assert!(lines[4].contains("Esc return"), "{text}");
+        assert!(lines[5].starts_with("state:"), "{text}");
+    }
+
+    #[test]
+    fn wide_status_keeps_connection_state_with_a_transient_notice() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.status = "read warning".to_owned();
+        let text = frame_text(&app, 120, 19);
+        assert!(text.contains("status: connected | read warning"), "{text}");
+        assert!(text.contains("?=help"), "{text}");
     }
 
     fn chat_app(rows: Vec<crate::content::Row>) -> App {
@@ -2061,7 +2446,7 @@ mod tests {
             typing_row.contains("Agent A typing"),
             "the wide layout spells the display name out: {typing_row:?}"
         );
-        assert!(text.contains("i compose"), "the composer keeps its hint");
+        assert!(!text.contains("i compose"), "reading has no empty editor");
         assert!(text.contains("1      general …"), "{text}");
         assert!(
             !text.contains("2      quiet …"),
@@ -2087,11 +2472,9 @@ mod tests {
         );
         let draft = "draft-in-composer";
         let nav = frame_text(&app, 24, 6);
-        assert!(nav.contains("@agent-a typing…"), "{nav}");
         assert!(
-            !nav.contains(draft),
-            "the composer is closed, so the typing line takes the row and the \
-             composer takes none: {nav}"
+            !nav.contains("@agent-a typing…"),
+            "the minimum reading view omits optional typing to preserve content: {nav}"
         );
 
         app.mode = Mode::Composer;
@@ -2099,20 +2482,24 @@ mod tests {
 
         let narrow = frame_text(&app, 40, 10);
         assert!(narrow.contains("@agent-a typing…"), "{narrow}");
-        assert!(narrow.contains("enter send"), "the composer keeps its hint");
+        assert!(
+            narrow.contains("New message"),
+            "the composer names its target"
+        );
         assert!(narrow.contains(draft), "{narrow}");
 
-        // 24x6 is the floor: header, one timeline row, typing, composer, and
-        // status must all fit at once.
         let minimal = frame_text(&app, 24, 6);
-        assert!(minimal.contains("@agent-a typing…"), "{minimal}");
+        // 24x6 composing is exactly header, context, target, input, keys,
+        // and state; optional channel typing is omitted.
+        assert!(!minimal.contains("@agent-a typing…"), "{minimal}");
+        assert!(minimal.contains("New message"), "{minimal}");
         assert!(
             minimal.contains(&format!("> {draft}")),
             "the composer prompt survives: {minimal}"
         );
         assert!(
-            minimal.contains("hello world"),
-            "the focused row survives: {minimal}"
+            minimal.contains("> "),
+            "the focused message header survives: {minimal}"
         );
     }
 
@@ -2188,6 +2575,32 @@ mod tests {
         assert!(header.contains("@you"), "{header}");
     }
 
+    #[test]
+    fn a_narrow_mentioned_header_reserves_the_semantic_label() {
+        let mut row = message_row(0, "hi");
+        row.author = "Alexandra_Responsible_For_Customer_Support_International".to_owned();
+        row.mentions_me = true;
+        let header = row_lines(&row, 110, 22, true, RootMark::None)[0].to_string();
+        assert!(header.width() <= 22, "{header:?}");
+        assert!(header.contains("@you"), "{header:?}");
+    }
+
+    #[test]
+    fn narrow_headers_bound_optional_metadata_before_state_words() {
+        let mut row = message_row(0, "hi");
+        row.author = "Alexandra_Responsible_For_Customer_Support_International".to_owned();
+        row.mentions_me = true;
+        row.pending = true;
+        row.uncertain = true;
+        row.parent_id = Some("root".to_owned());
+        row.broadcast = true;
+        row.edited = true;
+        let header = row_lines(&row, 110, 38, false, RootMark::Root)[0].to_string();
+        assert!(header.width() <= 38, "{header:?}");
+        assert!(header.contains("Unconfirmed"), "{header:?}");
+        assert!(header.contains("@you"), "{header:?}");
+    }
+
     fn agent_frame(agent: &str, channel: Option<Uuid>, turn: &str) -> crate::agents::Frame {
         crate::agents::Frame {
             agent: agent.to_owned(),
@@ -2231,6 +2644,29 @@ mod tests {
                 "the way out is on screen at {width}x{height}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn narrow_agent_views_keep_the_complete_quiet_state() {
+        let app = agent_app(true, &[("Review Agent", "aa")]);
+        let list = frame_text(&app, 24, 6);
+        assert!(list.contains("No active turn"), "{list}");
+        assert!(list.contains("observed"), "{list}");
+
+        let mut detail_app = app;
+        detail_app.agents.cursor.level = crate::agents::Level::Detail;
+        let detail = frame_text(&detail_app, 24, 6);
+        assert!(detail.contains("No active turn"), "{detail}");
+        assert!(detail.contains("observed"), "{detail}");
+    }
+
+    #[test]
+    fn agent_detail_help_keeps_the_selected_agent_in_context() {
+        let mut app = agent_app(true, &[("Review Agent", "aa")]);
+        app.agents.cursor.level = crate::agents::Level::Detail;
+        app.help = true;
+        let text = frame_text(&app, 40, 10);
+        assert!(text.contains("Help / My agents / Review Agent"), "{text}");
     }
 
     #[test]
