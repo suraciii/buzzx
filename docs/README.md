@@ -34,3 +34,7 @@ It is a product spec, not an implemented capability.
 [tui-visual.md](tui-visual.md) is the approved implementation spec for the shared TUI
 visual language, with message separators, region budgets and acceptance checks.
 Its atlas shows intended appearance; the change is not yet implemented.
+
+[Complete-message reading](tui-reading.md) proposes a full-screen reader for a
+loaded row whose content exceeds the timeline, with line scrolling and return
+to its original reply target. It is a product proposal, not implemented behavior.
