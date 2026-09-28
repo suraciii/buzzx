@@ -24,6 +24,9 @@ use sha2::{Digest, Sha256};
 const CHANNEL: &str = "7e5faaba-948a-47b5-8ca0-20c6e47953d3";
 /// A second channel, to prove a filter does not leak between them.
 const OTHER_CHANNEL: &str = "2c1e6c1a-1a2b-4f3a-9c1d-0f1e2d3c4b5a";
+/// A loopback address nothing listens on: the spawn that must not read the
+/// network still names a relay, so the ambient one cannot be reached.
+const UNREACHABLE: &str = "http://127.0.0.1:1";
 
 /// What the fake relay does with a write.
 #[derive(Clone, Copy, PartialEq)]
@@ -291,16 +294,27 @@ fn matches_filter(event: &Value, filter: &Value) -> bool {
     true
 }
 
+/// A spawn that cannot see the operator's environment: the relay is pinned,
+/// the config file is absent, and both credentials are removed. A test that
+/// reached the ambient relay would send a real message with a real identity,
+/// so no test spawns the binary any other way.
+fn binary(relay: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_buzzx"));
+    command
+        .env("BUZZ_RELAY_URL", relay)
+        .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
+        .env_remove("BUZZ_PRIVATE_KEY")
+        .env_remove("BUZZ_AUTH_TAG");
+    command
+}
+
 /// Run one command against the relay. Returns the exit code, stdout as JSON,
 /// and stderr.
 fn run(relay: &str, keys: &Keys, args: &[&str], stdin: Option<&str>) -> (i32, Value, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_buzzx"));
+    let mut command = binary(relay);
     command
         .args(args)
-        .env("BUZZ_RELAY_URL", relay)
         .env("BUZZ_PRIVATE_KEY", keys.secret_key().to_secret_hex())
-        .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
-        .env_remove("BUZZ_AUTH_TAG")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if stdin.is_some() {
@@ -355,7 +369,7 @@ fn message(keys: &Keys, content: &str, at: u64) -> Event {
 
 #[test]
 fn help_lists_the_five_commands() {
-    let output = Command::new(env!("CARGO_BIN_EXE_buzzx"))
+    let output = binary(UNREACHABLE)
         .arg("help")
         .output()
         .expect("the buzzx binary");
@@ -366,7 +380,7 @@ fn help_lists_the_five_commands() {
     }
     // Acceptance criterion 11: the history help separates which messages are
     // selected from the order they come back in.
-    let output = Command::new(env!("CARGO_BIN_EXE_buzzx"))
+    let output = binary(UNREACHABLE)
         .args(["messages", "get", "--help"])
         .output()
         .expect("the buzzx binary");
@@ -378,9 +392,8 @@ fn help_lists_the_five_commands() {
     // A usage error is bad input: code 1, not clap's own 2, and it stays on
     // stderr as prose.
     for args in [vec!["--nope"], vec!["messages", "nope"], vec!["channels"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_buzzx"))
+        let output = binary(UNREACHABLE)
             .args(&args)
-            .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
             .output()
             .expect("the buzzx binary");
         assert_eq!(output.status.code(), Some(1), "usage error {args:?}");
@@ -1092,10 +1105,10 @@ fn a_startup_failure_prints_one_json_error() {
     // reason's, so a script sees the code the category table promises.
     let valid_key = keys().secret_key().to_secret_hex();
     let reasons = [
-        (None, "http://127.0.0.1:1", 3, "forbidden", "identity"),
+        (None, UNREACHABLE, 3, "forbidden", "identity"),
         (
             Some("not-a-key"),
-            "http://127.0.0.1:1",
+            UNREACHABLE,
             3,
             "forbidden",
             "private key",
@@ -1130,12 +1143,8 @@ fn a_startup_failure_prints_one_json_error() {
                 Some("cd".repeat(32)),
             ),
         ] {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_buzzx"));
-            command
-                .args(&args)
-                .env("BUZZ_RELAY_URL", relay)
-                .env("BUZZX_CONFIG", "/nonexistent/buzzx-test-config")
-                .env_remove("BUZZ_AUTH_TAG");
+            let mut command = binary(relay);
+            command.args(&args);
             match key {
                 Some(key) => command.env("BUZZ_PRIVATE_KEY", key),
                 None => command.env_remove("BUZZ_PRIVATE_KEY"),
