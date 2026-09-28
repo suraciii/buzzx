@@ -711,7 +711,9 @@ impl Client {
 
     /// Extend one channel window by one adjacent page. Inclusive relay
     /// cursors are expected: an `until` page re-answers its boundary second,
-    /// and the caller deduplicates the overlap by event identity. A Newer
+    /// and the caller deduplicates the overlap by event identity. An older
+    /// page grows until it leaves that second, so a full page inside it is
+    /// not mistaken for a boundary (see [`Client::older_rows`]). A Newer
     /// page is walked down to the cursor, so it carries the rows that come
     /// right after it instead of the newest rows of the whole range.
     pub async fn history_page(
@@ -723,16 +725,16 @@ impl Client {
     ) -> Result<HistoryPage, Failure> {
         match direction {
             HistoryDirection::Older => {
-                let raw = self
-                    .transport
-                    .query(&json!({
-                        "kinds": content::TIMELINE_KINDS,
-                        "#h": [channel.to_string()],
-                        "until": cursor,
-                        "limit": limit,
-                    }))
+                let (raw, saturated) = self
+                    .older_rows(
+                        json!({
+                            "kinds": content::TIMELINE_KINDS,
+                            "#h": [channel.to_string()],
+                        }),
+                        cursor,
+                        limit,
+                    )
                     .await?;
-                let saturated = raw.len() as u64 >= limit;
                 Ok(HistoryPage {
                     events: order_timeline(raw),
                     saturated,
@@ -741,6 +743,34 @@ impl Client {
             HistoryDirection::Newer => {
                 let (events, saturated) = self.later_rows(channel, None, cursor, limit).await?;
                 Ok(HistoryPage { events, saturated })
+            }
+        }
+    }
+
+    /// One older page under an inclusive `until` cursor, grown until it
+    /// leaves the cursor's own second or reaches the relay's own bound. The
+    /// page a caller gets is the one that moved; `saturated` reports whether
+    /// that page was full, which is the only evidence of rows the relay did
+    /// not carry.
+    async fn older_rows(
+        &self,
+        filter: Value,
+        cursor: u64,
+        limit: u64,
+    ) -> Result<(Vec<Event>, bool), Failure> {
+        let mut progress = OlderProgress::new(limit);
+        loop {
+            let page = progress.limit();
+            let mut filter = filter.clone();
+            filter["until"] = json!(cursor);
+            filter["limit"] = json!(page);
+            let raw = self.transport.query(&filter).await?;
+            match progress.step(&raw, cursor, page) {
+                Some(next) => debug_assert!(next > page),
+                None => {
+                    let saturated = raw.len() as u64 >= page;
+                    return Ok((raw, saturated));
+                }
             }
         }
     }
@@ -761,27 +791,16 @@ impl Client {
         let hex = root.to_hex();
         let (raw, saturated) = match direction {
             HistoryDirection::Older => {
-                let mut progress = OlderProgress::new(limit);
-                loop {
-                    let page = progress.limit();
-                    let raw = self
-                        .transport
-                        .query(&json!({
-                            "kinds": content::TIMELINE_KINDS,
-                            "#e": [hex],
-                            "#h": [channel.to_string()],
-                            "until": cursor,
-                            "limit": page,
-                        }))
-                        .await?;
-                    match progress.step(&raw, cursor, page) {
-                        Some(next) => debug_assert!(next > page),
-                        None => {
-                            let saturated = raw.len() as u64 >= page;
-                            break (raw, saturated);
-                        }
-                    }
-                }
+                self.older_rows(
+                    json!({
+                        "kinds": content::TIMELINE_KINDS,
+                        "#e": [&hex],
+                        "#h": [channel.to_string()],
+                    }),
+                    cursor,
+                    limit,
+                )
+                .await?
             }
             HistoryDirection::Newer => self.later_rows(channel, Some(root), cursor, limit).await?,
         };

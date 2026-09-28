@@ -760,10 +760,11 @@ event, clears the count and follows the tail again. A reply that is not the
 newest one - a late backfill above the reader - neither moves the view nor
 counts.
 
-An older-window request that would answer a full page inside the boundary
-second grows the request up to the relay's own bound before that second is
-reported as unpassable, so `History limit reached` means a single second holds
-more events than one query may carry.
+An older-page request on any of the three surfaces - channel, context, or
+thread - that would answer a full page inside the boundary second grows the
+request (4x per retry, up to the relay's own bound of 1000 rows) before that
+second is reported as unpassable, so `History limit reached` means a single
+second holds more events than one query may carry.
 
 ### Reply without changing destination
 
