@@ -208,11 +208,14 @@ the former 500-reply cap must be possible where the relay can supply pages.
 
 Do not skip a timestamp boundary with `oldest_second - 1` until all events at
 that second are accounted for. Validate the deployed query's order, inclusive
-bounds and limits before selecting a paging strategy. If stable traversal
-cannot pass a saturated same-second boundary, report `History limit reached`
-with the visible gap and keep the readable window; never claim `Beginning`
-or complete coverage. Internal search-service page fields are not proof that
-clients have a usable cursor.
+bounds and limits before selecting a paging strategy. An older page that
+answers full while sitting entirely inside the boundary second has not moved,
+so it is re-asked with a page four times larger, capped at the relay's own
+bound, and the answer that clears the second is the page the reader gets. Only
+a single second holding more events than one query may carry stays unpassable:
+report `History limit reached` with the visible gap and keep the readable
+window; never claim `Beginning` or complete coverage. Internal search-service
+page fields are not proof that clients have a usable cursor.
 
 Bound memory with a sliding history window (target: at most 2,000 loaded rows
 for the active history view, excluding the separately retained thread root).
