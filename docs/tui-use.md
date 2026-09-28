@@ -743,6 +743,28 @@ filter, focus, and viewport. If the saved row was deleted, select its nearest
 surviving neighbor. Incoming messages must not pull focus away from older rows.
 Resize, including below 24x6 and back, preserves this context.
 
+### Tail follow and detached reading
+
+The thread follows its tail exactly while its focused row is the newest one:
+entering at the newest reply, `G`/`End`, stepping onto the last row, and
+sending your own reply all follow. A matching live reply that arrives while
+following keeps the newest row in view and does not count.
+
+Every other position is detached. A matching live reply is cached without
+moving the focused row, the viewport, or a line of the message being read. The
+status line then counts what this client observed since it left the tail:
+`3 new replies · G latest`, `1 new reply · G latest`, and the compact
+`3 new · G latest`. The count is this client's observation, never the thread's
+total reply count. `G`/`End` reads the newest window, focuses the newest valid
+event, clears the count and follows the tail again. A reply that is not the
+newest one - a late backfill above the reader - neither moves the view nor
+counts.
+
+An older-window request that would answer a full page inside the boundary
+second grows the request up to the relay's own bound before that second is
+reported as unpassable, so `History limit reached` means a single second holds
+more events than one query may carry.
+
 ### Reply without changing destination
 
 `Enter` replies to the focused confirmed row; `i` or Tab replies to the root.

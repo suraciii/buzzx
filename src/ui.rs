@@ -1029,7 +1029,7 @@ fn draw_composer_target(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_thread_keys(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
     let keys = match (app.mode == Mode::Composer, compact) {
-        (false, false) => "j/k: move  Enter: reply  i: root  ?: help",
+        (false, false) => "j/k: move  Enter: reply  i: root  G: latest  ?: help",
         (false, true) => "Enter:reply i:root ?help",
         // Leaving a thread composer is one press, unlike the channel's, and
         // the hint says so.
@@ -1085,6 +1085,18 @@ fn thread_status(app: &App, compact: bool) -> String {
             "Partial; limit reached".to_owned()
         } else {
             "Partial thread: reply limit reached".to_owned()
+        };
+    }
+    if app.thread.observed_new > 0 {
+        // What this client saw since the view left the tail, never a claim
+        // about the thread's total reply count.
+        let count = app.thread.observed_new;
+        return if compact {
+            format!("{count} new · G latest")
+        } else if count == 1 {
+            "1 new reply · G latest".to_owned()
+        } else {
+            format!("{count} new replies · G latest")
         };
     }
     if app.thread.loaded() && app.thread.rows.len() <= 1 {
@@ -2657,6 +2669,94 @@ mod tests {
     }
 
     #[test]
+    fn the_thread_frame_at_seventy_nine_columns_stays_one_column() {
+        let (app, _keys) = thread_app(false);
+        let text = frame_text(&app, 79, 12);
+        assert!(text.contains("Thread #general"), "the short label: {text}");
+        assert!(text.contains("Esc:back"), "the way back survives: {text}");
+        assert!(text.contains("Enter:reply"), "the short keys: {text}");
+        assert!(text.contains("the reply"), "{text}");
+        assert!(
+            !text.contains("j/k: move"),
+            "the wide key row is not used here: {text}"
+        );
+    }
+
+    #[test]
+    fn the_thread_frame_at_forty_columns_keeps_the_rows_and_the_target() {
+        let (mut app, _keys) = thread_app(false);
+        let reading = frame_text(&app, 40, 10);
+        assert!(reading.contains("Thread #general"), "{reading}");
+        assert!(reading.contains("Esc:back"), "{reading}");
+        assert!(reading.contains("[root]"), "{reading}");
+        assert!(reading.contains("the reply"), "{reading}");
+        app.handle(crate::keys::Action::ThreadReplyFocused, 131);
+        let composing = frame_text(&app, 40, 10);
+        assert!(composing.contains("Reply to "), "{composing}");
+        assert!(composing.contains("Enter:send"), "{composing}");
+    }
+
+    #[test]
+    fn every_thread_status_fits_the_narrowest_frames() {
+        for (width, height) in [(40u16, 10u16), (24u16, 6u16)] {
+            let (mut app, _keys) = thread_app(false);
+            app.thread.partial = true;
+            let text = frame_text(&app, width, height);
+            assert!(
+                text.contains("Partial; limit reached"),
+                "{width}x{height} clips the partial status: {text}"
+            );
+            app.thread.partial = false;
+            app.thread.observed_new = 12;
+            let text = frame_text(&app, width, height);
+            assert!(
+                text.contains("12 new · G latest"),
+                "{width}x{height} clips the observed-new status: {text}"
+            );
+            app.thread.observed_new = 0;
+            app.conn = ConnState::Reconnecting;
+            let text = frame_text(&app, width, height);
+            assert!(
+                text.contains("reconnecting; stale"),
+                "{width}x{height} clips the stale status: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_body_wraps_inside_the_thread_frame() {
+        let (mut app, _keys) = thread_app(false);
+        let root_row = message_row(0, "the root");
+        let mut wide = message_row(1, "链接 https://example.test/非常长的路径?q=1 🚀 结束");
+        wide.root_id = Some(root_row.event_id.clone());
+        wide.parent_id = Some(root_row.event_id.clone());
+        wide.author = "字宽".to_owned();
+        app.thread.rows = vec![root_row, wide];
+        app.thread.focus = 1;
+        app.thread.follow = true;
+        for (width, height) in [(80u16, 12u16), (40, 10), (24, 6)] {
+            let text = frame_text(&app, width, height);
+            // A wide glyph owns two cells, so the buffer carries a blank
+            // second cell: compare without the cell padding.
+            let dense: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(
+                dense.contains("链接"),
+                "{width}x{height} keeps the wide body: {text}"
+            );
+            assert!(
+                text.contains("Esc"),
+                "{width}x{height} keeps the way back: {text}"
+            );
+            for line in text.lines() {
+                assert!(
+                    line.chars().count() <= width as usize,
+                    "{width}x{height} overflows a row: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_long_conversation_name_is_clipped_after_the_back_hint() {
         let (mut app, _keys) = thread_app(false);
         app.channels[0].name = "a-very-long-conversation-name-indeed".into();
@@ -2717,6 +2817,19 @@ mod tests {
         let text = frame_text(&app, 80, 12);
         assert!(text.contains("reconnecting; stale"), "{text}");
         assert!(text.contains("the reply"), "loaded rows stay: {text}");
+    }
+
+    #[test]
+    fn observed_new_replies_are_named_with_the_way_to_the_latest() {
+        let (mut app, _keys) = thread_app(false);
+        app.thread.observed_new = 3;
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("3 new replies · G latest"), "{text}");
+        let compact = frame_text(&app, 40, 10);
+        assert!(compact.contains("3 new · G latest"), "{compact}");
+        app.thread.observed_new = 1;
+        let single = frame_text(&app, 80, 12);
+        assert!(single.contains("1 new reply · G latest"), "{single}");
     }
 
     #[test]
