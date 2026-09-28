@@ -211,6 +211,11 @@ pub struct ChannelEntry {
     /// edit target it belongs to. A draft must never be sent into another
     /// conversation by mistake.
     draft: Composer,
+    /// The row that was focused when this conversation was last left, so
+    /// returning to it lands where the reader was instead of at the newest
+    /// message. The event id is the identity; a row that is gone by the time
+    /// the conversation comes back falls back to the newest message.
+    saved_row: Option<String>,
     /// Read frontier, unread candidates, and how much of either is known.
     read: ReadTrack,
 }
@@ -313,10 +318,54 @@ impl Filter {
     }
 }
 
-/// The picker's own state: a cursor tied to a conversation, so a filter change
+/// One command the palette offers. The palette is a directory of actions the
+/// timeline already has: every entry routes to the same handler its own key
+/// reaches, and the palette owns no state of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    SwitchConversation,
+    SearchMessages,
+    MyAgents,
+    Help,
+    Quit,
+}
+
+impl Command {
+    /// The list, in the order the palette shows it.
+    pub const ALL: [Command; 5] = [
+        Command::SwitchConversation,
+        Command::SearchMessages,
+        Command::MyAgents,
+        Command::Help,
+        Command::Quit,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Command::SwitchConversation => "Switch conversation",
+            Command::SearchMessages => "Search messages",
+            Command::MyAgents => "My agents",
+            Command::Help => "Help",
+            Command::Quit => "Quit",
+        }
+    }
+
+    /// The key that runs the same command without the palette.
+    pub fn key(self) -> &'static str {
+        match self {
+            Command::SwitchConversation => "c",
+            Command::SearchMessages => "/",
+            Command::MyAgents => "a",
+            Command::Help => "?",
+            Command::Quit => "q",
+        }
+    }
+}
+
+/// The switcher's own state: a cursor tied to a conversation, so a filter change
 /// or a removal cannot move it onto a different conversation.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Picker {
+pub struct Switcher {
     /// The conversation under the cursor.
     pub cursor: Uuid,
     /// The row it stood on in the view, so a conversation that disappears
@@ -644,7 +693,7 @@ pub enum SearchScope {
 impl SearchScope {
     /// One `s` or `h`/`l` step inside the filter form. A chosen conversation
     /// is never part of the cycle: picking one is an explicit choice made in
-    /// the conversation picker, and `s` returns to the simple two-value
+    /// the conversation selector, and `s` returns to the simple two-value
     /// cycle from there.
     fn next(self) -> Self {
         match self {
@@ -898,12 +947,18 @@ pub struct App {
     /// The focused row of the selected channel. It is also the scroll
     /// position: the viewport keeps the focused row visible.
     pub focus: usize,
+    /// True while the cursor is on the newest loaded row because the row the
+    /// reader left is gone. The rows that arrive with the next load must put
+    /// the reader on the newest message, not on the row a stale list happened
+    /// to end with, so the focus is not read as a chosen row until the reader
+    /// moves it.
+    newest_fallback: bool,
     pub mode: Mode,
     pub help: bool,
     /// How far the help text is scrolled: at the minimum size the text is
     /// taller than the screen, and the whole of it must stay reachable.
     pub help_scroll: u16,
-    /// The Inbox filter in effect. The sidebar and the picker both show it.
+    /// The Inbox filter in effect. The sidebar and the switcher both show it.
     pub filter: Filter,
     /// The order each filtered view shows conversations in.
     views: HashMap<Filter, Sections>,
@@ -911,13 +966,16 @@ pub struct App {
     /// were first assigned. A slot is never reused: a number keeps its
     /// conversation for the session, whatever a filter hides.
     shortcuts: Vec<Uuid>,
-    /// The channel picker's local name query. It never changes Inbox state.
-    pub picker_query: String,
-    picker_saved_query: String,
-    pub picker_editing: bool,
-    /// The channel picker's state while it is open. Compact layouts open it
-    /// with `c`; the picker is the only channel list they show.
-    pub picker: Option<Picker>,
+    /// The channel switcher's local name query. It never changes Inbox state.
+    pub switcher_query: String,
+    switcher_saved_query: String,
+    pub switcher_editing: bool,
+    /// The switcher's state while it is open. Every layout opens it with `c`;
+    /// it is the only conversation list the client draws.
+    pub switcher: Option<Switcher>,
+    /// The command palette's cursor while it is open: an index into
+    /// [`Command::ALL`]. Every layout opens it with `Ctrl+P`.
+    pub palette: Option<usize>,
     /// Whether the relay described every roster row. False means the list is a
     /// floor, not the whole answer.
     pub roster_complete: bool,
@@ -998,10 +1056,12 @@ impl App {
             filter: Filter::All,
             views: HashMap::new(),
             shortcuts: Vec::new(),
-            picker_query: String::new(),
-            picker_saved_query: String::new(),
-            picker_editing: false,
-            picker: None,
+            switcher_query: String::new(),
+            switcher_saved_query: String::new(),
+            switcher_editing: false,
+            switcher: None,
+            palette: None,
+            newest_fallback: false,
             roster_complete: false,
             inbox_failed: HashSet::new(),
             history_failed: HashSet::new(),
@@ -1065,10 +1125,12 @@ impl App {
     pub fn overlay(&self) -> keys::Overlay {
         if self.help {
             keys::Overlay::Help
-        } else if self.picker_editing {
-            keys::Overlay::PickerSearch
-        } else if self.picker.is_some() {
-            keys::Overlay::Picker
+        } else if self.palette.is_some() {
+            keys::Overlay::Palette
+        } else if self.switcher_editing {
+            keys::Overlay::SwitcherSearch
+        } else if self.switcher.is_some() {
+            keys::Overlay::Switcher
         } else if self.agents.open {
             keys::Overlay::Agents
         } else {
@@ -1208,24 +1270,29 @@ impl App {
         self.agents.cursor.clamp(agents, contexts);
     }
 
-    /// The membership can change under the picker; its cursor never points at
+    /// The membership can change under the switcher; its cursor never points at
     /// a conversation that is gone. Its next surviving neighbor takes the row,
     /// or the previous one at the end.
-    fn clamp_picker(&mut self) {
-        let Some(picker) = self.picker.clone() else {
+    fn clamp_switcher(&mut self) {
+        let Some(switcher) = self.switcher.clone() else {
             return;
         };
-        if picker.at == 0 && self.channels.iter().any(|entry| entry.id == picker.cursor) {
+        if switcher.at == 0
+            && self
+                .channels
+                .iter()
+                .any(|entry| entry.id == switcher.cursor)
+        {
             return;
         }
         let view: Vec<Uuid> = self.view().all().collect();
-        let Some(next) = view.get(picker.at.min(view.len().saturating_sub(1))) else {
-            self.picker = None;
+        let Some(next) = view.get(switcher.at.min(view.len().saturating_sub(1))) else {
+            self.switcher = None;
             return;
         };
-        self.picker = Some(Picker {
+        self.switcher = Some(Switcher {
             cursor: *next,
-            at: picker.at,
+            at: switcher.at,
         });
     }
 
@@ -1305,6 +1372,8 @@ impl App {
     fn set_focus(&mut self, index: usize) {
         let len = self.selected_rows().len();
         self.focus = len.saturating_sub(1).min(index);
+        // A move is a choice: the cursor is on a row the reader picked.
+        self.newest_fallback = false;
         // Focus is the scroll position, so landing on the newest row is what
         // presenting the latest message means.
         self.note_presented();
@@ -1703,7 +1772,7 @@ impl App {
                 }
                 self.refresh_views();
                 self.set_focus(self.focus);
-                self.clamp_picker();
+                self.clamp_switcher();
                 self.status = format!("channel closed: {reason}");
                 if preserve_thread_draft || preserve_inspection_draft {
                     self.mode = Mode::Composer;
@@ -1990,9 +2059,10 @@ impl App {
 
     /// Advance the read frontier when the conversation is on screen, loaded,
     /// and sitting at its latest message. Reading older history, previewing the
-    /// picker and a failed load all leave it where it was.
+    /// switcher and a failed load all leave it where it was.
     pub fn note_presented(&mut self) {
-        if self.picker.is_some()
+        if self.switcher.is_some()
+            || self.palette.is_some()
             || self.help
             || self.agents.open
             || self.thread.open
@@ -2182,6 +2252,7 @@ impl App {
                         live_ids: HashSet::new(),
                         loading: true,
                         draft: Composer::new(),
+                        saved_row: None,
                         read: ReadTrack {
                             coverage,
                             ..ReadTrack::default()
@@ -2230,7 +2301,7 @@ impl App {
         if self.selected < self.channels.len() {
             self.set_focus(self.focus);
         }
-        self.clamp_picker();
+        self.clamp_switcher();
     }
 
     /// Give the first conversations their numeric shortcut. A conversation
@@ -2305,6 +2376,7 @@ impl App {
             live_ids: HashSet::new(),
             loading: false,
             draft: Composer::default(),
+            saved_row: None,
             read: ReadTrack {
                 known: true,
                 ..ReadTrack::default()
@@ -2317,11 +2389,11 @@ impl App {
         self.channels.iter().find(|entry| entry.id == id)
     }
 
-    /// The conversation the user is looking at: the picker's cursor when the
-    /// picker is open, and the conversation on screen otherwise.
+    /// The conversation the user is looking at: the switcher's cursor when the
+    /// switcher is open, and the conversation on screen otherwise.
     pub fn focused_entry(&self) -> Option<&ChannelEntry> {
-        match &self.picker {
-            Some(picker) => self.entry(picker.cursor),
+        match &self.switcher {
+            Some(switcher) => self.entry(switcher.cursor),
             None => self.channels.get(self.selected),
         }
     }
@@ -2343,27 +2415,37 @@ impl App {
         self.views.get(&self.filter).unwrap_or(&EMPTY_SECTIONS)
     }
 
-    /// The conversations the picker shows: the filter's matches, plus the
-    /// conversation under the cursor when it no longer matches, so the row the
-    /// user is looking at never vanishes from under them. The row is inserted
-    /// where the full list would put it.
-    pub fn picker_view(&self) -> Sections {
+    /// The conversations the switcher shows: the filter's matches, plus the
+    /// conversation under the cursor when it no longer matches the filter, so
+    /// the row the user is looking at never vanishes from under them. The row
+    /// is inserted where the full list would put it.
+    ///
+    /// A typed query is a question, and a conversation that does not match it
+    /// is not an answer: the cursor stays where it was, but the list shows the
+    /// matches only, and an empty list means no match.
+    /// How well one conversation answers the open query: 0 for an exact
+    /// name, 1 for a prefix of it, 2 for a name that merely contains it. The
+    /// list sorts by this inside a section, and the cursor picks the best
+    /// answer across both sections.
+    fn switcher_rank(&self, id: Uuid) -> u8 {
+        let query = self.switcher_query.trim().to_lowercase();
+        let label = self
+            .entry(id)
+            .map(|entry| self.label(entry).to_lowercase())
+            .unwrap_or_default();
+        if label == query {
+            0
+        } else if label.starts_with(&query) {
+            1
+        } else {
+            2
+        }
+    }
+
+    pub fn switcher_view(&self) -> Sections {
         let mut view = self.view().clone();
-        let query = self.picker_query.trim().to_lowercase();
+        let query = self.switcher_query.trim().to_lowercase();
         if !query.is_empty() {
-            let rank = |id: Uuid| {
-                let label = self
-                    .entry(id)
-                    .map(|entry| self.label(entry).to_lowercase())
-                    .unwrap_or_default();
-                if label == query {
-                    0
-                } else if label.starts_with(&query) {
-                    1
-                } else {
-                    2
-                }
-            };
             view.channels.retain(|id| {
                 self.entry(*id)
                     .is_some_and(|entry| self.label(entry).to_lowercase().contains(&query))
@@ -2372,26 +2454,20 @@ impl App {
                 self.entry(*id)
                     .is_some_and(|entry| self.label(entry).to_lowercase().contains(&query))
             });
-            view.channels.sort_by_key(|id| rank(*id));
-            view.dms.sort_by_key(|id| rank(*id));
+            view.channels.sort_by_key(|id| self.switcher_rank(*id));
+            view.dms.sort_by_key(|id| self.switcher_rank(*id));
+            return view;
         }
-        let Some(picker) = &self.picker else {
+        let Some(switcher) = &self.switcher else {
             return view;
         };
-        if !query.is_empty()
-            && !self
-                .entry(picker.cursor)
-                .is_some_and(|entry| self.label(entry).to_lowercase().contains(&query))
-        {
+        if view.contains(switcher.cursor) {
             return view;
         }
-        if view.contains(picker.cursor) {
-            return view;
-        }
-        let Some(entry) = self.channels.iter().find(|c| c.id == picker.cursor) else {
+        let Some(entry) = self.channels.iter().find(|c| c.id == switcher.cursor) else {
             return view;
         };
-        let cursor_at = self.index_of(picker.cursor).unwrap_or(usize::MAX);
+        let cursor_at = self.index_of(switcher.cursor).unwrap_or(usize::MAX);
         let section = if entry.is_dm() {
             &mut view.dms
         } else {
@@ -2401,7 +2477,7 @@ impl App {
             .iter()
             .position(|id| self.index_of(*id).unwrap_or(usize::MAX) > cursor_at)
             .unwrap_or(section.len());
-        section.insert(at, picker.cursor);
+        section.insert(at, switcher.cursor);
         view
     }
 
@@ -2489,6 +2565,42 @@ impl App {
         }
     }
 
+    /// The Inbox as the header states it in one segment: whether anything
+    /// waits outside the open conversation, and how much of that is known.
+    /// The count is what the switcher rows count, never a guess. The open
+    /// conversation is left out: its unread is on the timeline itself, and the
+    /// header answers for everything else. An empty roster the relay called
+    /// complete is an answer like any other, not an unknown.
+    pub fn inbox_summary(&self) -> String {
+        if !self.marker_read
+            || !self.roster_complete
+            || self
+                .channels
+                .iter()
+                .any(|entry| !entry.read.coverage.known())
+        {
+            return "Inbox ?".to_owned();
+        }
+        let elsewhere = || {
+            self.channels
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| *at != self.selected)
+        };
+        let mentions: usize = elsewhere()
+            .filter(|(_, entry)| entry.read.mentioned())
+            .map(|(_, entry)| entry.read.unread.len())
+            .sum();
+        if mentions > 0 {
+            return format!("Inbox @ {mentions}");
+        }
+        let unread: usize = elsewhere().map(|(_, entry)| entry.read.unread.len()).sum();
+        if unread > 0 {
+            return format!("Inbox ● {unread}");
+        }
+        "Inbox read".to_owned()
+    }
+
     /// What an empty list means. An empty view is four different answers, and
     /// only one of them says there is nothing to read.
     pub fn empty_view(&self) -> &'static str {
@@ -2506,8 +2618,15 @@ impl App {
             return "Checking failed";
         }
         if self.channels.is_empty() {
-            // Nothing to read is not the same answer as everything read.
-            return "No conversations";
+            // Nothing to read is not the same answer as everything read, and
+            // neither is a listing that never reported itself complete: the
+            // footer carries the reason, and the empty row does not claim a
+            // roster the relay did not answer for.
+            return if self.roster_complete {
+                "No conversations"
+            } else {
+                "Checking..."
+            };
         }
         match self.filter {
             Filter::All => "No conversations",
@@ -2556,6 +2675,9 @@ impl App {
         }
         let me = self.me.clone();
         let profiles = self.profiles.clone();
+        // Which row the reader is on, taken before the rows are replaced: a
+        // reload keeps that row under the cursor instead of jumping.
+        let focused = self.focused_row_id(channel);
         let Some(entry) = self.entry_mut(&channel) else {
             return;
         };
@@ -2631,7 +2753,7 @@ impl App {
             self.end_typing(channel, &pubkey, at);
         }
         if self.selected_entry().map(|e| e.id) == Some(channel) {
-            self.set_focus(usize::MAX);
+            self.land_on(focused);
         }
         self.refresh_views();
         self.request_profiles();
@@ -2901,6 +3023,9 @@ impl App {
             });
             self.focus = restored
                 .unwrap_or_else(|| focus.min(self.channels[index].rows.len().saturating_sub(1)));
+            // The reader is back on the row they left, whether or not it is
+            // still there: this is a position, not a fallback.
+            self.newest_fallback = false;
             saved_message_missing = focused.is_some() && restored.is_none();
         } else {
             self.draft_blocked = !self.composer.text().is_empty();
@@ -2929,9 +3054,10 @@ impl App {
             return;
         }
         self.help = false;
-        self.picker = None;
-        self.picker_editing = false;
+        self.switcher = None;
+        self.switcher_editing = false;
         self.agents.open = false;
+        self.palette = None;
         // The search surface owns the keys while it is open; the composer
         // mode it was opened from is restored by the origin on Esc.
         self.mode = Mode::Navigation;
@@ -3353,7 +3479,7 @@ impl App {
             return;
         }
         self.help = false;
-        self.picker = None;
+        self.switcher = None;
         self.agents.open = false;
         self.reader = ReaderView {
             open: true,
@@ -3392,6 +3518,9 @@ impl App {
                                 .position(|row| row.event_id == reader.event_id)
                         })
                         .unwrap_or_else(|| focus.min(selected.rows.len().saturating_sub(1)));
+                    // The reader left the reader on a row of this
+                    // conversation, so the position is theirs again.
+                    self.newest_fallback = false;
                 }
             }
             ReaderOrigin::Thread { focus, .. } => {
@@ -3884,7 +4013,7 @@ impl App {
         let request = self.thread_request;
         // Only one view is on screen at a time.
         self.help = false;
-        self.picker = None;
+        self.switcher = None;
         self.agents.open = false;
         self.thread = ThreadView {
             open: true,
@@ -5144,75 +5273,88 @@ impl App {
             Action::ToggleHelp => {
                 self.help = !self.help;
                 if self.help {
-                    self.picker = None;
-                    self.picker_editing = false;
-                    self.agents.open = false;
+                    // Help draws over whatever surface is under it and leaves
+                    // that surface where it was: closing help returns to it.
                     self.help_scroll = 0;
+                } else {
+                    self.note_presented();
                 }
             }
             Action::Dismiss => {
                 if self.help {
                     self.help = false;
                     self.note_presented();
-                } else if self.picker_editing {
-                    self.picker_query = self.picker_saved_query.clone();
-                    self.picker_saved_query.clear();
-                    self.picker_editing = false;
-                } else if self.picker.take().is_some() {
-                    self.picker_query.clear();
-                    self.picker_saved_query.clear();
+                } else if self.palette.take().is_some() {
+                    self.note_presented();
+                } else if self.switcher_editing {
+                    self.switcher_query = self.switcher_saved_query.clone();
+                    self.switcher_saved_query.clear();
+                    self.switcher_editing = false;
+                } else if self.switcher.is_some() {
+                    self.close_switcher();
                     self.note_presented();
                 } else {
                     self.dismiss_agents();
-                }
-            }
-            Action::NextChannel => self.step_channel(1),
-            Action::PrevChannel => {
-                let at_boundary = self.focus == 0 && !self.selected_rows().is_empty();
-                if !at_boundary || !self.request_channel_page(HistoryDirection::Older) {
-                    self.step_channel(-1);
                 }
             }
             Action::NextRow => self.channel_step(1),
             Action::PrevRow => self.channel_step(-1),
             Action::Channel(n) => {
                 let target = self.shortcut_target(n).and_then(|id| self.index_of(id));
-                self.picker = None;
+                self.close_switcher();
+                self.palette = None;
                 if let Some(index) = target {
                     self.switch_channel(index);
                 }
             }
             Action::FilterNext => self.set_filter(self.filter.next()),
             Action::ToggleAgents => self.toggle_agents(),
-            Action::PickerInput(c) => {
-                if self.picker_editing {
-                    self.picker_query.push(c);
+            Action::ToggleSwitcher => self.toggle_switcher(),
+            Action::TogglePalette => self.toggle_palette(),
+            Action::PaletteNext => self.move_palette(1),
+            Action::PalettePrev => self.move_palette(-1),
+            Action::PaletteConfirm => self.run_palette(now),
+            Action::SwitcherInput(c) => {
+                if self.switcher_editing {
+                    self.switcher_query.push(c);
                 } else if c == '/' {
-                    self.picker_saved_query = self.picker_query.clone();
-                    self.picker_editing = true;
+                    // `/` resumes editing the filter without adding itself.
+                    self.switcher_saved_query = self.switcher_query.clone();
+                    self.switcher_editing = true;
+                } else {
+                    // Typing starts the local name filter; the first character
+                    // is part of it.
+                    self.switcher_saved_query = self.switcher_query.clone();
+                    self.switcher_editing = true;
+                    self.switcher_query.push(c);
                 }
+                self.settle_on_query();
             }
-            Action::PickerBackspace => {
-                self.picker_query.pop();
+            Action::SwitcherBackspace => {
+                self.switcher_query.pop();
+                self.settle_on_query();
             }
-            Action::PickerConfirm => {
-                if self.picker_editing {
-                    self.picker_saved_query = self.picker_query.clone();
-                    self.picker_editing = false;
-                    self.refresh_views();
+            Action::SwitcherConfirm => {
+                let Some(switcher) = self.switcher.clone() else {
+                    return;
+                };
+                // A query that matched nothing has nothing to open: the
+                // cursor is still a conversation, but it is not an answer to
+                // what the user asked for. The editor keeps its text.
+                if !self.switcher_view().contains(switcher.cursor) {
                     return;
                 }
-                let confirmed = self
-                    .picker
-                    .take()
-                    .and_then(|picker| self.index_of(picker.cursor));
-                if let Some(index) = confirmed {
+                // Enter is `enter open` while the query editor is up as well:
+                // the list already shows the matches, so a second press to
+                // accept them would be a hidden mode.
+                self.close_switcher();
+                if let Some(index) = self.index_of(switcher.cursor) {
                     self.switch_channel(index);
                 }
                 self.note_presented();
             }
-            Action::PickerNext => self.step_picker(1),
-            Action::PickerPrev => self.step_picker(-1),
+            Action::SwitcherNext => self.step_switcher(1),
+            Action::SwitcherPrev => self.step_switcher(-1),
             Action::Top => self.set_focus(0),
             Action::Bottom => {
                 if !self.request_newest_window(HistorySurface::Channel)
@@ -5259,7 +5401,6 @@ impl App {
             Action::OpenSearch => self.open_search(false, now),
             Action::OpenThread => self.open_thread(),
             Action::OpenReader => self.open_reader(),
-            Action::TogglePicker => self.toggle_picker(),
             Action::AgentsNext => self.move_agents(1),
             Action::HelpScroll(step) => {
                 self.help_scroll = self.help_scroll.saturating_add_signed(step as i16);
@@ -5277,22 +5418,22 @@ impl App {
         }
         let _ = now;
     }
-    fn step_picker(&mut self, step: isize) {
-        let Some(picker) = self.picker.clone() else {
+    fn step_switcher(&mut self, step: isize) {
+        let Some(switcher) = self.switcher.clone() else {
             return;
         };
-        let ids: Vec<Uuid> = self.picker_view().all().collect();
+        let ids: Vec<Uuid> = self.switcher_view().all().collect();
         if ids.is_empty() {
             return;
         }
         let current = ids
             .iter()
-            .position(|id| *id == picker.cursor)
-            .unwrap_or(picker.at.min(ids.len().saturating_sub(1)));
+            .position(|id| *id == switcher.cursor)
+            .unwrap_or(switcher.at.min(ids.len().saturating_sub(1)));
         let next = current
             .saturating_add_signed(step)
             .min(ids.len().saturating_sub(1));
-        self.picker = Some(Picker {
+        self.switcher = Some(Switcher {
             cursor: ids[next],
             at: next,
         });
@@ -5472,54 +5613,96 @@ impl App {
             return;
         }
         self.save_draft();
+        self.save_position();
         let label = self.label(&self.channels[index]);
         let id = self.channels[index].id;
         self.selected = index;
         self.channels[index].loading = true;
         self.adopt_draft();
-        self.set_focus(usize::MAX);
+        // Where the reading stopped in this conversation, not the newest
+        // message: re-entry resumes, and a first visit lands on the end.
+        self.restore_position();
         self.status = format!("opened {label}");
         self.outbox.push(SessionCommand::OpenChannel(id));
     }
 
-    /// `j`/`k`: walk the conversations the active filter shows, from wherever
-    /// the selection stands. The selection is the conversation on screen, so a
-    /// step opens the next one.
-    fn step_channel(&mut self, step: isize) {
-        let order: Vec<Uuid> = self.view().all().collect();
-        if order.is_empty() {
-            return;
-        }
-        let current = self.channels.get(self.selected).map(|entry| entry.id);
-        let at = current.and_then(|id| order.iter().position(|candidate| *candidate == id));
-        let next = match at {
-            Some(at) => (at as isize + step).clamp(0, order.len() as isize - 1) as usize,
-            // The selection is outside this view: the first step enters it.
-            None if step > 0 => 0,
-            None => order.len() - 1,
-        };
-        if let Some(index) = self.index_of(order[next]) {
-            self.switch_channel(index);
-        }
-    }
-
-    /// `f`/Tab: the next filter. The picker's cursor moves to the first
+    /// `f`/Tab: the next filter. The switcher's cursor moves to the first
     /// conversation the new filter shows when the one it was on is not in it,
-    /// so a filtered view never opens on something it does not show.
+    /// so a filtered view never opens on something it does not show. The
+    /// filter's own rows decide, not the retained-row rule: a filter change is
+    /// an instruction, and the cursor obeys it.
     fn set_filter(&mut self, filter: Filter) {
         self.filter = filter;
         self.refresh_views();
-        if let Some(picker) = self.picker.clone() {
-            let view = self.view().clone();
-            if !view.contains(picker.cursor)
-                && let Some(first) = view.all().next()
-            {
-                self.picker = Some(Picker {
-                    cursor: first,
-                    at: 0,
-                });
-            }
+        let view = self.view().clone();
+        self.settle_switcher_cursor(&view);
+    }
+
+    /// Typing a name is aiming at a conversation. Every keystroke puts the
+    /// cursor on the best answer to the query - exact, then prefix, then
+    /// substring, in either section - so a name typed in full and one `Enter`
+    /// open it, whatever row the cursor started on. A query that matches
+    /// nothing leaves the cursor where it was: the list is empty, not the
+    /// choice, so the editor keeps its text and the cursor its meaning.
+    fn settle_on_query(&mut self) {
+        let view = self.switcher_view();
+        if self.switcher_query.trim().is_empty() {
+            self.settle_switcher_cursor(&view);
+            return;
         }
+        let Some(switcher) = self.switcher.clone() else {
+            return;
+        };
+        // Each section is sorted by rank, so its head is its best match, and
+        // the better of the two heads is the best match overall.
+        let best = view
+            .channels
+            .first()
+            .into_iter()
+            .chain(view.dms.first())
+            .min_by_key(|id| self.switcher_rank(**id))
+            .copied();
+        let Some(best) = best else {
+            return;
+        };
+        if best == switcher.cursor {
+            return;
+        }
+        let at = self
+            .view()
+            .all()
+            .position(|id| id == best)
+            .unwrap_or(switcher.at);
+        self.switcher = Some(Switcher { cursor: best, at });
+    }
+
+    fn settle_switcher_cursor(&mut self, view: &Sections) {
+        let Some(switcher) = self.switcher.clone() else {
+            return;
+        };
+        if view.contains(switcher.cursor) {
+            return;
+        }
+        // The best answer to the query, not the first row of the list: each
+        // section is sorted by rank, so the two heads are the candidates, and
+        // an exact name in the DMs wins over a longer channel name that only
+        // contains the query.
+        let Some(first) = view
+            .channels
+            .first()
+            .into_iter()
+            .chain(view.dms.first())
+            .min_by_key(|id| self.switcher_rank(**id))
+            .copied()
+        else {
+            return;
+        };
+        let at = self
+            .view()
+            .all()
+            .position(|id| id == first)
+            .unwrap_or(switcher.at);
+        self.switcher = Some(Switcher { cursor: first, at });
     }
 
     /// `a`: open the Agents overlay, or close it when it is open. Opening it
@@ -5532,7 +5715,8 @@ impl App {
         }
         // Only one overlay is on screen at a time.
         self.help = false;
-        self.picker = None;
+        self.switcher = None;
+        self.palette = None;
         self.agents.open = true;
         self.agents.cursor.level = agents::Level::List;
         self.outbox.push(SessionCommand::LoadAgents);
@@ -5558,22 +5742,28 @@ impl App {
     /// detail, and the detail opens the selected working conversation. An
     /// Agent that cannot be read, or a context this identity is not in, opens
     /// nothing.
-    fn toggle_picker(&mut self) {
-        if self.picker.take().is_some() {
-            self.picker_editing = false;
-            self.picker_query.clear();
-            self.picker_saved_query.clear();
+    fn toggle_switcher(&mut self) {
+        if self.switcher.is_some() {
+            self.close_switcher();
             self.note_presented();
             return;
         }
-        self.picker = if !self.channels.is_empty() {
+        // Only the channel timeline opens the list. Inside a thread, search,
+        // context or reader the destination is protected until the user
+        // returns, and a guard here holds even if a key ever routes around
+        // the key map.
+        if self.surface() != keys::Surface::Channel {
+            return;
+        }
+        self.switcher = if !self.channels.is_empty() {
             self.help = false;
             self.agents.open = false;
-            self.picker_query.clear();
-            self.picker_saved_query.clear();
+            self.palette = None;
+            self.switcher_query.clear();
+            self.switcher_saved_query.clear();
             self.channels.get(self.selected).map(|entry| {
                 let at = self.view().all().position(|id| id == entry.id).unwrap_or(0);
-                Picker {
+                Switcher {
                     cursor: entry.id,
                     at,
                 }
@@ -5581,6 +5771,142 @@ impl App {
         } else {
             None
         };
+    }
+
+    /// `Ctrl+P`: the command palette, or close it when it is open. Opening it
+    /// clears every other overlay; the palette routes to the actions the
+    /// timeline already has instead of implementing any of them again.
+    fn toggle_palette(&mut self) {
+        if self.palette.take().is_some() {
+            self.note_presented();
+            return;
+        }
+        // Same guard as the switcher: the palette may switch the destination,
+        // so it only opens where `c` does.
+        if self.surface() != keys::Surface::Channel {
+            return;
+        }
+        self.help = false;
+        self.agents.open = false;
+        self.switcher = None;
+        self.switcher_editing = false;
+        self.switcher_query.clear();
+        self.switcher_saved_query.clear();
+        self.palette = Some(0);
+    }
+
+    /// Close the conversation list and forget the query with it: the filter
+    /// belongs to one visit to the list, not to the conversation it opened.
+    fn close_switcher(&mut self) {
+        self.switcher = None;
+        self.switcher_editing = false;
+        self.switcher_query.clear();
+        self.switcher_saved_query.clear();
+    }
+
+    /// `j` and `k` inside the palette: one fixed command list, no query.
+    fn move_palette(&mut self, step: isize) {
+        let Some(at) = self.palette else {
+            return;
+        };
+        let last = Command::ALL.len().saturating_sub(1) as isize;
+        self.palette = Some((at as isize + step).clamp(0, last) as usize);
+    }
+
+    /// Enter inside the palette: run the selected command through the same
+    /// handler its own key reaches.
+    fn run_palette(&mut self, now: u64) {
+        let Some(command) = self
+            .palette
+            .take()
+            .and_then(|at| Command::ALL.get(at).copied())
+        else {
+            return;
+        };
+        match command {
+            Command::SwitchConversation => self.toggle_switcher(),
+            Command::SearchMessages => self.open_search(false, now),
+            Command::MyAgents => self.toggle_agents(),
+            Command::Help => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
+            Command::Quit => self.quit = true,
+        }
+    }
+
+    /// Keep the row the reader was on with the conversation it belongs to, so
+    /// returning to that conversation lands where the reading stopped instead
+    /// of at the newest message.
+    fn save_position(&mut self) {
+        let row = self
+            .selected_rows()
+            .get(self.focus)
+            .filter(|row| !row.pending)
+            .map(|row| row.event_id.clone());
+        if let Some(entry) = self.channels.get_mut(self.selected) {
+            entry.saved_row = row;
+        }
+    }
+
+    /// Land a freshly loaded conversation where its reader left it. A row the
+    /// reload no longer carries - deleted, or outside the loaded window -
+    /// falls back to the newest message: a return never guesses another row,
+    /// and the newest means the newest the next load carries, not the last row
+    /// of whatever stale list was on screen when the conversation was picked.
+    fn restore_position(&mut self) {
+        let saved = self
+            .channels
+            .get_mut(self.selected)
+            .and_then(|entry| entry.saved_row.take());
+        let target = saved.and_then(|id| {
+            self.selected_rows()
+                .iter()
+                .position(|row| row.event_id == id)
+        });
+        match target {
+            Some(index) => self.set_focus(index),
+            None => {
+                self.set_focus(usize::MAX);
+                self.newest_fallback = true;
+            }
+        }
+    }
+
+    /// Keep the reader on the row it is reading when the conversation's rows
+    /// are replaced under it. A reload that no longer carries that row falls
+    /// back on the same rule as a re-entry: the newest message, never a
+    /// guessed neighbor.
+    /// Land on `focused` when the conversation still carries that row, and on
+    /// the re-entry position otherwise. A row the reload no longer carries -
+    /// deleted, or outside the loaded window - falls back to the newest
+    /// message: a reload never guesses a neighbor.
+    fn land_on(&mut self, focused: Option<String>) {
+        let target = focused.and_then(|id| {
+            self.selected_rows()
+                .iter()
+                .position(|row| row.event_id == id)
+        });
+        match target {
+            Some(index) => self.set_focus(index),
+            None => self.restore_position(),
+        }
+    }
+
+    /// The row the reader is on in the conversation, when there is one: an
+    /// empty list has a cursor, not a row, and a reload on top of it lands on
+    /// the end instead of keeping index zero. A cursor that only follows the
+    /// newest message after a missing saved row is not a row either: the load
+    /// that follows must land on its own newest message.
+    fn focused_row_id(&self, channel: Uuid) -> Option<String> {
+        if self.newest_fallback {
+            return None;
+        }
+        self.selected_entry()
+            .filter(|entry| entry.id == channel)
+            .and_then(|entry| entry.rows.get(self.focus))
+            .filter(|row| !row.pending)
+            .map(|row| row.event_id.clone())
     }
 
     /// Esc inside the Agents overlay: the detail back to the list, and the
@@ -6202,6 +6528,7 @@ mod tests {
             live_ids: HashSet::new(),
             loading: false,
             draft: Composer::default(),
+            saved_row: None,
             read: ReadTrack {
                 known: true,
                 ..ReadTrack::default()
@@ -6209,9 +6536,9 @@ mod tests {
         }
     }
 
-    /// The conversation under the picker's cursor.
+    /// The conversation under the switcher's cursor.
     fn picked(app: &App) -> Option<Uuid> {
-        app.picker.as_ref().map(|picker| picker.cursor)
+        app.switcher.as_ref().map(|switcher| switcher.cursor)
     }
 
     fn row(id: &str, created_at: u64, pubkey: &str) -> Row {
@@ -6572,7 +6899,51 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_ranks_exact_prefix_then_substring_matches() {
+    fn the_switcher_cursor_takes_the_best_match_in_either_section() {
+        let mut app = app();
+        app.apply(
+            ChatEvent::Channels(roster(vec![channel_info(1), channel_info(2)])),
+            0,
+        );
+        app.channels[0].name = "planning".to_owned();
+        app.channels[1].name = "Plan".to_owned();
+        app.channels[1].kind = ChannelKind::Dm;
+        app.stub_roster();
+        let plan = app.channels[1].id;
+        app.handle(Action::ToggleSwitcher, 0);
+        for character in "plan".chars() {
+            app.handle(Action::SwitcherInput(character), 0);
+        }
+        assert_eq!(app.switcher_query, "plan");
+        assert_eq!(
+            picked(&app),
+            Some(plan),
+            "the exact name in the DMs wins over the channel that merely contains it"
+        );
+        app.handle(Action::SwitcherConfirm, 0);
+        assert_eq!(app.channels[app.selected].id, plan);
+        // The section order still breaks a tie: a prefix match in the DM
+        // section keeps the cursor when the channel name only contains the
+        // query.
+        app.handle(Action::ToggleSwitcher, 0);
+        app.switcher_query.clear();
+        app.switcher_editing = false;
+        app.channels[0].name = "planning".to_owned();
+        app.channels[1].name = "planet".to_owned();
+        app.stub_roster();
+        app.handle(Action::SwitcherInput('p'), 0);
+        for character in "plann".chars() {
+            app.handle(Action::SwitcherInput(character), 0);
+        }
+        assert_eq!(
+            picked(&app),
+            Some(app.channels[0].id),
+            "an equal rank keeps section order"
+        );
+    }
+
+    #[test]
+    fn the_switcher_ranks_exact_prefix_then_substring_matches() {
         let mut app = app();
         app.apply(
             ChatEvent::Channels(roster(vec![
@@ -6585,13 +6956,13 @@ mod tests {
         app.channels[0].name = "alpaca".to_owned();
         app.channels[1].name = "alpha".to_owned();
         app.channels[2].name = "beta-alp".to_owned();
-        app.picker_query = "alp".to_owned();
-        app.picker = Some(Picker {
+        app.switcher_query = "alp".to_owned();
+        app.switcher = Some(Switcher {
             cursor: app.channels[1].id,
             at: 0,
         });
         let shown: Vec<String> = app
-            .picker_view()
+            .switcher_view()
             .all()
             .filter_map(|id| app.entry(id).map(|entry| entry.name.clone()))
             .collect();
@@ -6798,6 +7169,130 @@ mod tests {
         app.take_outbox();
         app.handle(Action::ThreadRetry, 52);
         assert!(take_commands(&mut app).is_empty());
+    }
+
+    /// One unread candidate on a conversation whose read state is fully known.
+    fn unread(entry: &mut ChannelEntry, id: &str, mention: bool) {
+        entry.read.known = true;
+        entry.read.coverage = Coverage::Complete;
+        entry.read.marked = true;
+        entry
+            .read
+            .unread
+            .insert(id.to_owned(), Candidate { at: 1, mention });
+    }
+
+    #[test]
+    fn a_return_whose_saved_row_is_gone_lands_on_the_newest_after_the_load() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        let id = channel(1).id;
+        let author = keys();
+        let first = message_event(&author, id, "first", 10);
+        let second = message_event(&author, id, "second", 20);
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![first.clone(), second.clone()],
+            },
+            30,
+        );
+        app.set_focus(1);
+        app.save_position();
+        assert_eq!(app.channels[0].saved_row, Some(second.id.to_hex()));
+        // The row the reader left is gone by the time they come back: the
+        // loaded list still ends on an older row, and the return must not
+        // mistake that row for a position the reader chose.
+        app.channels[0].saved_row = Some("d".repeat(64));
+        app.restore_position();
+        assert_eq!(app.focus, 1, "the stale list ends on its own last row");
+        let third = message_event(&author, id, "third", 40);
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![first, second, third.clone()],
+            },
+            50,
+        );
+        assert_eq!(app.focus, 2, "the reload lands on the newest message");
+        assert!(
+            app.focused_row_id(id).is_none(),
+            "following the newest is not a row the reader chose"
+        );
+        // Once the reader moves, the reload keeps the row they chose.
+        app.set_focus(0);
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![third],
+            },
+            60,
+        );
+        assert_eq!(app.focus, 0);
+    }
+
+    #[test]
+    fn the_header_counts_unread_outside_the_open_conversation() {
+        let mut app = app();
+        app.apply(
+            ChatEvent::Channels(roster(vec![channel_info(1), channel_info(2)])),
+            0,
+        );
+        app.marker_read = true;
+        app.selected = 0;
+        unread(&mut app.channels[0], "a", false);
+        unread(&mut app.channels[1], "b", true);
+        assert_eq!(app.inbox_summary(), "Inbox @ 1");
+        app.selected = 1;
+        assert_eq!(
+            app.inbox_summary(),
+            "Inbox ● 1",
+            "the open conversation's own unread is on the timeline, not in the header"
+        );
+        app.channels[0].read.unread.clear();
+        assert_eq!(
+            app.inbox_summary(),
+            "Inbox read",
+            "and the conversation that is open never counts itself"
+        );
+        app.selected = 0;
+        assert_eq!(
+            app.inbox_summary(),
+            "Inbox @ 1",
+            "what waits outside the new open conversation still counts"
+        );
+    }
+
+    #[test]
+    fn the_header_reads_a_complete_empty_roster_as_read_and_a_missing_one_as_unknown() {
+        let mut app = app();
+        app.marker_read = true;
+        app.apply(ChatEvent::Channels(roster(vec![])), 0);
+        assert_eq!(app.inbox_summary(), "Inbox read");
+        app.apply(
+            ChatEvent::Channels(Roster {
+                items: vec![],
+                complete: false,
+            }),
+            0,
+        );
+        assert_eq!(app.inbox_summary(), "Inbox ?");
+    }
+
+    #[test]
+    fn an_empty_list_is_only_no_conversations_once_the_roster_answered() {
+        let mut app = app();
+        app.marker_read = true;
+        app.apply(
+            ChatEvent::Channels(Roster {
+                items: vec![],
+                complete: false,
+            }),
+            0,
+        );
+        assert_eq!(app.empty_view(), "Checking...");
+        app.apply(ChatEvent::Channels(roster(vec![])), 0);
+        assert_eq!(app.empty_view(), "No conversations");
     }
 
     #[test]
@@ -7094,17 +7589,16 @@ mod tests {
         let filter = app.filter;
         app.handle(Action::OpenThread, 40);
         for action in [
-            Action::NextChannel,
-            Action::PrevChannel,
-            Action::TogglePicker,
+            Action::ToggleSwitcher,
             Action::FilterNext,
             Action::ToggleAgents,
+            Action::TogglePalette,
         ] {
             app.handle(action, 41);
         }
         assert_eq!(app.selected, before);
         assert_eq!(app.filter, filter);
-        assert!(app.picker.is_none());
+        assert!(app.switcher.is_none());
         assert!(!app.agents.open);
         assert!(app.thread.open);
     }
@@ -7992,7 +8486,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_channels_focuses_the_newest_row_and_requests_history() {
+    fn switching_conversations_resumes_where_the_reading_stopped() {
         let mut app = app();
         let first = channel(1);
         let second = channel(2);
@@ -8007,13 +8501,19 @@ mod tests {
                 ..second
             },
         ];
-        app.handle(Action::NextChannel, 0);
+        app.stub_roster();
+        app.set_focus(0);
+        app.take_outbox();
+        app.handle(Action::Channel(2), 0);
         assert_eq!(app.selected, 1);
-        assert_eq!(app.focus, 1);
+        assert_eq!(app.focus, 1, "a first visit opens at the newest row");
         match &take_commands(&mut app)[..] {
             [SessionCommand::OpenChannel(id)] => assert_eq!(*id, second_id),
             other => panic!("expected one open, got {other:?}"),
         }
+        app.handle(Action::Channel(1), 0);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.focus, 0, "a return lands on the row reading stopped at");
     }
 
     #[test]
@@ -8028,27 +8528,27 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_opens_on_the_selection_and_confirm_switches_the_channel() {
+    fn the_switcher_opens_on_the_selection_and_confirm_switches_the_channel() {
         let mut app = app();
         let ids: Vec<Uuid> = (1..=3).map(|n| channel(n).id).collect();
         app.channels = vec![channel(1), channel(2), channel(3)];
         app.selected = 1;
-        app.handle(Action::TogglePicker, 0);
+        app.handle(Action::ToggleSwitcher, 0);
         assert_eq!(
             picked(&app),
             Some(ids[1]),
-            "the picker opens on the selection"
+            "the switcher opens on the selection"
         );
-        app.handle(Action::PickerNext, 0);
-        app.handle(Action::PickerNext, 0);
-        app.handle(Action::PickerNext, 0);
+        app.handle(Action::SwitcherNext, 0);
+        app.handle(Action::SwitcherNext, 0);
+        app.handle(Action::SwitcherNext, 0);
         assert_eq!(
             picked(&app),
             Some(ids[2]),
             "the cursor clamps at the last row"
         );
-        app.handle(Action::PickerConfirm, 0);
-        assert_eq!(app.picker, None, "confirming closes the picker");
+        app.handle(Action::SwitcherConfirm, 0);
+        assert_eq!(app.switcher, None, "confirming closes the switcher");
         assert_eq!(app.channels[app.selected].id, ids[2]);
         assert!(
             matches!(
@@ -8065,30 +8565,170 @@ mod tests {
         app.channels = vec![channel(1)];
         app.handle(Action::ToggleHelp, 0);
         assert!(app.help);
-        // Opening the picker puts the help away: they never share the screen.
+        // Opening the switcher puts the help away: they never share the screen.
         let only = channel(1).id;
-        app.handle(Action::TogglePicker, 0);
+        app.handle(Action::ToggleSwitcher, 0);
         assert_eq!(picked(&app), Some(only));
         assert!(!app.help);
         app.handle(Action::Dismiss, 0);
-        assert_eq!(app.picker, None);
+        assert_eq!(app.switcher, None);
         app.handle(Action::ToggleHelp, 0);
         app.handle(Action::Dismiss, 0);
         assert!(!app.help);
     }
 
     #[test]
-    fn a_picker_without_channels_stays_closed() {
+    fn the_switcher_query_filters_by_name_and_escape_restores_it() {
         let mut app = app();
-        app.handle(Action::TogglePicker, 0);
-        assert_eq!(app.picker, None);
+        let general = channel(1);
+        let design = ChannelEntry {
+            name: "design".to_owned(),
+            ..channel(2)
+        };
+        let build = ChannelEntry {
+            name: "build".to_owned(),
+            ..channel(3)
+        };
+        app.channels = vec![general, design, build];
+        app.stub_roster();
+        app.handle(Action::ToggleSwitcher, 0);
+        for c in "si".chars() {
+            app.handle(Action::SwitcherInput(c), 0);
+        }
+        assert!(app.switcher_editing, "typing starts the query");
+        assert_eq!(app.switcher_query, "si");
+        assert_eq!(
+            app.switcher_view().all().collect::<Vec<_>>(),
+            vec![channel(2).id],
+            "the list holds the matches of one name"
+        );
+        app.handle(Action::SwitcherBackspace, 0);
+        assert_eq!(app.switcher_query, "s");
+        // One press of Enter opens the one match, query and all.
+        app.handle(Action::SwitcherConfirm, 0);
+        assert_eq!(app.switcher, None);
+        assert_eq!(app.channels[app.selected].id, channel(2).id);
+        assert_eq!(app.switcher_query, "", "opening ends the query");
+        app.handle(Action::ToggleSwitcher, 0);
+        app.handle(Action::SwitcherInput('c'), 0);
+        for c in "zz".chars() {
+            app.handle(Action::SwitcherInput(c), 0);
+        }
+        assert_eq!(app.switcher_query, "czz");
+        assert!(
+            app.switcher_view().all().next().is_none(),
+            "a query that matches nothing lists nothing"
+        );
+        // Enter opens the row it points at; a query that matched nothing
+        // points at nothing, so it opens nothing and keeps the text.
+        let before = app.channels[app.selected].id;
+        app.handle(Action::SwitcherConfirm, 0);
+        assert_eq!(app.switcher_query, "czz", "the text survives");
+        assert_eq!(
+            app.channels[app.selected].id, before,
+            "Enter on nothing opens nothing"
+        );
+        assert!(app.switcher.is_some());
+        app.handle(Action::Dismiss, 0);
+        assert_eq!(app.switcher_query, "", "Esc cancels the query");
+        assert!(!app.switcher_editing);
+        assert!(app.switcher.is_some(), "the list is still open");
+        app.handle(Action::Dismiss, 0);
+        assert_eq!(app.switcher, None, "Esc again closes the list");
     }
 
     #[test]
-    fn a_channel_list_that_shrinks_pulls_the_picker_cursor_back() {
+    fn escape_in_the_query_editor_restores_the_filter_it_started_from() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2)];
+        app.stub_roster();
+        app.handle(Action::ToggleSwitcher, 0);
+        app.handle(Action::SwitcherInput('c'), 0);
+        app.handle(Action::SwitcherInput('2'), 0);
+        assert_eq!(app.switcher_query, "c2");
+        app.handle(Action::Dismiss, 0);
+        assert_eq!(app.switcher_query, "");
+        assert!(!app.switcher_editing);
+        assert!(app.switcher.is_some(), "the list is still open");
+    }
+
+    #[test]
+    fn a_digit_switch_closes_the_list_it_was_picked_from() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2)];
+        app.stub_roster();
+        app.handle(Action::ToggleSwitcher, 0);
+        app.handle(Action::Channel(2), 0);
+        assert_eq!(app.switcher, None);
+        assert_eq!(app.channels[app.selected].id, channel(2).id);
+    }
+
+    #[test]
+    fn the_palette_moves_within_one_fixed_list_and_closes_on_escape() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.handle(Action::TogglePalette, 0);
+        assert_eq!(app.palette, Some(0));
+        for _ in 0..Command::ALL.len() {
+            app.handle(Action::PaletteNext, 0);
+        }
+        assert_eq!(
+            app.palette,
+            Some(Command::ALL.len() - 1),
+            "the cursor clamps at the end"
+        );
+        for _ in 0..Command::ALL.len() {
+            app.handle(Action::PalettePrev, 0);
+        }
+        assert_eq!(app.palette, Some(0), "and at the start");
+        app.handle(Action::Dismiss, 0);
+        assert_eq!(app.palette, None, "Esc closes it without running anything");
+        assert!(!app.help && app.switcher.is_none());
+    }
+
+    #[test]
+    fn a_palette_command_routes_to_the_action_its_key_reaches() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        // The list opens on Switch conversation, the action `c` reaches.
+        app.handle(Action::TogglePalette, 0);
+        app.handle(Action::PaletteConfirm, 0);
+        assert_eq!(app.palette, None);
+        assert_eq!(picked(&app), Some(channel(1).id));
+        app.handle(Action::Dismiss, 0);
+        // Search messages is the next command, and it is the same surface
+        // `Ctrl+F` opens.
+        app.handle(Action::TogglePalette, 0);
+        app.handle(Action::PaletteNext, 0);
+        app.handle(Action::PaletteConfirm, 100);
+        assert!(app.search.open, "the palette added no second search");
+        // The search owns Esc in two steps: leave its query, then leave it.
+        app.handle(Action::Dismiss, 100);
+        app.handle(Action::Dismiss, 100);
+        assert!(!app.search.open);
+        // Quit is the last command and sets the same flag `q` does.
+        app.handle(Action::TogglePalette, 0);
+        for _ in 0..Command::ALL.len() {
+            app.handle(Action::PaletteNext, 0);
+        }
+        app.handle(Action::PaletteConfirm, 0);
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn a_switcher_without_channels_stays_closed() {
+        let mut app = app();
+        app.handle(Action::ToggleSwitcher, 0);
+        assert_eq!(app.switcher, None);
+    }
+
+    #[test]
+    fn a_channel_list_that_shrinks_pulls_the_switcher_cursor_back() {
         let mut app = app();
         app.channels = vec![channel(1), channel(2), channel(3)];
-        app.picker = Some(Picker {
+        app.switcher = Some(Switcher {
             cursor: channel(3).id,
             at: 2,
         });
@@ -8569,7 +9209,7 @@ mod tests {
         assert_eq!(app.marker(&app.channels[1]), Marker::Unread);
         // The row says where its tracking starts, and the note is about the
         // conversation under the cursor.
-        app.picker = Some(Picker { cursor: id, at: 1 });
+        app.switcher = Some(Switcher { cursor: id, at: 1 });
         assert_eq!(
             app.inbox_footer().as_deref(),
             Some("Tracking new messages from this visit")
@@ -8655,7 +9295,7 @@ mod tests {
     }
 
     #[test]
-    fn previewing_the_picker_or_reading_older_history_does_not_clear_unread() {
+    fn previewing_the_switcher_or_reading_older_history_does_not_clear_unread() {
         let mut app = app();
         app.channels = vec![channel(1)];
         app.stub_roster();
@@ -8703,15 +9343,15 @@ mod tests {
         );
 
         app.focus = 1;
-        app.picker = Some(Picker { cursor: id, at: 0 });
+        app.switcher = Some(Switcher { cursor: id, at: 0 });
         app.note_presented();
         assert_eq!(
             app.marker(&app.channels[0]),
             Marker::Unread,
-            "a picker preview is not a read"
+            "a switcher preview is not a read"
         );
 
-        app.picker = None;
+        app.switcher = None;
         app.note_presented();
         assert_eq!(app.marker(&app.channels[0]), Marker::None);
         let contexts = published(&mut app).expect("the read is published");
@@ -9068,7 +9708,7 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_change_resets_the_picker_cursor_to_the_first_match() {
+    fn a_filter_change_resets_the_switcher_cursor_to_the_first_match() {
         let mut app = app();
         app.channels = vec![channel(1), channel(2)];
         app.stub_roster();
@@ -9082,7 +9722,7 @@ mod tests {
             },
             0,
         );
-        app.picker = Some(Picker { cursor: one, at: 0 });
+        app.switcher = Some(Switcher { cursor: one, at: 0 });
         app.handle(Action::FilterNext, 0);
         assert_eq!(app.filter, Filter::Unread);
         assert_eq!(
@@ -9099,12 +9739,12 @@ mod tests {
         app.stub_roster();
         let id = app.channels[0].id;
         caught_up(&mut app);
-        // A conversation that was never unread, kept under the picker's cursor
+        // A conversation that was never unread, kept under the switcher's cursor
         // in a filter it does not match.
         app.filter = Filter::Unread;
         app.refresh_views();
-        app.picker = Some(Picker { cursor: id, at: 0 });
-        assert_eq!(app.picker_view().all().collect::<Vec<Uuid>>(), vec![id]);
+        app.switcher = Some(Switcher { cursor: id, at: 0 });
+        assert_eq!(app.switcher_view().all().collect::<Vec<Uuid>>(), vec![id]);
         assert_eq!(
             app.marker(&app.channels[0]),
             Marker::None,
@@ -9124,7 +9764,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_that_becomes_read_keeps_the_cursor_until_the_picker_closes() {
+    fn a_row_that_becomes_read_keeps_the_cursor_until_the_switcher_closes() {
         let mut app = app();
         app.channels = vec![channel(1)];
         app.stub_roster();
@@ -9154,22 +9794,22 @@ mod tests {
         app.refresh_views();
         assert!(app.view().all().next().is_none());
 
-        // ...and the picker still opens on the conversation on screen, keeps
+        // ...and the switcher still opens on the conversation on screen, keeps
         // its row where it is, and says why it is still there.
-        app.handle(Action::TogglePicker, 0);
+        app.handle(Action::ToggleSwitcher, 0);
         assert_eq!(picked(&app), Some(id));
         assert_eq!(
-            app.picker_view().all().collect::<Vec<Uuid>>(),
+            app.switcher_view().all().collect::<Vec<Uuid>>(),
             vec![id],
             "the row the cursor stands on does not vanish"
         );
         assert_eq!(app.marker(&app.channels[0]), Marker::Read);
 
         app.handle(Action::Dismiss, 0);
-        assert_eq!(app.picker, None);
+        assert_eq!(app.switcher, None);
         assert!(
             app.view().all().next().is_none(),
-            "closing the picker lets a filter drop what no longer matches"
+            "closing the switcher lets a filter drop what no longer matches"
         );
     }
 
@@ -9243,7 +9883,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_picker_presents_a_newest_row_that_arrived_while_it_was_open() {
+    fn closing_the_switcher_presents_a_newest_row_that_arrived_while_it_was_open() {
         let mut app = app();
         app.channels = vec![channel(1)];
         app.stub_roster();
@@ -9263,8 +9903,8 @@ mod tests {
             ..row("unread", 20, "p")
         }];
         app.focus = 0;
-        app.handle(Action::TogglePicker, 20);
-        assert!(app.picker.is_some());
+        app.handle(Action::ToggleSwitcher, 20);
+        assert!(app.switcher.is_some());
 
         app.handle(Action::Dismiss, 20);
         assert_eq!(app.marker(&app.channels[0]), Marker::None);
@@ -10010,7 +10650,7 @@ mod tests {
     }
 
     #[test]
-    fn the_author_picker_selects_a_whole_pubkey_and_labels_duplicates() {
+    fn the_author_switcher_selects_a_whole_pubkey_and_labels_duplicates() {
         let (mut app, _id, _token) = searching();
         let first = keys();
         let second = keys();
@@ -10071,7 +10711,7 @@ mod tests {
         }
         app.handle(Action::SearchSubmit, 35);
         assert!(app.search.failed.is_some(), "a partial pubkey is reported");
-        assert!(app.search.author_pick.is_some(), "the picker stays open");
+        assert!(app.search.author_pick.is_some(), "the switcher stays open");
         assert_eq!(
             app.search.author.as_deref(),
             Some(exact.as_str()),
@@ -10116,7 +10756,7 @@ mod tests {
     }
 
     #[test]
-    fn the_scope_picker_chooses_one_listed_conversation() {
+    fn the_scope_switcher_chooses_one_listed_conversation() {
         let (mut app, _id, _token) = searching();
         app.handle(Action::SearchFilter, 30);
         app.handle(Action::SearchInput('o'), 30);
@@ -10124,7 +10764,7 @@ mod tests {
             .search
             .scope_pick
             .as_ref()
-            .expect("o opens the conversation picker");
+            .expect("o opens the conversation switcher");
         assert_eq!(
             pick.options.len(),
             2,
@@ -10235,7 +10875,7 @@ mod tests {
     }
 
     #[test]
-    fn author_picker_escape_returns_to_the_filter_form() {
+    fn author_switcher_escape_returns_to_the_filter_form() {
         let (mut app, _id, _token) = searching();
         app.handle(Action::SearchFilter, 30);
         app.handle(Action::SearchInput('a'), 30);

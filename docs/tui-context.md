@@ -68,23 +68,30 @@ The cost is explicit return state, addressed by C6 and the release acceptance.
 
 ### C1. Find a conversation
 
-Enhance the existing c picker with a local name filter, entered with `/` while
-in the picker. It searches the accessible, listed channels and DMs already
-known to the session; it does not discover or join new channels. Preserve the
-active Inbox filter and show it beside the name query, so an Unread filter
-cannot look like a failed global directory search.
+The `c` switcher carries the local name filter; typing any character starts
+it, and `/` resumes it without adding a slash. It searches the accessible,
+listed channels and DMs already known to the session; it does not discover or
+join new channels. The active Inbox filter is shown as the switcher's tab row
+beside the name query, so an Unread filter cannot look like a failed global
+directory search.
 
 Rank exact, prefix and substring matches, retaining the existing stable order
-within each group. Do not reshuffle because a live message arrives. Empty
-query restores the same list. Enter from text entry applies the filter and
-focuses results; j/k then select, Enter opens, Esc returns one level. Escape
-from query editing restores the previous applied query. Scope, name query,
-selected identity and scroll position survive the inspection journey.
+within each group. Do not reshuffle because a live message arrives. An empty
+query restores the same list and leaves the cursor where it is; every
+keystroke puts the cursor on the highest-ranked match in either section, so an
+exact name wins over a longer name that merely contains the query and one
+`Enter` opens the name that was typed. Enter opens the
+conversation the cursor is on, whether or not the query is still being edited;
+the query is applied live, so there is no separate submit step. Escape from
+query editing restores the previous applied query and keeps the list open;
+Escape again closes it. Scope, name query, selected identity and scroll
+position survive the inspection journey.
 
 A nonempty draft keeps the existing conversation-switch guard. Filtering and
 previewing cannot discard it. Labels may shorten; unread and unknown signals
 retain their reserved space. No match and an incompletely loaded roster are
-different states. Fullscreen on small terminals, as the current picker is.
+different states. The switcher is full screen at every size, not only on small
+terminals, and the timeline under it keeps its width.
 
 ### C2. Search messages
 
@@ -278,7 +285,9 @@ state. Preserve unrelated drafts without showing revoked content.
 Reuse [revision 5](tui-visual.md). All new views are single-column fullscreen,
 with context at the top, content in the middle, and actions/state at the bottom.
 No additional persistent sidebar, split-thread panel or card language is added.
-The existing wide channel sidebar remains as defined by the current layout.
+The conversation list is an overlay in every layout: the timeline keeps the
+full terminal width, and `c` opens the same switcher at 80 columns and up as
+it does below.
 
 At 24x6, search uses header, applied query/scope summary, two result/context
 rows, actions and state. A filter form replaces results while editing. Show

@@ -1,7 +1,8 @@
 //! `KeyEvent` to `Action`, pure. The key set is the contract in
 //! docs/tui-use.md and docs/tui.md. Navigation mode handles the timeline and
-//! channels; composer mode handles text input. The layout decides whether
-//! `j` and `k` move the channel list or the timeline.
+//! the conversation switcher; composer mode handles text input. Every layout
+//! moves the timeline with `j` and `k`: the conversation list is an overlay,
+//! not a column, so the layout no longer chooses what a step means.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -12,21 +13,24 @@ pub const PAGE_ROWS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    NextChannel,
-    PrevChannel,
-    /// The next or previous timeline row. One-column layouts move the
-    /// timeline with `j` and `k`, because it is the list they show.
+    /// The next or previous timeline row.
     NextRow,
     PrevRow,
     /// Jump to the channel with this 1-based index.
     Channel(usize),
-    /// `c`: open the channel picker, or close it when it is open.
-    TogglePicker,
-    PickerNext,
-    PickerPrev,
-    PickerConfirm,
-    PickerInput(char),
-    PickerBackspace,
+    /// `c`: open the conversation switcher, or close it when it is open.
+    ToggleSwitcher,
+    SwitcherNext,
+    SwitcherPrev,
+    SwitcherConfirm,
+    SwitcherInput(char),
+    SwitcherBackspace,
+    /// `Ctrl+P`: open the command palette, or close it when it is open.
+    TogglePalette,
+    PaletteNext,
+    PalettePrev,
+    /// Enter: run the selected command.
+    PaletteConfirm,
     /// `f`: the next Inbox filter.
     FilterNext,
     /// `a`: open the Agents overlay, or close it when it is open.
@@ -129,8 +133,10 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     None,
-    Picker,
-    PickerSearch,
+    Switcher,
+    SwitcherSearch,
+    /// The command palette: an action directory over the timeline.
+    Palette,
     Help,
     Agents,
 }
@@ -147,7 +153,7 @@ pub enum Surface {
 }
 
 /// Which sub-surface of full-screen search a key press lands in. It decides
-/// whether printable characters are query text or filter-form and picker
+/// whether printable characters are query text or filter-form and switcher
 /// commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -163,10 +169,10 @@ pub enum SearchMode {
     ScopePick,
 }
 
-/// Map a key press to an action in navigation mode. `layout` selects the
-/// list that `j` and `k` move; `overlay` routes keys to the overlay that is
-/// open; `surface` selects the channel timeline or an open thread;
-/// `search_mode` selects which search sub-surface owns the keys.
+/// Map a key press to an action in navigation mode. `layout` only separates
+/// the too-small message from the interface; `overlay` routes keys to the
+/// overlay that is open; `surface` selects the channel timeline or an open
+/// thread; `search_mode` selects which search sub-surface owns the keys.
 pub fn map_navigation(
     key: KeyEvent,
     layout: LayoutMode,
@@ -175,9 +181,20 @@ pub fn map_navigation(
     search_mode: SearchMode,
 ) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // `Ctrl+F` and `Ctrl+P` are the timeline's own: they open over the
+        // channel timeline itself and nowhere else. An open overlay keeps its
+        // own keys - help, the switcher and the Agents list are dismissed on
+        // their own terms, and the switcher's query must survive - the
+        // size message answers only `q`, and inside a thread, search, context
+        // or reader the destination is protected until the user returns.
+        // `Ctrl+P` a second time closes the palette it opened.
+        let timeline_only = surface == Surface::Channel
+            && layout != LayoutMode::TooSmall
+            && matches!(overlay, Overlay::None | Overlay::Palette);
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
-            KeyCode::Char('f') => Action::OpenSearch,
+            KeyCode::Char('f') if timeline_only => Action::OpenSearch,
+            KeyCode::Char('p') if timeline_only => Action::TogglePalette,
             _ => Action::Ignored,
         };
     }
@@ -195,6 +212,17 @@ pub fn map_navigation(
             KeyCode::PageDown => Action::HelpScroll(PAGE_ROWS as isize),
             KeyCode::PageUp => Action::HelpScroll(-(PAGE_ROWS as isize)),
             KeyCode::Esc | KeyCode::Char('?') => Action::Dismiss,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
+    if overlay == Overlay::Palette {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::PaletteNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::PalettePrev,
+            KeyCode::Enter => Action::PaletteConfirm,
+            KeyCode::Esc => Action::Dismiss,
+            KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Char('q') => Action::Quit,
             _ => Action::Ignored,
         };
@@ -237,7 +265,7 @@ pub fn map_navigation(
                 _ => Action::Ignored,
             };
         }
-        // The filter form and both pickers: j/k and the arrows move, other
+        // The filter form and both switchers: j/k and the arrows move, other
         // printable characters adjust the focused control or type text.
         return match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::SearchNext,
@@ -283,27 +311,37 @@ pub fn map_navigation(
             _ => Action::Ignored,
         };
     }
-    if overlay == Overlay::PickerSearch {
+    if overlay == Overlay::SwitcherSearch {
         return match key.code {
             KeyCode::Esc => Action::Dismiss,
-            KeyCode::Enter => Action::PickerConfirm,
-            KeyCode::Backspace => Action::PickerBackspace,
+            KeyCode::Enter => Action::SwitcherConfirm,
+            KeyCode::Backspace => Action::SwitcherBackspace,
+            KeyCode::Down => Action::SwitcherNext,
+            KeyCode::Up => Action::SwitcherPrev,
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => {
-                Action::PickerInput(c)
+                Action::SwitcherInput(c)
             }
             _ => Action::Ignored,
         };
     }
-    if overlay == Overlay::Picker {
+    if overlay == Overlay::Switcher {
         return match key.code {
-            KeyCode::Char('j') | KeyCode::Down => Action::PickerNext,
-            KeyCode::Char('k') | KeyCode::Up => Action::PickerPrev,
+            KeyCode::Char('j') | KeyCode::Down => Action::SwitcherNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::SwitcherPrev,
             KeyCode::Char('f') | KeyCode::Tab => Action::FilterNext,
-            KeyCode::Char('/') => Action::PickerInput('/'),
-            KeyCode::Enter => Action::PickerConfirm,
+            KeyCode::Char('/') => Action::SwitcherInput('/'),
+            KeyCode::Enter => Action::SwitcherConfirm,
             KeyCode::Esc | KeyCode::Char('c') => Action::Dismiss,
+            KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Char('q') => Action::Quit,
+            KeyCode::Backspace => Action::SwitcherBackspace,
             KeyCode::Char(d @ '1'..='9') => Action::Channel(d as usize - '0' as usize),
+            // Any other printable character is the local name filter: the
+            // pointer says `type to filter`, so the first letter starts the
+            // query instead of being ignored.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SwitcherInput(c)
+            }
             _ => Action::Ignored,
         };
     }
@@ -333,14 +371,8 @@ pub fn map_navigation(
         };
     }
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down => match layout {
-            LayoutMode::Wide => Action::NextChannel,
-            _ => Action::NextRow,
-        },
-        KeyCode::Char('k') | KeyCode::Up => match layout {
-            LayoutMode::Wide => Action::PrevChannel,
-            _ => Action::PrevRow,
-        },
+        KeyCode::Char('j') | KeyCode::Down => Action::NextRow,
+        KeyCode::Char('k') | KeyCode::Up => Action::PrevRow,
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
         KeyCode::Char('[') => Action::ContextLoadOlder,
@@ -348,7 +380,7 @@ pub fn map_navigation(
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('/') => Action::OpenSearch,
-        KeyCode::Char('c') => Action::TogglePicker,
+        KeyCode::Char('c') => Action::ToggleSwitcher,
         KeyCode::Char('v') => Action::OpenReader,
         KeyCode::Char('t') => Action::OpenThread,
         KeyCode::Char('i') => Action::ComposeNew,
@@ -576,47 +608,72 @@ mod tests {
     }
 
     #[test]
-    fn navigation_moves_channels_with_j_k_and_digits() {
-        assert_eq!(wide(KeyCode::Char('j')), Action::NextChannel);
-        assert_eq!(wide(KeyCode::Down), Action::NextChannel);
-        assert_eq!(wide(KeyCode::Char('k')), Action::PrevChannel);
-        assert_eq!(wide(KeyCode::Up), Action::PrevChannel);
+    fn navigation_moves_rows_with_j_k_and_digits() {
+        assert_eq!(wide(KeyCode::Char('j')), Action::NextRow);
+        assert_eq!(wide(KeyCode::Down), Action::NextRow);
+        assert_eq!(wide(KeyCode::Char('k')), Action::PrevRow);
+        assert_eq!(wide(KeyCode::Up), Action::PrevRow);
         assert_eq!(wide(KeyCode::Char('3')), Action::Channel(3));
     }
 
     #[test]
-    fn a_one_column_layout_moves_rows_with_j_k_and_opens_the_picker_with_c() {
+    fn a_one_column_layout_moves_rows_with_j_k_and_opens_the_switcher_with_c() {
         assert_eq!(narrow(KeyCode::Char('j')), Action::NextRow);
         assert_eq!(narrow(KeyCode::Down), Action::NextRow);
         assert_eq!(narrow(KeyCode::Char('k')), Action::PrevRow);
         assert_eq!(narrow(KeyCode::Up), Action::PrevRow);
-        assert_eq!(narrow(KeyCode::Char('c')), Action::TogglePicker);
+        assert_eq!(narrow(KeyCode::Char('c')), Action::ToggleSwitcher);
         // The digits still jump straight to a channel.
         assert_eq!(narrow(KeyCode::Char('3')), Action::Channel(3));
     }
 
     #[test]
-    fn an_open_picker_takes_the_selection_keys_and_isolates_the_rest() {
-        let picker = |code: KeyCode| {
+    fn every_layout_opens_the_same_switcher_with_c_and_moves_rows_with_j_k() {
+        for layout in [LayoutMode::Wide, LayoutMode::Narrow, LayoutMode::Minimal] {
+            let press = |code: KeyCode| {
+                map_navigation(
+                    key(code, KeyModifiers::NONE),
+                    layout,
+                    Overlay::None,
+                    Surface::Channel,
+                    SearchMode::Results,
+                )
+            };
+            assert_eq!(
+                press(KeyCode::Char('c')),
+                Action::ToggleSwitcher,
+                "{layout:?}"
+            );
+            assert_eq!(press(KeyCode::Char('j')), Action::NextRow, "{layout:?}");
+            assert_eq!(press(KeyCode::Char('k')), Action::PrevRow, "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn an_open_switcher_takes_the_selection_keys_and_isolates_the_rest() {
+        let switcher = |code: KeyCode| {
             map_navigation(
                 key(code, KeyModifiers::NONE),
-                LayoutMode::Narrow,
-                Overlay::Picker,
+                LayoutMode::Wide,
+                Overlay::Switcher,
                 Surface::Channel,
                 SearchMode::Results,
             )
         };
-        assert_eq!(picker(KeyCode::Char('j')), Action::PickerNext);
-        assert_eq!(picker(KeyCode::Up), Action::PickerPrev);
-        assert_eq!(picker(KeyCode::Enter), Action::PickerConfirm);
-        assert_eq!(picker(KeyCode::Esc), Action::Dismiss);
-        assert_eq!(picker(KeyCode::Char('c')), Action::Dismiss);
-        assert_eq!(picker(KeyCode::Char('q')), Action::Quit);
-        // Composing, reacting, and editing do not fire while picking.
-        assert_eq!(picker(KeyCode::Char('i')), Action::Ignored);
-        assert_eq!(picker(KeyCode::Char('r')), Action::Ignored);
-        assert_eq!(picker(KeyCode::Char('e')), Action::Ignored);
-        assert_eq!(picker(KeyCode::Char('g')), Action::Ignored);
+        assert_eq!(switcher(KeyCode::Char('j')), Action::SwitcherNext);
+        assert_eq!(switcher(KeyCode::Up), Action::SwitcherPrev);
+        assert_eq!(switcher(KeyCode::Enter), Action::SwitcherConfirm);
+        assert_eq!(switcher(KeyCode::Esc), Action::Dismiss);
+        assert_eq!(switcher(KeyCode::Char('c')), Action::Dismiss);
+        assert_eq!(switcher(KeyCode::Char('q')), Action::Quit);
+        assert_eq!(switcher(KeyCode::Char('f')), Action::FilterNext);
+        assert_eq!(switcher(KeyCode::Tab), Action::FilterNext);
+        assert_eq!(switcher(KeyCode::Char('?')), Action::ToggleHelp);
+        // Anything else printable is the local name filter; the held list
+        // answers typing instead of acting on the conversation behind it.
+        assert_eq!(switcher(KeyCode::Char('i')), Action::SwitcherInput('i'));
+        assert_eq!(switcher(KeyCode::Char('r')), Action::SwitcherInput('r'));
+        assert_eq!(switcher(KeyCode::Backspace), Action::SwitcherBackspace);
     }
 
     #[test]
@@ -722,19 +779,194 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_cycles_the_filter_and_the_sidebar_does_too() {
-        let picker = |code: KeyCode| {
+    fn the_switcher_cycles_the_filter_and_the_timeline_does_too() {
+        let switcher = |code: KeyCode| {
             map_navigation(
                 key(code, KeyModifiers::NONE),
-                LayoutMode::Narrow,
-                Overlay::Picker,
+                LayoutMode::Wide,
+                Overlay::Switcher,
                 Surface::Channel,
                 SearchMode::Results,
             )
         };
-        assert_eq!(picker(KeyCode::Char('f')), Action::FilterNext);
-        assert_eq!(picker(KeyCode::Tab), Action::FilterNext);
+        assert_eq!(switcher(KeyCode::Char('f')), Action::FilterNext);
+        assert_eq!(switcher(KeyCode::Tab), Action::FilterNext);
         assert_eq!(wide(KeyCode::Char('f')), Action::FilterNext);
+    }
+
+    #[test]
+    fn ctrl_f_opens_search_over_the_channel_timeline_only() {
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                Overlay::None,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::OpenSearch
+        );
+        // The palette's own shortcut reaches search too: it is the command
+        // the list offers, and opening search closes the palette.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                Overlay::Palette,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::OpenSearch
+        );
+        // Every other overlay keeps its keys.
+        for overlay in [
+            Overlay::Switcher,
+            Overlay::SwitcherSearch,
+            Overlay::Help,
+            Overlay::Agents,
+        ] {
+            assert_eq!(
+                map_navigation(
+                    key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                    LayoutMode::Wide,
+                    overlay,
+                    Surface::Channel,
+                    SearchMode::Results,
+                ),
+                Action::Ignored,
+                "{overlay:?}"
+            );
+        }
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                LayoutMode::TooSmall,
+                Overlay::None,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::Ignored
+        );
+        // `/` remains the search entry on the thread surface, where the
+        // destination is the thread itself.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('/'), KeyModifiers::NONE),
+                LayoutMode::Wide,
+                Overlay::None,
+                Surface::Thread,
+                SearchMode::Results,
+            ),
+            Action::OpenSearch
+        );
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_palette_over_the_channel_timeline_only() {
+        for layout in [LayoutMode::Wide, LayoutMode::Narrow] {
+            assert_eq!(
+                map_navigation(
+                    key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    layout,
+                    Overlay::None,
+                    Surface::Channel,
+                    SearchMode::Results,
+                ),
+                Action::TogglePalette,
+                "{layout:?}"
+            );
+        }
+        // A second press closes the palette it opened, like its own name says.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                Overlay::Palette,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::TogglePalette
+        );
+        // An overlay owns its keys: the palette must not open over the
+        // switcher (its query would be destroyed), help or the Agents list.
+        for overlay in [
+            Overlay::Switcher,
+            Overlay::SwitcherSearch,
+            Overlay::Help,
+            Overlay::Agents,
+        ] {
+            assert_eq!(
+                map_navigation(
+                    key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    LayoutMode::Wide,
+                    overlay,
+                    Surface::Channel,
+                    SearchMode::Results,
+                ),
+                Action::Ignored,
+                "{overlay:?}"
+            );
+        }
+        // The size message answers `q` alone, whatever else is pressed with
+        // Ctrl.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                LayoutMode::TooSmall,
+                Overlay::None,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::Ignored
+        );
+        // A surface that carries a destination of its own keeps it.
+        for surface in [
+            Surface::Thread,
+            Surface::Search,
+            Surface::Context,
+            Surface::Reader,
+        ] {
+            assert_eq!(
+                map_navigation(
+                    key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    LayoutMode::Wide,
+                    Overlay::None,
+                    surface,
+                    SearchMode::Results,
+                ),
+                Action::Ignored,
+                "{surface:?}"
+            );
+        }
+        // The composer keeps its draft: Ctrl+P is not a composer key.
+        assert_eq!(
+            map_composer(key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Action::Ignored
+        );
+    }
+
+    #[test]
+    fn an_open_palette_takes_the_selection_keys_and_isolates_the_rest() {
+        let palette = |code: KeyCode| {
+            map_navigation(
+                key(code, KeyModifiers::NONE),
+                LayoutMode::Wide,
+                Overlay::Palette,
+                Surface::Channel,
+                SearchMode::Results,
+            )
+        };
+        assert_eq!(palette(KeyCode::Char('j')), Action::PaletteNext);
+        assert_eq!(palette(KeyCode::Down), Action::PaletteNext);
+        assert_eq!(palette(KeyCode::Char('k')), Action::PalettePrev);
+        assert_eq!(palette(KeyCode::Up), Action::PalettePrev);
+        assert_eq!(palette(KeyCode::Enter), Action::PaletteConfirm);
+        assert_eq!(palette(KeyCode::Esc), Action::Dismiss);
+        assert_eq!(palette(KeyCode::Char('?')), Action::ToggleHelp);
+        assert_eq!(palette(KeyCode::Char('q')), Action::Quit);
+        // Typing is not a palette key: the command list is fixed.
+        assert_eq!(palette(KeyCode::Char('s')), Action::Ignored);
+        assert_eq!(palette(KeyCode::Char('c')), Action::Ignored);
     }
 
     #[test]

@@ -21,47 +21,52 @@ relay; the limits are described below.
 
 | Terminal | Layout | What it shows |
 | --- | --- | --- |
-| At least 80 columns and 12 rows | Wide | Inbox sidebar, timeline, and composer. |
-| At least 40 columns and 10 rows, but not wide | Narrow | One-column timeline; `c` opens the full-screen conversation picker. |
-| At least 24 columns and 6 rows, but neither above | Minimal | One-column timeline with compact rows and a one-line composer while composing. |
+| At least 80 columns and 12 rows | Wide | Full-width timeline, composer, and status line. |
+| At least 40 columns and 10 rows, but not wide | Narrow | The same timeline; `c` opens the full-screen conversation switcher. |
+| At least 24 columns and 6 rows, but neither above | Minimal | The same timeline with compact typing text and a one-line composer while composing. |
 | Below 24 columns or 6 rows | Too small | A size message. Resize the terminal; the session continues. |
+
+### Timeline first
+
+One column is the base surface at every size: the header names the open
+conversation and the Inbox answer, the timeline takes the rest of the width,
+and the composer, hint and status line sit at the bottom. Nothing is drawn
+beside the timeline, so a 80-column terminal reads a message across the whole
+80 columns instead of a 58-column remainder.
+
+```text diagram
+#general                                                            Inbox read
+> alice       2m
+  the migration is on main
+
+  bob         1m
+  @tyler can you look
+  +2 reactions
+
+j/k move  c switch  Enter reply  ? help
+status: connected https://relay.example | sent | mode: nav | ?=help
+```
+
+The header's Inbox segment is `Inbox read` when nothing is unread anywhere,
+`Inbox ● N` with the unread messages outside the open conversation,
+`Inbox @ N` when any of them mentions this identity, and `Inbox ?` when the
+answer is not known yet — a missing roster, an unread marker lookup that has
+not answered, or a catch-up that failed. Narrow and minimal add the connection
+state to the header; the wide header leaves it to the status line. Below 36
+columns the segment is dropped rather than clipping the conversation name.
 
 ### Wide
 
-```text diagram
-| Inbox: All | #general                                     |
-| Channels   |                                             |
-| 1 @ 2 eng  | alice         2m                            |
-| 2 * 3 rnd  | the migration is on main                    |
-| DMs        |                                             |
-| 3 * 1 Sam  | bob           1m                            |
-|            | @tyler can you look                         |
-|            | +2 reactions                                |
-|            | Agent A typing...                            |
-|            +---------------------------------------------+
-|            | reply to bob - enter to send, esc to clear  |
-+-----------+---------------------------------------------+
- status: connected https://relay.example | sent | mode: nav | ?=help
-```
-
-The wide sidebar lists conversations under `Channels` and `DMs`. The selected
-conversation's timeline is on the right. The typing line appears above the
-composer while another identity is composing, and takes no row when nobody is.
-The row signals and filtering rules are below.
-
-In narrow and minimal modes the list is not shown beside the timeline. Press
-`c` to open the full-screen conversation picker. It uses the same Inbox
-sections and filters as the wide sidebar; `j` and `k` move its cursor, `Enter`
-opens the conversation, and `Esc` closes it. Filtering is available at every
-layout size. Message bodies wrap to the available width. Long words and URLs
-break at character boundaries; the message itself is unchanged.
+The wide layout keeps the timeline's structure and spends its extra width on
+density: messages are separated by a rule, and the header's connection state
+moves to the status line. Its keys are the same ones every other layout uses.
 
 ### Narrow and minimal
 
-One column: the timeline, with the conversation and connection state on the top
-line and the composer and a status hint at the bottom. The full-screen
-conversation picker is opened with `c`. In minimal mode the timeline uses
-compact rows and the composer takes one line while it is being used.
+One column: the timeline, with the conversation, connection state and Inbox
+answer on the top line, and the composer and a status hint at the bottom. The
+full-screen conversation switcher is opened with `c`. In minimal mode the
+typing text is compact and the composer takes one line while it is being used.
 
 A message body wraps to the column's width. Long words and URLs break at
 character boundaries; the message itself is unchanged.
@@ -100,14 +105,14 @@ with any signal. (Sources: `src/ui.rs::conversation_item`;
 | `● 3` | Three unread messages, with no unread direct mention |
 | `@ 2` | Two unread messages, at least one of which mentions this identity |
 | `?` | Read state or catch-up is unknown |
-| `Read` | A picker row retained after it stops matching the active filter |
+| `Read` | A switcher row retained after it stops matching the active filter |
 | `…` | Someone is typing; this is independent of the unread signal |
 | two spaces | No signal |
 
 
 Unread messages clear only after the newest loaded message has actually been
 presented: its conversation is selected, history is loaded, focus is at the
-bottom, and neither the picker nor help covers the timeline. Opening a
+bottom, and neither the switcher nor help covers the timeline. Opening a
 conversation or reading older history does not clear unread messages. When a
 saved marker is available, the next session reads it from the relay and
 continues from that frontier. A conversation with no marker starts at the
@@ -131,14 +136,21 @@ merges each context by its maximum. (Sources: `src/read_state.rs::slot`,
 `builder`, `parse`; `src/client.rs::read_state`, `publish_read_state`.)
 
 A failed marker lookup or unreadable slot is unknown, not read. Failed or
-truncated catch-up is also unknown; the list can show `?` or `Checking...`
-frontier stays advanced and the list shows `Read here; not synced (<reason>)`.
-This note remains until a later publish succeeds. The session keeps working
-and does not retry the failed publish automatically; a later read advance can
-issue a new publish. If the failed read was not stored, a later session can
-show those messages as unread again. (Sources: `src/app.rs::apply_read_state`,
-`apply_catch_up`, `inbox_footer`; `src/session.rs::load_read_state`,
-`publish_read`, `run_command_pump`.)
+truncated catch-up is also unknown, and the list says `?` or `Checking...`
+rather than an empty answer. A roster the relay never reported complete is
+unknown the same way: an empty list it did not vouch for is not
+`No conversations`, and the footer says the listing may be missing rows. The
+header counts what waits outside the conversation that is open; it answers
+`Inbox ?` while any of those conversations is unknown, and an empty roster the
+relay called complete reads as `Inbox read`.
+A failed publish leaves the frontier advanced and the list shows `Read here;
+not synced (<reason>)`. This note remains until a later publish succeeds. The
+session keeps working and does not retry the failed publish automatically; a
+later read advance can issue a new publish. If the failed read was not stored,
+a later session can show those messages as unread again. (Sources:
+`src/app.rs::apply_read_state`, `apply_catch_up`, `empty_view`, `inbox_summary`,
+`inbox_footer`; `src/session.rs::load_read_state`, `publish_read`,
+`run_command_pump`.)
 
 
 ## Keys
@@ -146,15 +158,14 @@ show those messages as unread again. (Sources: `src/app.rs::apply_read_state`,
 Keys have two modes. The timeline starts in navigation mode.
 
 In navigation mode:
-- `j` or the down arrow moves to the next conversation in the wide layout. In
-  one-column layouts, it moves through timeline rows; use `c` to open the
-  conversation picker there.
-- `k` or the up arrow moves to the previous conversation or timeline row.
+- `j` or the down arrow moves to the next timeline row.
+- `k` or the up arrow moves to the previous timeline row.
 - `1` through `9` jump to the conversation with that session shortcut.
-- `f` cycles `All`, `Unread`, and `For you`. In the picker, `f` or Tab cycles
+- `f` cycles `All`, `Unread`, and `For you`. In the switcher, `f` or Tab cycles
   the same filters.
-- `c` opens the conversation picker. `j` and `k` move within it, `Enter` opens
-  the highlighted conversation, and `Esc` closes it.
+- `c` opens the conversation switcher at every layout size. The section
+  below owns its keys.
+- `Ctrl+P` opens the command palette.
 - `g` or `Home` focuses the oldest loaded message.
 - `G` or `End` focuses the newest message.
 - `PgUp` and `PgDn` move ten rows.
@@ -168,6 +179,72 @@ In navigation mode:
 - `d` deletes the identity's own focused row.
 - `?` toggles the key help, and `Esc` closes it.
 - `q` quits.
+
+### Conversation switcher
+
+`c` opens the same full-screen switcher at every size; `c` or `Esc` closes it
+without opening anything. It is the only conversation list the client draws,
+and it never advances a read marker: previewing it and opening a conversation
+from it are different acts, and only the conversation that ends up on screen
+with its newest loaded message focused claims its read state.
+
+```text diagram
+Switch conversation  name: rel
+All  Unread  For you
+  Channels
+> 3      release
+  2      general
+  DMs
+  4      Direct Person
+j/k move  type to filter  enter open  esc back  ? help
+```
+
+- `j`/`k` or the arrows move the cursor; `Enter` opens the conversation the
+  cursor is on and closes the list.
+- Typing filters by name against the labels the list shows. Matches rank
+  exact, then prefix, then substring; equal ranks keep section order (Channels
+  before DMs) and then roster order. The list keeps its sections, while every
+  keystroke puts the cursor on the best match in either of them: an exact name
+  wins over a longer name that merely contains the query, so typing a name in
+  full and pressing `Enter` opens it. A cleared query leaves the cursor where
+  it is, and a query that matches nothing says `No match`, opens nothing, and
+  keeps the cursor too.
+- `Backspace` edits the query; `/` resumes it without adding a slash; `Esc`
+  cancels the query and returns the list to the applied one, and `Esc` again
+  closes the list.
+- `f` or `Tab` cycles the filter; the cursor moves to the first conversation
+  the new filter shows when the row it was on is hidden by it.
+- `1`–`9` open the numbered conversation directly, exactly as they do on the
+  timeline.
+- A conversation whose state is unknown shows `?`, and one retained after it
+  stops matching the active filter shows `Read`; the header summary says
+  `Inbox ?` while any answer is still missing. The list is not a placement
+  surface: it never joins, leaves, or creates a conversation.
+
+### Commands
+
+`Ctrl+P` opens a command palette over the timeline: one fixed list of the
+actions the keys already reach, each showing the key that reaches it. It owns
+no state of its own.
+
+| Command | Key | What it does |
+| --- | --- | --- |
+| Switch conversation | `c` | Opens the conversation switcher. |
+| Search messages | `/` | Opens message search. |
+| My agents | `a` | Opens the Agents overlay. |
+| Help | `?` | Opens help. |
+| Quit | `q` | Ends the session. |
+
+`j`/`k` move the cursor, `Enter` runs the highlighted command through the same
+handler its key uses, and `Esc` closes the palette without running anything. A
+second `Ctrl+P` closes it too, and `Ctrl+F` opens search from it, the command
+the list offers.
+The palette, the switcher, the Agents overlay and help never share the screen:
+opening one closes the others. It opens only over the channel timeline itself:
+with the switcher, help or the Agents list open, `Ctrl+F` and `Ctrl+P` do
+nothing and the overlay keeps its keys; the under-minimum size message answers
+`q` alone; and inside a thread, search, context, or the reader the destination
+is protected until the user returns.
 
 ### Message search and context (M2)
 
@@ -198,7 +275,7 @@ row for scope, author and time:
   cycles the scope, `t` the time range (all time, 7 days, 30 days, relative
   to the submission), and `Enter` applies the form and submits.
 - Scope is the current conversation, all accessible listed conversations, or
-  one chosen conversation (`o` opens the picker).
+  one chosen conversation (`o` opens the conversation selector).
 - `a` opens the author picker over known, accessible participant profiles.
   The list may be incomplete and says so; duplicate names carry short public
   keys. `p` types an exact 64-character public key instead. Identity is the
@@ -273,9 +350,9 @@ The wide layout writes the names as they are. The one-column layouts use the
 compact `@` form, `@Agent A typing…`. When nobody is composing, the line is
 gone and the timeline gets the row back.
 
-Channels where someone is composing carry a `…` after the name in the channel
-list, and the picker shows the same marker, so activity in a channel you are
-not reading is still visible. The marker is not an unread count and it does not
+Channels where someone is composing carry a `…` after the name in the
+switcher's row, so activity in a channel you are not reading is still
+visible. The marker is not an unread count and it does not
 reorder the list.
 
 Indicators are ephemeral: they are never part of the history, they are not
@@ -647,7 +724,7 @@ Enter: reply   i: reply to root   Esc: back
 
 Within this view, `j`/`k` and arrows move message focus at all widths.
 `g`/`G`, Home/End, PgUp/PgDn, help, and quit retain their timeline meaning.
-`t` does not open another level. Conversation shortcuts, picker, Inbox filters,
+`t` does not open another level. Conversation shortcuts, switcher, Inbox filters,
 and Agents navigation are unavailable until returning; they must not silently
 switch the destination. `Esc` in navigation returns to the saved channel,
 filter, focus, and viewport. If the saved row was deleted, select its nearest
