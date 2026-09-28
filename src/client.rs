@@ -1830,6 +1830,7 @@ mod tests {
                 key: crate::config::KeySource::Flag,
                 relay: crate::config::RelaySource::Flag,
             },
+            community: None,
         };
         let client = Client::new(&resolved);
         for outcome in [

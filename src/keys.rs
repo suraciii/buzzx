@@ -27,6 +27,10 @@ pub enum Action {
     PickerConfirm,
     PickerInput(char),
     PickerBackspace,
+    ToggleCommunityPicker,
+    CommunityNext,
+    CommunityPrev,
+    CommunityConfirm,
     /// `f`: the next Inbox filter.
     FilterNext,
     /// `a`: open the Agents overlay, or close it when it is open.
@@ -122,7 +126,6 @@ pub enum Action {
     /// A key the current mode does not define.
     Ignored,
 }
-
 /// Which overlay is on screen. The overlays are exclusive: help draws over
 /// everything, and each open overlay isolates the navigation keys it does not
 /// use.
@@ -131,6 +134,7 @@ pub enum Overlay {
     None,
     Picker,
     PickerSearch,
+    CommunityPicker,
     Help,
     Agents,
 }
@@ -294,6 +298,16 @@ pub fn map_navigation(
             _ => Action::Ignored,
         };
     }
+    if overlay == Overlay::CommunityPicker {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::CommunityNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::CommunityPrev,
+            KeyCode::Enter => Action::CommunityConfirm,
+            KeyCode::Esc | KeyCode::Char('C') => Action::Dismiss,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
     if overlay == Overlay::Picker {
         return match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::PickerNext,
@@ -349,7 +363,7 @@ pub fn map_navigation(
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('/') => Action::OpenSearch,
         KeyCode::Char('c') => Action::TogglePicker,
-        KeyCode::Char('v') => Action::OpenReader,
+        KeyCode::Char('C') => Action::ToggleCommunityPicker,
         KeyCode::Char('t') => Action::OpenThread,
         KeyCode::Char('i') => Action::ComposeNew,
         KeyCode::Enter => Action::ComposeReply,

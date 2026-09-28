@@ -1,9 +1,11 @@
 # Web surface
 
-Status: proposed. [The shared catalog](../docs/interactive.md) owns scope;
-[the Web specification](../docs/web.md) owns startup and browser interaction.
-No Web implementation exists at
-the recorded baseline.
+Status: the loopback Web surface is implemented in the current working-tree
+baseline (`src/web.rs`); it is not yet in a committed release. Community
+profile selection and switching are specified here as contract for work in
+progress: they are not implemented and are not parity evidence yet.
+[The shared catalog](../docs/interactive.md) owns scope; [the Web
+specification](../docs/web.md) owns startup and browser interaction.
 
 ## Design pressure
 
@@ -48,7 +50,7 @@ API, generic plugin framework or new shared crate for this slice.
       |
  existing client, identity, read-state and Agent logic
       |
- existing HTTP bridge and relay WebSocket
+existing HTTP bridge and relay WebSocket of the active community
 ```
 
 The browser submits user actions with explicit conversation and target ids.
@@ -74,10 +76,13 @@ it, including view identity, operation correlation and explicit write outcomes.
 
 ## State and recovery
 
-The process owns the configured identity and relay for its lifetime. Each
-browser view owns its independent selection, draft, target and presentation
-state. Share relay knowledge where appropriate without letting one view's
-navigation overwrite another's. No durable draft or message database is added.
+The process owns the configured identity for its lifetime and one active
+community profile at a time. Switching re-binds the single relay connection
+inside the process instead of adding a second one; see
+[community switching](#community-switching). Each browser view owns its
+independent selection, draft, target and presentation state. Share relay
+knowledge where appropriate without letting one view's navigation overwrite
+another's. No durable draft or message database is added.
 
 Presentation reports identify the actual conversation, latest visible event
 and view generation. Only current, visible and focused views may report read
@@ -103,6 +108,41 @@ Do not queue writes offline or replay them after process restart.
 Loss of the local browser connection prevents submitting a new action. Relay
 publication eligibility comes from the shared session rules, with the same
 `Stored`, `Refused` and `Unknown` meanings in both interactive surfaces.
+
+## Community switching
+
+Switching the active community is a process-level operation. One
+`buzzx web` process holds one relay connection, so every tab observes the
+same active profile. The browser may list, select, rename and remove saved
+profiles; it never submits a relay URL, an auth tag or identity material, so
+adding a community stays a terminal action and the page only prompts for it.
+A profile's auth tag reaches the browser only as configured or not
+configured, never as content.
+
+The switch follows one sequence:
+
+1. Any tab may request a switch to a saved profile. A pending or uncertain
+   write in any tab blocks the request, naming the tab and the operation.
+2. The process closes the old subscriptions, connects the target relay and
+   completes NIP-42 with the target profile's auth tag. It broadcasts
+   `community_switching` to every view; views clear their visible targets
+   and show the switching state instead of passing old content off as the
+   target community.
+3. On success the process publishes the new `community_id` with a new view
+   generation to every tab; each view restores that profile's recent view or
+   the Inbox.
+4. On failure every tab shows the target profile's error and Retry. The
+   process does not fall back to the previous profile or another one; the
+   person chooses.
+
+Every browser action and update carries `view_id`, `community_id` and
+`generation`. Updates from an old generation - events, read reports and
+operation results that arrive after a switch - are dropped, not merged into
+the new community. The process re-checks permissions, membership and targets
+against the active profile, so a forged `community_id` grants nothing and one
+view's selection never retargets another view. Drafts are keyed by view,
+community and conversation; a switch suspends them into the previous
+profile's slots instead of carrying them across.
 
 ## Local access and content
 
@@ -152,6 +192,11 @@ with a stale label.
 4. Run comparative TUI/Web acceptance and browser boundary checks against the
    final packaged binary. A milestone is not the full Web release until all
    rows pass. Update the architecture map to the actual module ownership.
+
+5. Add the community selector on top of a session that can re-bind its one
+   relay connection: process-wide switching, generation-tagged updates and
+   terminal-only additions, proven with two relays and two tabs before the
+   selector becomes a shared capability claim.
 
 ## Verification
 

@@ -3,6 +3,7 @@
 //! docs/configuration.md. Nothing here holds state between calls.
 
 use std::io::Read;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_sdk::extract_channel_id;
 use clap::Subcommand;
@@ -10,7 +11,7 @@ use nostr::Event;
 use serde_json::{Value, json};
 
 use crate::client::{Client, WriteOutcome, channel_id, event_id};
-use crate::config::{self, Resolved};
+use crate::config::{self, CommunityProfile, ConfigFile, Resolved};
 use crate::content;
 use crate::failure::{Category, Failure};
 
@@ -21,6 +22,49 @@ const DEFAULT_LIMIT: u64 = 20;
 pub enum ChannelsCommand {
     /// List the channels the identity can access.
     List,
+}
+
+/// The local community profiles: what a session connects to. `add` and
+/// `verify` reach the relay; the rest are offline facts about the config
+/// file, and none of them prints a credential.
+#[derive(Subcommand)]
+pub enum CommunityCommand {
+    /// List the saved profiles with their last known status. Offline.
+    List,
+    /// Verify a relay and save it as a new profile, then make it active.
+    /// The relay URL comes from the global --relay.
+    Add {
+        /// Profile name; the relay host when omitted.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Re-verify one saved profile and record the outcome. The active
+    /// profile does not change.
+    Verify {
+        /// Profile id, as `community list` shows it.
+        id: String,
+    },
+    /// Make one saved profile the active community. Offline: nothing here
+    /// claims the relay was reached.
+    Use {
+        /// Profile id.
+        id: String,
+    },
+    /// Rename one saved profile.
+    Rename {
+        /// Profile id.
+        id: String,
+        /// The new name.
+        name: String,
+    },
+    /// Remove one saved profile. Local only: nothing on the relay changes.
+    Remove {
+        /// Profile id.
+        id: String,
+        /// Permit removing the active profile without first selecting another.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -74,10 +118,12 @@ pub async fn run_channels(resolved: &Resolved, action: ChannelsCommand) -> i32 {
                     .items
                     .iter()
                     .map(|channel| {
-                        json!({
+                        let mut value = json!({
                             "channel_id": channel.id.to_string(),
                             "name": channel.name,
-                        })
+                        });
+                        value["community"] = community_json(resolved);
+                        value
                     })
                     .collect();
                 if !roster.complete {
@@ -105,14 +151,16 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
             event,
             limit,
         } => match (channel, event) {
-            (Some(channel), None) => read_channel(&client, &channel, limit.as_deref()).await,
+            (Some(channel), None) => {
+                read_channel(resolved, &client, &channel, limit.as_deref()).await
+            }
             (None, Some(event)) => match limit {
                 // A single event has no window to apply a limit to.
                 Some(_) => fail(
                     &Failure::invalid_input("--limit applies to --channel reads"),
                     None,
                 ),
-                None => read_event(&client, &event).await,
+                None => read_event(resolved, &client, &event).await,
             },
             (Some(_), Some(_)) => fail(
                 &Failure::invalid_input("--channel and --event are mutually exclusive"),
@@ -123,7 +171,7 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
                 None,
             ),
         },
-        MessagesCommand::Thread { event } => read_thread(&client, event.as_deref()).await,
+        MessagesCommand::Thread { event } => read_thread(resolved, &client, event.as_deref()).await,
         MessagesCommand::Send { channel, content } => {
             let channel = match channel.as_deref() {
                 Some(raw) => match channel_id(raw) {
@@ -138,7 +186,8 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
                 Ok(content) => content,
                 Err(failure) => return refuse(&failure, Some(&channel.to_string()), None),
             };
-            write_result(
+            write_result_with_community(
+                resolved,
                 client.send_message(channel, &content, None, &[]).await,
                 Some(&channel.to_string()),
                 None,
@@ -173,7 +222,8 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
                     Some(&target_hex),
                 );
             };
-            write_result(
+            write_result_with_community(
+                resolved,
                 client.reply(&resolved_event, &content).await,
                 Some(&channel.to_string()),
                 Some(&target_hex),
@@ -182,7 +232,340 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
     }
 }
 
-async fn read_channel(client: &Client, raw: &str, limit: Option<&str>) -> i32 {
+/// `buzzx community`: manage the saved profiles. The one JSON-per-run
+/// contract of the relay commands holds here too, and no output carries a
+/// private key or an auth tag. Returns the process exit code.
+pub fn run_community(
+    action: CommunityCommand,
+    flag_relay: Option<&str>,
+    flag_key: Option<&str>,
+    flag_auth_tag: Option<&str>,
+    flag_community: Option<&str>,
+) -> i32 {
+    if flag_community.is_some() {
+        return fail(
+            &Failure::invalid_input(
+                "--community cannot be combined with the community subcommand; \
+                 its actions name profile ids themselves",
+            ),
+            None,
+        );
+    }
+    if flag_relay.is_some() && !matches!(action, CommunityCommand::Add { .. }) {
+        return fail(
+            &Failure::invalid_input("--relay is only valid for community add"),
+            None,
+        );
+    }
+    let path = config::config_path();
+    let mut file = if path.is_file() {
+        match config::read_config_file(&path) {
+            Ok(file) => file,
+            Err(error) => return fail_config(&error),
+        }
+    } else {
+        ConfigFile::default()
+    };
+
+    match action {
+        CommunityCommand::List => {
+            print(&list_json(&file));
+            0
+        }
+        CommunityCommand::Use { id } => match plan_use(&mut file, &id) {
+            Ok(value) => persist(&path, &file, &value),
+            Err(failure) => fail(&failure, Some(("id", &id))),
+        },
+        CommunityCommand::Rename { id, name } => match plan_rename(&mut file, &id, &name) {
+            Ok(value) => persist(&path, &file, &value),
+            Err(failure) => fail(&failure, Some(("id", &id))),
+        },
+        CommunityCommand::Remove { id, yes } => {
+            if file.active_community.as_deref() == Some(id.as_str()) && !yes {
+                let message = if file.communities.len() > 1 {
+                    "active community: run community use <other-id> first or pass --yes"
+                } else {
+                    "active community: pass --yes to confirm removing the last active profile"
+                };
+                return fail(&Failure::invalid_input(message), Some(("id", &id)));
+            }
+            match plan_remove(&mut file, &id) {
+                Ok(value) => persist(&path, &file, &value),
+                Err(failure) => fail(&failure, Some(("id", &id))),
+            }
+        }
+        CommunityCommand::Add { name } => {
+            let Some(relay) = flag_relay else {
+                return fail(
+                    &Failure::invalid_input("--relay is required for community add"),
+                    None,
+                );
+            };
+            let http_url = match config::normalize_relay_url(relay) {
+                Ok(http_url) => http_url,
+                Err(error) => return fail_config(&error),
+            };
+            let name = name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| config::host_of(&http_url));
+            // The URL check runs before any network call: a second profile
+            // for a saved relay is refused without touching the relay.
+            if let Some(existing) = file.profile_by_url(&http_url) {
+                return fail(
+                    &Failure::invalid_input(format!(
+                        "already_exists: community {:?} ({}) already uses {}",
+                        existing.name, existing.id, existing.relay_url
+                    )),
+                    Some(("relay_url", &http_url)),
+                );
+            }
+            let keys = match config::resolve_keys(flag_key) {
+                Ok(keys) => keys,
+                Err(error) => return fail_config(&error),
+            };
+            // Only an explicit tag applies: a new relay borrows nothing.
+            let auth_tag = flag_auth_tag
+                .map(str::to_owned)
+                .or_else(|| std::env::var("BUZZ_AUTH_TAG").ok());
+            if let Some(tag) = &auth_tag
+                && let Err(e) = buzz_sdk::nip_oa::verify_auth_tag(tag, &keys.public_key())
+            {
+                return fail_config(&config::StartupError::auth(format!(
+                    "auth tag does not verify for this identity: {e}"
+                )));
+            }
+            // The profile is saved only after the relay accepted the
+            // identity the way a session will present it.
+            if let Err(error) = crate::login::verify_online(&http_url, &keys, auth_tag.as_deref()) {
+                return fail_config(&error);
+            }
+            let value = plan_add(&mut file, &name, &http_url, auth_tag, now_secs());
+            persist(&path, &file, &value)
+        }
+        CommunityCommand::Verify { id } => {
+            let Some(profile) = file.profile(&id).cloned() else {
+                return fail(
+                    &Failure::invalid_input(format!(
+                        "no saved community with id {id:?}; run buzzx community list"
+                    )),
+                    Some(("id", &id)),
+                );
+            };
+            let keys = match config::resolve_keys(flag_key) {
+                Ok(keys) => keys,
+                Err(error) => return fail_config(&error),
+            };
+            // What a session would present for this profile: an explicit
+            // tag, the environment, then the profile's own.
+            let auth_tag = flag_auth_tag
+                .map(str::to_owned)
+                .or_else(|| std::env::var("BUZZ_AUTH_TAG").ok())
+                .or_else(|| profile.auth_tag.clone());
+            let outcome =
+                crate::login::verify_online(&profile.relay_url, &keys, auth_tag.as_deref());
+            let (status, exit) = match &outcome {
+                Ok(()) => ("connected", 0),
+                Err(error) => (observed_status(error), error.code),
+            };
+            let value = plan_observed(&mut file, &id, status, now_secs());
+            if let Err(error) = config::save_config_at(&path, &file) {
+                return fail_config(&error);
+            }
+            if exit == 0 {
+                print(&value);
+                0
+            } else {
+                // The outcome is both a recorded fact and this run's
+                // failure: the error object carries the id it belongs to.
+                let reason = outcome
+                    .err()
+                    .map(|error| observed_reason(&error, auth_tag.is_some()))
+                    .unwrap_or_default();
+                let mut failure = failure_json(
+                    &Failure::new(config_category(exit), reason),
+                    Some(("id", &id)),
+                );
+                failure["status"] = json!(status);
+                print(&failure);
+                eprintln!("buzzx: verify failed for community {id:?}: {status}");
+                exit
+            }
+        }
+    }
+}
+
+/// Save the planned config, then print the value it produced. A save
+/// failure keeps the old file and fails the run: reporting a profile the
+/// file does not hold would be a lie.
+fn persist(path: &std::path::Path, file: &ConfigFile, value: &Value) -> i32 {
+    match config::save_config_at(path, file) {
+        Ok(_) => {
+            print(value);
+            0
+        }
+        Err(error) => fail_config(&error),
+    }
+}
+
+/// Make one profile active. Nothing else about it changes: `use` is a
+/// local choice, not a connection claim.
+fn plan_use(file: &mut ConfigFile, id: &str) -> Result<Value, Failure> {
+    let profile = file.profile(id).cloned().ok_or_else(|| unknown(id))?;
+    file.active_community = Some(profile.id.clone());
+    Ok(profile_json(&profile, file.active_community.as_deref()))
+}
+
+/// Rename one profile. The id is untouched: a rename must not break what
+/// `--community` addresses.
+fn plan_rename(file: &mut ConfigFile, id: &str, name: &str) -> Result<Value, Failure> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Failure::invalid_input("the new name is empty"));
+    }
+    let Some(profile) = file.profile_mut(id) else {
+        return Err(unknown(id));
+    };
+    profile.name = name.to_owned();
+    let snapshot = profile.clone();
+    Ok(profile_json(&snapshot, file.active_community.as_deref()))
+}
+
+/// Remove one profile. Removing the active one leaves no active community,
+/// stated in the result rather than silently re-pointed at another.
+fn plan_remove(file: &mut ConfigFile, id: &str) -> Result<Value, Failure> {
+    let Some(position) = file.communities.iter().position(|c| c.id == id) else {
+        return Err(unknown(id));
+    };
+    let removed = file.communities.remove(position);
+    if file.active_community.as_deref() == Some(id) {
+        file.active_community = None;
+    }
+    Ok(json!({
+        "id": removed.id,
+        "name": removed.name,
+        "relay_url": removed.relay_url,
+        "removed": true,
+        "active": file.active_community,
+    }))
+}
+
+/// Save a verified relay as a new profile and make it active. The caller
+/// has already verified the relay and checked the URL for duplicates.
+fn plan_add(
+    file: &mut ConfigFile,
+    name: &str,
+    http_url: &str,
+    auth_tag: Option<String>,
+    now: u64,
+) -> Value {
+    let profile = CommunityProfile {
+        id: config::fresh_profile_id(
+            &file
+                .communities
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>(),
+        ),
+        name: name.to_owned(),
+        relay_url: http_url.to_owned(),
+        auth_tag,
+        last_used_at: Some(now),
+        last_status: Some("connected".to_owned()),
+        last_checked_at: Some(now),
+        ..CommunityProfile::default()
+    };
+    file.active_community = Some(profile.id.clone());
+    file.communities.push(profile.clone());
+    profile_json(&profile, file.active_community.as_deref())
+}
+
+/// Record one observation on a profile. The active profile never moves:
+/// a failed check on another community must not redirect a session.
+fn plan_observed(file: &mut ConfigFile, id: &str, status: &str, now: u64) -> Value {
+    let Some(profile) = file.profile_mut(id) else {
+        return json!({"id": id, "status": status});
+    };
+    profile.last_status = Some(status.to_owned());
+    profile.last_checked_at = Some(now);
+    let snapshot = profile.clone();
+    profile_json(&snapshot, file.active_community.as_deref())
+}
+
+/// The profiles in `list` order: the active one first, the rest by their
+/// last use, never-used last, ids breaking ties.
+fn list_json(file: &ConfigFile) -> Value {
+    let active = file.active_community.as_deref();
+    let mut rows: Vec<Value> = file
+        .communities
+        .iter()
+        .map(|p| profile_json(p, active))
+        .collect();
+    let rank = |value: &Value| {
+        (
+            if value["active"].as_bool() == Some(true) {
+                0
+            } else {
+                1
+            },
+            -(value["last_used_at"].as_u64().unwrap_or(0) as i64),
+            value["id"].as_str().unwrap_or_default().to_owned(),
+        )
+    };
+    rows.sort_by_key(rank);
+    Value::Array(rows)
+}
+
+/// One profile as the contract's object. `auth_tag_configured` is a fact
+/// about the file; the tag itself never appears.
+fn profile_json(profile: &CommunityProfile, active: Option<&str>) -> Value {
+    json!({
+        "id": profile.id,
+        "name": profile.name,
+        "relay_url": profile.relay_url,
+        "active": Some(profile.id.as_str()) == active,
+        "auth_tag_configured": profile.auth_tag.is_some(),
+        "last_used_at": profile.last_used_at,
+        "last_status": profile.last_status,
+        "last_checked_at": profile.last_checked_at,
+    })
+}
+
+fn unknown(id: &str) -> Failure {
+    Failure::invalid_input(format!(
+        "no saved community with id {id:?}; run buzzx community list"
+    ))
+}
+
+/// The stored outcome of one failed check, in the profile-status
+/// vocabulary: stale the moment it is written, never a live state.
+fn observed_status(error: &config::StartupError) -> &'static str {
+    match error.code {
+        config::EXIT_AUTH => "auth_failed",
+        _ => "unavailable",
+    }
+}
+
+/// The finer reason a check failed, as the error object prints it.
+fn observed_reason(error: &config::StartupError, had_tag: bool) -> String {
+    match error.code {
+        config::EXIT_NETWORK => format!("network: {}", error.message),
+        config::EXIT_AUTH if had_tag => format!("auth_invalid: {}", error.message),
+        config::EXIT_AUTH => format!("forbidden: {}", error.message),
+        _ => format!("relay_rejected: {}", error.message),
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn read_channel(resolved: &Resolved, client: &Client, raw: &str, limit: Option<&str>) -> i32 {
     let channel = match channel_id(raw) {
         Ok(channel) => channel,
         Err(failure) => return fail(&failure, Some(("channel_id", raw))),
@@ -193,28 +576,33 @@ async fn read_channel(client: &Client, raw: &str, limit: Option<&str>) -> i32 {
     };
     match client.history(channel, limit).await {
         Ok(events) => {
-            print(&Value::Array(events.iter().map(event_json).collect()));
+            print(&Value::Array(
+                events
+                    .iter()
+                    .map(|event| event_json_with_community(event, resolved))
+                    .collect(),
+            ));
             0
         }
         Err(failure) => fail(&failure, Some(("channel_id", &channel.to_string()))),
     }
 }
 
-async fn read_event(client: &Client, raw: &str) -> i32 {
+async fn read_event(resolved: &Resolved, client: &Client, raw: &str) -> i32 {
     let id = match event_id(raw) {
         Ok(id) => id,
         Err(failure) => return fail(&failure, Some(("event_id", raw))),
     };
     match client.event(id).await {
         Ok(event) => {
-            print(&event_json(&event));
+            print(&event_json_with_community(&event, resolved));
             0
         }
         Err(failure) => fail(&failure, Some(("event_id", raw))),
     }
 }
 
-async fn read_thread(client: &Client, raw: Option<&str>) -> i32 {
+async fn read_thread(resolved: &Resolved, client: &Client, raw: Option<&str>) -> i32 {
     let id = match raw {
         Some(raw) => event_id(raw),
         None => Err(Failure::invalid_input("--event is required")),
@@ -225,7 +613,12 @@ async fn read_thread(client: &Client, raw: Option<&str>) -> i32 {
     };
     match client.thread(id, None).await {
         Ok(read) => {
-            print(&Value::Array(read.events.iter().map(event_json).collect()));
+            print(&Value::Array(
+                read.events
+                    .iter()
+                    .map(|event| event_json_with_community(event, resolved))
+                    .collect(),
+            ));
             0
         }
         Err(failure) => fail(&failure, Some(("event_id", &id.to_hex()))),
@@ -244,6 +637,27 @@ fn event_json(event: &Event) -> Value {
         "reply_to": content::parent_of(event),
         "content": event.content,
     })
+}
+
+fn event_json_with_community(event: &Event, resolved: &Resolved) -> Value {
+    let mut value = event_json(event);
+    value["community"] = community_json(resolved);
+    value
+}
+
+fn community_json(resolved: &Resolved) -> Value {
+    match &resolved.community {
+        Some(community) => json!({
+            "id": community.id,
+            "name": community.name,
+            "relay_url": resolved.http_url,
+        }),
+        None => json!({
+            "id": Value::Null,
+            "name": "default",
+            "relay_url": resolved.http_url,
+        }),
+    }
 }
 
 /// One write, as the contract's object. A write that is not confirmed names
@@ -278,9 +692,24 @@ fn write_result(outcome: WriteOutcome, channel: Option<&str>, reply_to: Option<&
     print(&write_json(&outcome, channel, reply_to));
     match outcome {
         WriteOutcome::Stored { .. } => 0,
-        // Both failures exit by their category, so the code and the `error`
-        // the object prints never disagree. The reason is also a diagnostic,
-        // so it reaches a person on stderr.
+        WriteOutcome::Refused { category, reason } | WriteOutcome::Unknown { category, reason } => {
+            eprintln!("buzzx: {reason}");
+            exit_code(category)
+        }
+    }
+}
+
+fn write_result_with_community(
+    resolved: &Resolved,
+    outcome: WriteOutcome,
+    channel: Option<&str>,
+    reply_to: Option<&str>,
+) -> i32 {
+    let mut value = write_json(&outcome, channel, reply_to);
+    value["community"] = community_json(resolved);
+    print(&value);
+    match outcome {
+        WriteOutcome::Stored { .. } => 0,
         WriteOutcome::Refused { category, reason } | WriteOutcome::Unknown { category, reason } => {
             eprintln!("buzzx: {reason}");
             exit_code(category)
@@ -435,6 +864,28 @@ pub fn fail_message_startup(shape: &FailureShape, code: i32, message: &str) -> i
 /// before any relay call: code 1 is bad input, code 3 is the identity, and
 /// the catch-all code 4 is the relay's own bucket. The category decides the
 /// code, so the two cannot disagree.
+/// A config or verification failure, with the exit code it carries kept
+/// distinct: the community commands report network (2) and auth (3)
+/// separately instead of folding both into the catch-all.
+fn fail_config(error: &config::StartupError) -> i32 {
+    fail(
+        &Failure::new(config_category(error.code), error.message.clone()),
+        None,
+    )
+}
+
+/// The category a community-command failure carries. Unlike the relay
+/// commands' startup mapping, the network code stays itself: `community
+/// add` and `verify` answer for reaching a relay, where 2 and 4 differ.
+fn config_category(code: i32) -> Category {
+    match code {
+        config::EXIT_USAGE => Category::InvalidInput,
+        config::EXIT_AUTH => Category::Forbidden,
+        config::EXIT_NETWORK => Category::Network,
+        _ => Category::RelayRejected,
+    }
+}
+
 fn startup_category(code: i32) -> Category {
     match code {
         config::EXIT_USAGE => Category::InvalidInput,
@@ -662,5 +1113,189 @@ mod tests {
         assert_eq!(exit_code(Category::TimeoutUnknown), 2);
         assert_eq!(exit_code(Category::Forbidden), 3);
         assert_eq!(exit_code(Category::RelayRejected), 4);
+    }
+
+    mod community {
+        use super::super::*;
+        use crate::config::CommunityProfile;
+
+        fn profile(id: &str, name: &str, relay_url: &str) -> CommunityProfile {
+            CommunityProfile {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                relay_url: relay_url.to_owned(),
+                ..CommunityProfile::default()
+            }
+        }
+
+        fn file(active: Option<&str>, profiles: Vec<CommunityProfile>) -> ConfigFile {
+            ConfigFile {
+                private_key: Some("k".into()),
+                active_community: active.map(str::to_owned),
+                communities: profiles,
+                ..ConfigFile::default()
+            }
+        }
+
+        #[test]
+        fn add_refuses_a_second_profile_for_one_normalized_url() {
+            let mut state = file(
+                Some("a"),
+                vec![profile("a", "work", "https://work.example")],
+            );
+            // Every transport spelling of one relay is the one URL the
+            // duplicate check compares.
+            assert_eq!(
+                config::normalize_relay_url("wss://work.example/").unwrap(),
+                "https://work.example"
+            );
+            assert!(state.profile_by_url("https://work.example").is_some());
+
+            let value = plan_add(&mut state, "again", "http://other.example", None, 1_000);
+            assert_eq!(state.communities.len(), 2);
+            assert_eq!(value["active"], json!(true));
+            assert_eq!(value["relay_url"], "http://other.example");
+            assert_eq!(value["last_status"], "connected");
+            assert_eq!(
+                state.active_community.as_deref(),
+                Some(state.communities[1].id.as_str())
+            );
+        }
+
+        #[test]
+        fn no_json_for_a_profile_carries_a_credential() {
+            let mut state = file(
+                Some("a"),
+                vec![CommunityProfile {
+                    auth_tag: Some(r#"["auth","owner","kind=9","sig"]"#.into()),
+                    last_used_at: Some(5),
+                    last_status: Some("connected".into()),
+                    last_checked_at: Some(6),
+                    ..profile("a", "work", "https://work.example")
+                }],
+            );
+            let secret = state.communities[0].auth_tag.clone().unwrap();
+            let listed = list_json(&state).to_string();
+            assert!(!listed.contains(&secret), "{listed}");
+            assert!(
+                !listed.contains("\"k\""),
+                "the private key stays out: {listed}"
+            );
+            assert!(listed.contains("\"auth_tag_configured\":true"), "{listed}");
+
+            let renamed = plan_rename(&mut state, "a", "day job").unwrap();
+            assert!(!renamed.to_string().contains(&secret), "{renamed}");
+            let used = plan_use(&mut state, "a").unwrap();
+            assert!(!used.to_string().contains(&secret), "{used}");
+            let observed = plan_observed(&mut state, "a", "unavailable", 9);
+            assert!(!observed.to_string().contains(&secret), "{observed}");
+        }
+
+        #[test]
+        fn list_orders_the_active_profile_first_then_by_last_use() {
+            let state = file(
+                Some("old-active"),
+                vec![
+                    CommunityProfile {
+                        last_used_at: Some(1),
+                        ..profile("never", "never", "http://never.example")
+                    },
+                    CommunityProfile {
+                        last_used_at: Some(9),
+                        ..profile("recent", "recent", "http://recent.example")
+                    },
+                    CommunityProfile {
+                        last_used_at: Some(4),
+                        ..profile("old-active", "old", "http://old.example")
+                    },
+                ],
+            );
+            let listed = list_json(&state);
+            let ids: Vec<&str> = listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, vec!["old-active", "recent", "never"]);
+            assert_eq!(listed[0]["active"], json!(true));
+            assert_eq!(listed[1]["active"], json!(false));
+        }
+
+        #[test]
+        fn use_changes_only_the_active_reference() {
+            let mut state = file(
+                Some("a"),
+                vec![
+                    profile("a", "work", "https://work.example"),
+                    profile("b", "home", "http://home.example"),
+                ],
+            );
+            let value = plan_use(&mut state, "b").unwrap();
+            assert_eq!(state.active_community.as_deref(), Some("b"));
+            assert_eq!(state.communities.len(), 2);
+            assert_eq!(state.communities[0].name, "work", "nothing else moves");
+            assert_eq!(value["id"], "b");
+            assert_eq!(value["active"], json!(true));
+        }
+
+        #[test]
+        fn rename_keeps_the_id_and_rejects_empty_names() {
+            let mut state = file(
+                Some("a"),
+                vec![profile("a", "work", "https://work.example")],
+            );
+            let value = plan_rename(&mut state, "a", " day job ").unwrap();
+            assert_eq!(state.communities[0].name, "day job");
+            assert_eq!(state.communities[0].id, "a");
+            assert_eq!(value["name"], "day job");
+
+            let err = plan_rename(&mut state, "a", "  ").unwrap_err();
+            assert_eq!(err.category, Category::InvalidInput);
+            let err = plan_rename(&mut state, "nope", "x").unwrap_err();
+            assert_eq!(err.category, Category::InvalidInput);
+        }
+
+        #[test]
+        fn removing_the_active_profile_leaves_none_active() {
+            let mut state = file(
+                Some("a"),
+                vec![
+                    profile("a", "work", "https://work.example"),
+                    profile("b", "home", "http://home.example"),
+                ],
+            );
+            let value = plan_remove(&mut state, "a").unwrap();
+            assert_eq!(value["removed"], json!(true));
+            assert_eq!(value["active"], serde_json::Value::Null);
+            assert_eq!(state.active_community, None);
+            assert_eq!(state.communities.len(), 1);
+            assert_eq!(state.communities[0].id, "b");
+
+            // Removing the last profile leaves an empty, usable config.
+            plan_remove(&mut state, "b").unwrap();
+            assert!(state.communities.is_empty());
+        }
+
+        #[test]
+        fn a_recorded_observation_never_moves_the_active_profile() {
+            let mut state = file(
+                Some("a"),
+                vec![
+                    profile("a", "work", "https://work.example"),
+                    profile("b", "home", "http://home.example"),
+                ],
+            );
+            let value = plan_observed(&mut state, "b", "auth_failed", 42);
+            assert_eq!(state.active_community.as_deref(), Some("a"));
+            assert_eq!(
+                state.communities[1].last_status.as_deref(),
+                Some("auth_failed")
+            );
+            assert_eq!(state.communities[1].last_checked_at, Some(42));
+            assert_eq!(state.communities[0].last_checked_at, None);
+            assert_eq!(value["id"], "b");
+            assert_eq!(value["active"], json!(false));
+        }
     }
 }

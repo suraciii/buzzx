@@ -278,7 +278,7 @@ pub struct Turn {
     pub last_activity: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct AgentWork {
     turns: BTreeMap<String, Turn>,
     ended: VecDeque<String>,
@@ -356,7 +356,7 @@ impl AgentWork {
 }
 
 /// Every Agent's observed work, keyed by Agent identity.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Work {
     agents: HashMap<String, AgentWork>,
 }

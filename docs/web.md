@@ -1,14 +1,17 @@
 # Using `buzzx web`
 
-Status: proposed product specification. The command is not implemented.
-The current baseline and the synchronized TUI/Web capability catalog live in
-[interactive.md](interactive.md).
+Status: implemented local browser surface with relay-backed navigation,
+inspection, tab-isolated drafts and shared write/read-state semantics.
+Community selection and in-process switching are implemented; browser profile
+management remains in `buzzx community` and live relay/browser checks below
+are still required before claiming a release.
 
 ## Outcome and scope
 
 A person runs `buzzx web` and uses Buzz in a browser with the same product
-capabilities as `buzzx tui`. They use their existing identity, relay,
-conversations and permissions. They install no separate web application.
+capabilities as `buzzx tui`. They use their existing identity, saved
+community profiles, conversations and permissions. They install no separate
+web application.
 
 Parity means the same available operations, destinations, observed information
 and result meanings. It does not mean drawing terminal cells in a browser or
@@ -33,6 +36,7 @@ With an identity already configured:
 
 ```sh
 buzzx web
+buzzx web --community <id>
 ```
 
 The command resolves the same configuration as TUI, starts a local listener
@@ -41,14 +45,18 @@ default browser once. Web assets ship with buzzx: no Node runtime, development
 server, external asset service or separate install is needed to run it.
 
 The listener is available only on `127.0.0.1`. Its selected port is printed
-in the access link. A second process gets its own port and access link. No
-new flags, environment variables or config fields are introduced in this
-slice; the existing global identity and relay flags still apply.
+in the access link. A second process gets its own port and access link.
+`buzzx web --community <id>` starts on that saved profile; without the flag
+the process uses the active community. `--community` combined with `--relay`
+or `BUZZ_RELAY_URL` is refused as `conflicting_relay_selector` before any
+listener starts. Selection precedence is owned by
+[the configuration reference](configuration.md#selection).
 
-The terminal shows the public identity, relay, access link and `Ctrl+C to
-stop`. The link opens only this running process. It grants access to that
-identity's session and should stay private. It contains no Nostr private key.
-The browser never asks the user to paste that key.
+The terminal shows the public identity, the active community's name and
+relay host, the access link and `Ctrl+C to stop`. The link opens only this
+running process. It grants access to that identity's session and should stay
+private. It contains no Nostr private key. The browser never asks the user
+to paste that key, and no page shows an auth tag's content.
 
 If there is no usable identity, the command exits with the existing
 configuration error and points to `buzzx login`. Browser opening is attempted
@@ -63,13 +71,52 @@ client, not a public or multi-user hosting mode.
 
 The page can load while the relay is unavailable. It distinguishes
 `Connecting`, `Reconnecting` and an explicit authentication failure from an
-empty Inbox. The identity and relay stay fixed for the process lifetime;
-changing them requires restarting with the desired configuration.
+empty Inbox. The identity stays fixed for the process lifetime. The active
+community may be switched inside the process from the community selector;
+the process still holds exactly one relay connection at a time, so a switch
+replaces that connection instead of adding a second one.
 
 Closing a tab closes that view, not the process. `Ctrl+C` stops the process
 and invalidates its browser sessions. Open pages show `Session stopped` and
 disable writes. A later run requires its new access link. Stopping web does
 not log out of buzzx or remove saved credentials.
+
+## Communities and switching
+
+`buzzx web` runs on one saved community profile: the one named by
+`--community`, else the active community. Because the process holds exactly
+one relay connection, the browser's community choice is process-wide: every
+tab of this run shares the active profile.
+
+Wide screens put the community selector at the top of the Inbox sidebar;
+narrow screens show `Community / Channel` in the app bar. The selector lists
+saved profiles with their name and relay host and switches the one active
+connection. It does not show cross-community unread totals or mix another
+profile's channels into the Inbox. Add, rename and remove profiles with
+`buzzx community`; the browser never accepts relay URLs or signing material.
+
+Switching to another saved profile follows one visible sequence:
+
+1. Any tab can start the switch. A pending or uncertain write in any tab
+   blocks it, naming the tab and the operation.
+2. Every tab receives the switching state and clears its visible target; the
+   previous community's timeline is never shown as the target's content.
+3. On success every tab receives the new community and view generation, then
+   restores that profile's recent view or the Inbox. A late update from the
+   old community is dropped, not merged.
+4. On failure every tab shows the target profile's error and remains on that
+   target until the person reselects a profile; selecting it again retries.
+   The process does not fall back to the previous profile or pick another one.
+
+Drafts, reply/edit targets, selection and scroll belong to their own tab and
+community: a switch suspends them with the previous profile instead of
+carrying them across. The [Web design](../design/web.md#community-switching)
+owns the generation and broadcast mechanism.
+
+Adding a community - a new relay URL or an auth tag - is a terminal action.
+The selector offers no form for it; use `buzzx community add` and refresh the
+page to load a newly saved profile. There is no cross-community Inbox, search,
+mention or forwarding.
 
 ## Page shape
 
@@ -89,6 +136,7 @@ the full content region on narrow screens; it never creates a third column.
 ```text diagram
 +------------------+--------------------------------------------------+
 | buzzx            | #engineering          Search   My agents   Help  |
+| Community: work v|                                                  |
 | Find conversation|                                                  |
 | All Unread       | Connected                                        |
 | For you          +--------------------------------------------------+
@@ -339,9 +387,10 @@ assistive technology without reading every incoming message aloud.
 
 ## Acceptance before calling Web complete
 
-1. A configured user starts from the shipped buzzx binary with `buzzx web`,
-   opens its printed link, and reaches the same visible conversations as TUI.
-   Browser launch failure and missing identity have actionable outcomes.
+1. A configured user starts from the shipped buzzx binary with `buzzx web`
+   or `buzzx web --community <id>`, opens its printed link, and reaches the
+   same visible conversations as TUI on that community. Browser launch
+   failure and missing identity have actionable outcomes.
 2. Exercise every [shared catalog](interactive.md#shared-capability-catalog)
    row and [synchronized journey](interactive.md#synchronized-acceptance)
    with the same identity, relay and source
@@ -367,6 +416,18 @@ assistive technology without reading every incoming message aloud.
    Agent access failure and stale observation without false empty/success claims.
 9. Verify session stop/restart, refresh with unsaved work and credential
    isolation using the [Web boundary checks](../design/web.md#verification).
+
+10. With two saved communities, switch from a second tab while the first
+    reads history. Every tab clears to the switching state and receives the
+    new generation; the previous community's timeline, unread and a late
+    event from the old generation never appear as target content.
+11. Attempt a switch while any tab has a pending or uncertain write: the
+    switch is blocked and names the tab and operation. Force a failed switch
+    and confirm every tab shows the target error and Retry without falling
+    back to another profile.
+12. Confirm that no page, dialog or response displays the private key or an
+    auth tag's content, and that adding a community is offered only as a
+    terminal instruction.
 
 Run the repository's required checks at the delivered source state. Record
 browser version, viewport, binary revision and real-relay evidence separately

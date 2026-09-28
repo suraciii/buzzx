@@ -33,11 +33,22 @@ pub enum HistorySurface {
 
 /// What the transport side tells the UI. Every mutation the UI renders
 /// arrives as one of these.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ChatEvent {
+    /// Events from an older relay generation are dropped by the UI.
+    Generation {
+        generation: u64,
+        event: Box<ChatEvent>,
+    },
+    /// The old relay is no longer visible while the new one authenticates.
+    CommunitySwitching {
+        generation: u64,
+        id: Option<String>,
+        name: String,
+        relay_url: String,
+    },
     Connected,
     Disconnected(String),
-    /// The identity's channel list. Sent after connect and after a reload.
     /// `complete` is false when the relay could not describe every row.
     Channels(crate::client::Roster),
     /// A channel's history, oldest first. Replaces the loaded rows.
@@ -247,10 +258,12 @@ pub enum ChatEvent {
 }
 
 /// What the UI asks the session to do.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SessionCommand {
+    /// Stop the current subscriptions and bind the single active connection
+    /// to another saved profile.
+    SwitchCommunity(Resolved),
     LoadChannels,
-    /// Read the managed-agent roster this identity owns. Asked for when the
     /// Agents view opens, so a session that never opens it never reads it.
     LoadAgents,
     /// Fetch history, subscribe live, and backfill overlays for one channel.
@@ -341,8 +354,7 @@ pub struct Session {
     pub commands: mpsc::Sender<SessionCommand>,
     pub started: oneshot::Receiver<Result<(), (i32, String)>>,
     /// Resolves when the command pump has finished, including the read it owes
-    /// a quitting session. A process that exits on its own must wait for this,
-    /// or the last write is cut off mid-flight.
+    /// a quitting session.
     pub finished: oneshot::Receiver<()>,
 }
 
@@ -351,26 +363,19 @@ pub struct Session {
 pub fn spawn(resolved: &Resolved, events: mpsc::Sender<ChatEvent>) -> Session {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (sub_tx, sub_rx) = mpsc::channel(64);
+    let (sub_events_tx, sub_events_rx) = mpsc::channel(256);
     let (started_tx, started_rx) = oneshot::channel();
     let (finished_tx, finished_rx) = oneshot::channel();
 
-    let (_http_url, ws_url) =
-        crate::config::split_relay_url(&resolved.http_url).expect("a resolved URL always splits");
-    let auth_tag = resolved.auth_tag.as_deref().map(|s| {
-        buzz_sdk::nip_oa::parse_auth_tag(s).expect("resolve() verified the tag at startup")
-    });
-
-    tokio::spawn(sub::run_ws_pump(
-        ws_url,
-        resolved.keys.clone(),
-        auth_tag,
-        sub_rx,
-        events.clone(),
-        started_tx,
-    ));
+    tokio::spawn(forward_sub_events(sub_events_rx, events.clone(), 0));
+    spawn_sub_pump(resolved, sub_rx, sub_events_tx, started_tx);
 
     tokio::spawn(run_command_pump(
         Client::new(resolved),
+        resolved
+            .community
+            .as_ref()
+            .map(|community| community.id.clone()),
         cmd_rx,
         sub_tx,
         events,
@@ -381,6 +386,46 @@ pub fn spawn(resolved: &Resolved, events: mpsc::Sender<ChatEvent>) -> Session {
         commands: cmd_tx,
         started: started_rx,
         finished: finished_rx,
+    }
+}
+
+fn spawn_sub_pump(
+    resolved: &Resolved,
+    sub_rx: mpsc::Receiver<SubControl>,
+    events: mpsc::Sender<ChatEvent>,
+    started: oneshot::Sender<Result<(), (i32, String)>>,
+) {
+    let (_http_url, ws_url) =
+        crate::config::split_relay_url(&resolved.http_url).expect("a resolved URL always splits");
+    let auth_tag = resolved.auth_tag.as_deref().map(|s| {
+        buzz_sdk::nip_oa::parse_auth_tag(s).expect("resolve() verified the tag at startup")
+    });
+    tokio::spawn(sub::run_ws_pump(
+        ws_url,
+        resolved.keys.clone(),
+        auth_tag,
+        sub_rx,
+        events,
+        started,
+    ));
+}
+
+async fn forward_sub_events(
+    mut source: mpsc::Receiver<ChatEvent>,
+    events: mpsc::Sender<ChatEvent>,
+    generation: u64,
+) {
+    while let Some(event) = source.recv().await {
+        if events
+            .send(ChatEvent::Generation {
+                generation,
+                event: Box::new(event),
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -396,13 +441,14 @@ fn thread_ref(thread: &Option<(String, String)>) -> Result<Option<buzz_sdk::Thre
 }
 
 async fn run_command_pump(
-    client: Client,
+    mut client: Client,
+    mut active_community: Option<String>,
     mut commands: mpsc::Receiver<SessionCommand>,
-    subs: mpsc::Sender<SubControl>,
+    mut subs: mpsc::Sender<SubControl>,
     events: mpsc::Sender<ChatEvent>,
     finished: oneshot::Sender<()>,
 ) {
-    // What this terminal has read, waiting for its window to close.
+    let mut generation = 0u64;
     let mut pending_read: Option<HashMap<String, u64>> = None;
     let mut due: Option<tokio::time::Instant> = None;
     loop {
@@ -426,6 +472,49 @@ async fn run_command_pump(
             break;
         };
         match command {
+            SessionCommand::SwitchCommunity(resolved) => {
+                flush_read(&client, &mut pending_read, &events).await;
+                generation = generation.saturating_add(1);
+                let community = resolved.community.clone();
+                let (sub_tx, sub_rx) = mpsc::channel(64);
+                let (sub_events_tx, sub_events_rx) = mpsc::channel(256);
+                let (started_tx, started_rx) = oneshot::channel();
+                let relay_url = resolved.http_url.clone();
+                let name = community
+                    .as_ref()
+                    .map(|community| community.name.clone())
+                    .unwrap_or_else(|| "default".to_owned());
+                let id = community.as_ref().map(|community| community.id.clone());
+                active_community = id.clone();
+                let _ = events
+                    .send(ChatEvent::CommunitySwitching {
+                        generation,
+                        id,
+                        name,
+                        relay_url,
+                    })
+                    .await;
+                let old_subs = std::mem::replace(&mut subs, sub_tx);
+                drop(old_subs);
+                tokio::spawn(forward_sub_events(
+                    sub_events_rx,
+                    events.clone(),
+                    generation,
+                ));
+                spawn_sub_pump(&resolved, sub_rx, sub_events_tx, started_tx);
+                let switch_events = events.clone();
+                tokio::spawn(async move {
+                    if let Ok(Err((_code, reason))) = started_rx.await {
+                        let _ = switch_events
+                            .send(ChatEvent::Generation {
+                                generation,
+                                event: Box::new(ChatEvent::Disconnected(reason)),
+                            })
+                            .await;
+                    }
+                });
+                client = Client::new(&resolved);
+            }
             SessionCommand::LoadChannels => {
                 load_channels(&client, &subs, &events).await;
             }
@@ -436,6 +525,16 @@ async fn run_command_pump(
                 let _ = subs.send(SubControl::AuxAdd { channel, ids }).await;
             }
             SessionCommand::OpenChannel(channel) => {
+                if let Some(id) = &active_community
+                    && let Err(error) =
+                        crate::config::mark_profile_channel(id, &channel.to_string())
+                {
+                    let _ = events
+                        .send(ChatEvent::Status(format!(
+                            "cannot record last channel for {id}: {error}"
+                        )))
+                        .await;
+                }
                 open_channel(&client, channel, &subs, &events).await;
             }
             SessionCommand::OpenThread {

@@ -435,6 +435,9 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     if app.picker.is_some() {
         draw_picker(frame, app, now, area);
     }
+    if app.community_picker.is_some() {
+        draw_community_picker(frame, app, area);
+    }
     if app.help {
         draw_help(frame, app, area, mode);
     }
@@ -1173,13 +1176,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
         }
         None => "no conversation".to_owned(),
     };
+    let context = format!("{} / {}", app.community_name, channel);
     let line = if with_conn {
         Line::from(vec![
-            Span::styled(channel, author_style()),
+            Span::styled(context, author_style()),
             Span::styled(format!(" · {}", conn_word(app.conn)), pending_style()),
         ])
     } else {
-        Line::styled(channel, author_style())
+        Line::styled(context, author_style())
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -1632,6 +1636,27 @@ fn draw_picker(frame: &mut Frame, app: &App, now: u64, area: Rect) {
         .highlight_symbol("> ");
     let mut state = ListState::default();
     state.select(item_index(&rows, app.picker.as_ref().map(|p| p.cursor)));
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_community_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items = app
+        .communities
+        .iter()
+        .map(|community| ListItem::new(format!("{} · {}", community.name, community.relay_url)))
+        .collect::<Vec<_>>();
+    let title = format!("Community: {}", app.community_name);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(Line::raw("enter switch · esc close"));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style())
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(app.community_picker);
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -2089,6 +2114,7 @@ const WIDE_HELP: &str = "\
 navigation
   j k up down    switch conversation   1-9 jump
   c              conversation picker   Esc close
+  C              community picker      Enter switch
   a              Agents: owned roster, working now
   f              Inbox filter
   g G PgUp PgDn  move the focused row

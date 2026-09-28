@@ -106,7 +106,7 @@ download is authorized by an event in the query.
 ## buzzx terms
 
 **buzzx**:
-Buzz's extension CLI (`buzz ext`), with a TUI, a planned Web surface and
+Buzz's extension CLI (`buzz ext`), with a TUI, a local Web surface and
 non-interactive commands.
 Its product boundary is defined in [core.md](core.md).
 
@@ -152,9 +152,21 @@ The event that the next sent message answers. It is cleared by every send.
 The event that the next sent message replaces. It is cleared by every send.
 The reply target and the edit target are mutually exclusive.
 
+**community profile**:
+The saved local record of one community: a stable `id`, a user-chosen name,
+a normalized relay URL, an optional profile-level auth tag and local usage
+state. Storage, selection and migration live in
+[the configuration reference](docs/configuration.md).
+
+**active community**:
+The community profile a session uses when no selector names another one. A
+process keeps one active community, therefore one relay connection; it never
+aggregates communities.
+
 **session**:
-One run of `buzzx`: one identity, one relay, one WebSocket connection, and
-the state that both pumps share.
+One run of `buzzx`: one identity, at most one active relay connection, and
+the state that both pumps share. Switching the active community re-binds the
+relay connection inside the same session.
 
 **bridge**:
 The relay's HTTP surface. `buzzx` uses `POST /query` to read and

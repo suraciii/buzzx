@@ -10,10 +10,9 @@ the relay they already belong to.
   identity and relay and where each came from, locally.
 - [`buzzx logout`](docs/configuration.md#logout) removes the saved key and
   auth tag, keeping the relay preference.
-- [`buzzx web`](docs/web.md) is a proposed browser surface with TUI capability
-  parity under the [shared interactive contract](docs/interactive.md). Its
-  design includes current search, context recovery and complete reading;
-  the command is not implemented.
+`buzzx web` opens a local browser chat session with the same relay-backed
+interactive state as the TUI. It binds only to loopback, prints a one-run
+access link, and keeps the web process alive until Ctrl+C.
 
 Buzz ships a Tauri desktop app, a Flutter mobile app, and the `buzz` CLI. The
 desktop and mobile apps need a graphical session. The `buzz` CLI is a

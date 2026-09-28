@@ -439,8 +439,8 @@ fn channels_list_returns_one_object_per_channel() {
     assert_eq!(
         json,
         json!([
-            {"channel_id": unnamed, "name": unnamed},
-            {"channel_id": named, "name": "buzzx-cli"},
+            {"channel_id": unnamed, "name": unnamed, "community": {"id": null, "name": "default", "relay_url": relay.url}},
+            {"channel_id": named, "name": "buzzx-cli", "community": {"id": null, "name": "default", "relay_url": relay.url}},
         ])
     );
 }
@@ -488,6 +488,7 @@ fn messages_get_returns_the_newest_limit_oldest_first() {
             "thread_root": null,
             "reply_to": null,
             "content": "three",
+            "community": {"id": null, "name": "default", "relay_url": relay.url},
         })
     );
 }

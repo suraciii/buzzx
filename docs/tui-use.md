@@ -1,6 +1,8 @@
 # Using `buzzx tui`
 
-`buzzx tui` opens a live terminal chat session against one Buzz relay.
+`buzzx tui` opens a live terminal chat session against one active Buzz
+community. The current community is shown beside the channel; `C` opens the
+saved-profile picker and switches the single active relay connection in place.
 
 The [shared interactive contract](interactive.md) maps these capabilities to
 both TUI and Web. This manual owns terminal controls; its linked functional
@@ -159,6 +161,9 @@ In navigation mode:
   the same filters.
 - `c` opens the conversation picker. `j` and `k` move within it, `Enter` opens
   the highlighted conversation, and `Esc` closes it.
+- `C` opens the community picker. `j` and `k` move between saved profiles,
+  `Enter` switches the active relay, and `Esc` closes it. Add, rename and
+  remove profiles with `buzzx community`.
 - `g` or `Home` focuses the oldest loaded message.
 - `G` or `End` focuses the newest message.
 - `PgUp` and `PgDn` move ten rows.

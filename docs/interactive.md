@@ -1,10 +1,12 @@
 # Interactive capabilities
 
-Status: shared product contract for TUI and the proposed Web surface.
-The implementation baseline is buzzx main
-`4d3fe9d2f3825b2440679b5282f7ea13f2525284`. TUI has the code paths listed
-below; Web is not implemented. Source presence and a specification are not
-runtime acceptance evidence.
+Status: shared product contract for TUI and the implemented Web surface.
+The implementation baseline is the current working tree. Web runtime behavior
+is implemented in `src/web.rs`; source presence alone is not acceptance
+evidence, so browser and relay checks remain required. Community profiles,
+selectors and in-process switching are implemented in the current baseline;
+profile management remains a CLI responsibility and live multi-relay
+acceptance still requires the checks below.
 
 ## One product, two interactive surfaces
 
@@ -31,6 +33,13 @@ adopt from the other Buzz clients and where buzzx deliberately has a narrower
 boundary. Those clients are reference implementations, not an obligation to
 duplicate their entire feature set.
 
+Both surfaces share one community model: one identity, saved community
+profiles, and one active relay connection per process. Switching replaces
+the active community inside the running surface; it never opens a second
+relay connection or merges communities. Adding, renaming and removing a
+community stays a terminal action through `buzzx community`; the interactive
+selectors list and switch saved profiles without accepting signing material.
+
 ## Shared capability catalog
 
 Every row is required for the first Web release and subsequent synchronized
@@ -39,8 +48,8 @@ Web entries define the required browser equivalent.
 
 | Capability and behavior owner | TUI entry | Web entry |
 | --- | --- | --- |
-| [Configured identity and one relay](configuration.md) | `buzzx tui` | `buzzx web`, session identity header |
-| [Channels, existing DMs and Inbox filters](tui-use.md#inbox-and-read-state) | Sidebar or `c`; `f` filters | Sidebar/list; All, Unread, For you |
+| [Configured identity and one active relay](configuration.md#community-profiles) | `buzzx tui` | `buzzx web`, session identity header |
+| [Community context and profile switching](configuration.md#selection) | Community line beside the channel; `C` picker to switch saved profiles | Community selector in the Inbox sidebar or app bar |
 | [Find a listed conversation](tui-context.md#c1-find-a-conversation) | `/` in picker | Find conversation field beside Inbox filters |
 | [Message search, scope, author and time](tui-context.md#c2-search-messages) | `/`; Ctrl+f from composer | Search messages button and filter form |
 | [Exact result context](tui-context.md#c3-open-the-result-in-context) | Enter on hit | Open result at its event |
@@ -116,8 +125,8 @@ shortcut or pane arrangement is not a different capability.
 Dedicated forum authoring/navigation, media upload/download or inline playback,
 DM creation, member administration, persisted drafts, thread-follow management,
 per-message/thread unread controls, Agent configuration/control, workflows,
-projects, huddles and a multi-community switcher are not introduced here.
-Existing forum rows and attachment labels remain readable as before.
+projects and huddles are not introduced here. Existing forum rows and
+attachment labels remain readable as before.
 
 Any future addition from that set needs a shared user outcome and usable
 controls in both surfaces. A Web-only attachment button or TUI-only search
@@ -153,6 +162,11 @@ Both surfaces must complete these representative journeys:
    sends. No recovery path automatically repeats an uncertain operation.
 8. Open My agents, inspect stale/unavailable work and an accessible context,
    then return with draft and reading state intact.
+
+9. Save two community profiles, switch between them, and verify the target
+   community's timeline, unread, drafts and write destinations never mix; a
+   failed switch keeps the picker open with a retry and never falls back to
+   another profile silently.
 
 Run these paths at the TUI sizes required by its specifications and at the
 browser sizes/input modes required by [web.md](web.md). Store the exact
