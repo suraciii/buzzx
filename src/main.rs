@@ -364,7 +364,8 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             let show_cursor = app.mode == app::Mode::Composer
                 && layout != layout::LayoutMode::TooSmall
                 && !app.help
-                && app.picker.is_none()
+                && app.switcher.is_none()
+                && app.palette.is_none()
                 && !app.agents.open;
             if show_cursor {
                 terminal.show_cursor().map_err(|e| e.to_string())?;

@@ -11,7 +11,7 @@ pub const MIN_HEIGHT: u16 = 6;
 pub enum LayoutMode {
     /// Channels, timeline, and composer side by side.
     Wide,
-    /// One-column timeline with the full-screen channel picker.
+    /// One-column timeline with the full-screen channel switcher.
     Narrow,
     /// One column and compact rows.
     Minimal,

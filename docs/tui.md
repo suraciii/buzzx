@@ -21,8 +21,8 @@ does not infer a device type.
 
 | Terminal size | Mode | Behavior |
 | --- | --- | --- |
-| 80 columns × 12 rows or larger | Wide | Inbox sidebar, timeline, and composer. |
-| 40–79 columns and 10 rows or larger | Narrow | One-column timeline. `c` opens the full-screen conversation picker. Composer stays at the bottom. |
+| 80 columns × 12 rows or larger | Wide | Full-width timeline, composer, and status line. |
+| 40–79 columns and 10 rows or larger | Narrow | The same one-column timeline. `c` opens the full-screen conversation switcher. Composer stays at the bottom. |
 | 24–39 columns and 6 rows or larger | Minimal | One-column timeline with compact rows and a one-line composer while composing. |
 | Below 24 columns or 6 rows | Too small | Start the session and show a size message. Keep listening for resize; switch modes automatically when the terminal is large enough. |
 
@@ -30,40 +30,43 @@ Narrow and minimal modes never introduce horizontal scrolling. Message bodies
 wrap to the available width. Long words and URLs may break at character
 boundaries; the underlying message remains unchanged.
 
-The wide layout shows `Inbox: <filter>` in the sidebar and the selected
-conversation on the right. The sidebar groups rows under `Channels` and
-`DMs`; one-column modes keep the Inbox in the picker opened with `c`. The
-picker and wide list use `All`, `Unread`, and `For you`. A row signal carries
-the unread message count when known (`● 3`, `@ 2`), `?` for unknown, `Read` for
-a picker row retained after it stops matching, or no signal. Its signal cell
-is reserved before the label is clipped; typing adds `…` after the label.
-Read-state details and limits are in
+The layout is timeline first at every size: the header names the open
+conversation and carries the Inbox answer, and the timeline under it keeps the
+terminal's full width. The conversation list is the switcher opened with `c`,
+which groups rows under `Channels` and `DMs` and uses `All`, `Unread`, and
+`For you` as its filter tabs. A row signal carries the unread message count
+when known (`● 3`, `@ 2`), `?` for unknown, `Read` for a switcher row retained
+after it stops matching, or no signal. Its signal cell is reserved before the
+label is clipped; typing adds `…` after the label. Read-state details and
+limits are in
 [shared-core.md](../design/shared-core.md#inbox-and-read-state).
 
 ## Unified keys
 
-The action meaning depends on the layout and on whether the picker or help is
-open. `j` and `k` move between conversations in the wide Inbox and between
-timeline rows in one-column modes. In one-column modes, `c` opens the
-conversation picker. `f` cycles `All`, `Unread`, and `For you` in navigation
-mode; `f` or Tab cycles them in the picker. Help opens with `?`; while open,
+The action meaning depends on the layout and on whether the switcher, the
+command palette, or help is open. `j` and `k` move between timeline rows at
+every width. `c` opens the conversation switcher at every width, and `Ctrl+P`
+opens the command palette. `f` cycles `All`, `Unread`, and `For you` in
+navigation mode; `f` or Tab cycles them in the switcher. Help opens with `?`; while open,
 `j`/`k`, `PgUp`/`PgDn`, and `g`/`G` scroll it, and `Esc` or `?` closes it.
 Help displays the full selected conversation label.
 
 | Action | Primary key | Alias |
 | --- | --- | --- |
 | Move focus / select item | `j` / `k` | Up / Down |
-| Open conversation picker | `c` | — |
+| Open conversation switcher | `c` | — |
+| Open the command palette | `Ctrl+P` | — |
 | Open the Agents overlay | `a` | — |
-| Change Inbox filter | `f` | Tab in picker |
+| Change Inbox filter | `f` | Tab in the switcher |
 | Compose a new message | `i` | Tab |
 | Reply to the focused row | Enter | — |
 | Send | Enter in composer | — |
 | Insert newline | Alt+Enter in composer | — |
 | Back / close overlay | Esc | — |
 
-`j` and `k` move the picker cursor. `Enter` opens the highlighted
-conversation and `Esc` closes the picker. Other navigation keys include
+`j` and `k` move the switcher cursor, typing filters the list by name, `Enter`
+opens the highlighted conversation and `Esc` closes the switcher. Other
+navigation keys include
 `g`/`Home` for the oldest loaded message, `G`/`End` for the newest,
 `PgUp`/`PgDn` for ten rows, and `r`, `e`, and `d` for react, edit, and delete.
 
