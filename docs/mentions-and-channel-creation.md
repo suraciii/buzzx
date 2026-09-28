@@ -1,10 +1,9 @@
 # Mention suggestions and channel creation
 
-Status: implementation-ready product specification. The current `buzzx` baseline
-(`dc6c468`) has send-time mention resolution in the shared session, but the CLI
-send/reply paths still pass an empty recipient set. Channel creation is not yet
-available. This document defines the next synchronized TUI, WebUI and CLI
-slice; it does not claim that slice is implemented.
+Status: implemented in the current working tree. The historical baseline
+(`dc6c468`) had send-time mention resolution in the shared session, but CLI
+send/reply passed an empty recipient set and channel creation was unavailable.
+The synchronized TUI, WebUI and CLI behavior below replaces those gaps.
 
 This specification extends the shared behavior in
 [`interactive.md`](interactive.md), keeps the community boundary in
@@ -26,19 +25,13 @@ The same identity, relay, membership, reply target, write outcome and
 community isolation rules apply in every surface. A visible `@Name` is not
 evidence of a notification; the signed recipient tag is.
 
-## Baseline findings
+## Historical baseline findings
 
-- [`src/session.rs`](../src/session.rs) already performs a member-directory
-  lookup and blocks unresolved mentions for shared interactive sending.
-- [`src/cli.rs`](../src/cli.rs) currently passes `&[]` mentions to both CLI
-  message write paths, so visible names do not become signed recipients.
-- [`src/web.rs`](../src/web.rs) exposes pending write state but not the
-  structured mention error needed by a browser composer.
-- [`src/cli.rs`](../src/cli.rs) only declares `channels list`; the client
-  has no channel creation operation in [`src/client.rs`](../src/client.rs).
-- [`docs/browse-collab-cli.md`](browse-collab-cli.md) currently excludes
-  channel administration. This slice adds channel creation while leaving
-  membership administration, invites and archival separate.
+At `dc6c468`, the shared session resolved mentions, but CLI message writes
+passed no recipients; WebUI lacked structured mention errors; and CLI only
+offered `channels list`. The implementation now shares send-time preflight,
+exposes browser corrections, and supports channel creation across surfaces.
+Membership administration, invites and archival remain separate.
 
 ## Desktop and Mobile reference
 
@@ -129,9 +122,10 @@ An uncertain write is never retried automatically.
 - The picker is a compact overlay in wide mode and a scrollable temporary
   full-screen view in narrow/minimal modes. It never introduces a second
   timeline column.
-- `j/k` or Up/Down moves the cursor. Enter inserts `@Display Name ` and closes
-  the picker. Esc closes it without changing the draft. The Enter used to
-  select a person never sends the message.
+- Up/Down or Tab/BackTab moves the cursor. `j` and `k` stay text: the query
+  may contain them, and a name may begin with one. Enter inserts
+  `@Display Name ` and closes the picker. Esc closes it without changing the
+  draft. The Enter used to select a person never sends the message.
 - A selected occurrence remembers its public key until the text occurrence is
   changed, the channel/community changes, or the final revalidation fails.
 - `?` explains an unresolved or ambiguous fragment and shows complete exact
@@ -145,7 +139,7 @@ An uncertain write is never retried automatically.
 | `loading` | `Loading members…` | Continue typing, Esc, return to draft |
 | `open` | Ranked suggestions | Move, select, dismiss |
 | `empty` | `No matching members` | Edit query, dismiss |
-| `directory_failed` | `Could not load members; retry` | Retry lookup, keep draft |
+| `directory_failed` | `Could not load members; retry` | `Ctrl+R`, keep draft |
 | `blocked` | Short send refusal in status line | `?` details, edit and retry |
 
 ### TUI creation entry
@@ -156,9 +150,9 @@ community shown in the header and does not add a new global key.
 
 `Creating…` disables duplicate submit. `Created` refreshes the roster and
 opens the new channel. `Failed` keeps editable fields. `Unknown` says that the
-channel may exist and requires an explicit refresh; it never retries creation.
-Pending or uncertain creation blocks community switching until the result is
-resolved.
+channel may exist and requires an explicit refresh (`r`, in the form or on the
+timeline); it never retries creation. Pending or uncertain creation blocks
+community switching until the result is resolved.
 
 ## WebUI behavior
 

@@ -168,6 +168,27 @@ pub fn member_pubkeys(event: &Event) -> Vec<String> {
         .collect()
 }
 
+/// The relay's role for each member its roster describes, as
+/// `(lowercase hex, role)`. The NIP-29 `p` tag carries the role in its fourth
+/// column; a tag without one says nothing, and nothing is not `member`.
+pub fn member_roles(event: &Event) -> Vec<(String, String)> {
+    let mut seen: HashSet<String> = HashSet::new();
+    event
+        .tags
+        .iter()
+        .filter_map(|t| {
+            let parts = tag_strings(t);
+            if parts.first().map(String::as_str) != Some("p") {
+                return None;
+            }
+            let key = PublicKey::parse(parts.get(1)?).ok()?.to_hex();
+            let role = parts.get(3).filter(|role| !role.is_empty())?.clone();
+            Some((key, role))
+        })
+        .filter(|(key, _)| seen.insert(key.clone()))
+        .collect()
+}
+
 /// Whether an event directly mentions one identity: a `p` tag that names it.
 /// Broadcast alone does not qualify.
 pub fn mentions_me(event: &Event, me: &str) -> bool {

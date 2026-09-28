@@ -456,7 +456,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
                         app.surface(),
                         app.search.key_mode(),
                     ),
-                    app::Mode::Composer => keys::map_composer(key),
+                    app::Mode::Composer => keys::map_composer(key, app.mention_picker.is_some()),
                 };
                 app.handle(action, now);
             }

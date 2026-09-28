@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 use crate::agents::Load as AgentLoad;
 use crate::app::{
-    AgentStatus, App, CommunityChoice, ConnState, Context, Filter, Mode, SearchScope, SearchTime,
+    AgentStatus, App, CommunityChoice, ConnState, Context, CreateChannelForm, CreateState, Filter,
+    Mode, SearchScope, SearchTime,
 };
 use crate::client::ChannelKind;
 use crate::config::{self, Resolved};
@@ -40,29 +41,90 @@ const HTML: &str = r##"<!doctype html>
 </head>
 <body><div id="root"></div>
 <script>
-const root=document.getElementById('root');root.textContent='Connecting…';window.addEventListener('error',event=>{root.textContent='Browser error: '+event.message});const tabKey=globalThis.crypto?.randomUUID?.()||Math.random().toString(36).slice(2);let state=null;let view='channel';let lastView='';let notice='';let drafts=new Map();let fields=new Map();
-const esc=(x)=>String(x??'');function draftFor(){const key=(state?.community?.id||'default')+':'+(state?.selected||'inbox');if(!drafts.has(key))drafts.set(key,{text:'',target:null,pending:false});return drafts.get(key)}function saveDraft(){const box=document.querySelector('#composer');if(box&&!box.disabled)draftFor().text=box.value}
+const root=document.getElementById('root');root.textContent='Connecting…';window.addEventListener('error',event=>{root.textContent='Browser error: '+event.message});const tabKey=globalThis.crypto?.randomUUID?.()||Math.random().toString(36).slice(2);let state=null;let view='channel';let lastView='';let notice='';let drafts=new Map();let fields=new Map();let refreshSerial=0;let mentionQueue=Promise.resolve();
+const esc=(x)=>String(x??'');function draftFor(){const key=(state?.community?.id||'default')+':'+(state?.selected||'inbox');if(!drafts.has(key))drafts.set(key,{text:'',target:null,pending:false,caret:null});return drafts.get(key)}function saveDraft(){const box=document.querySelector('#composer');if(box&&!box.disabled)draftFor().text=box.value}
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:body?{'content-type':'application/json','x-buzzx-tab':tabKey}:{'x-buzzx-tab':tabKey},body:body?JSON.stringify(body):undefined,credentials:'same-origin'});if(!r.ok){throw new Error(await r.text()||r.statusText)}return r.json()}
 function rowHtml(r,selected){return `<article class="row ${selected?'focus':''}" data-row-id="${esc(r.event_id)}"><div class="meta"><span class="author"></span><span>${new Date((r.created_at||0)*1000).toLocaleString()}</span>${r.edited?'<span>(edited)</span>':''}${r.uncertain?'<span class="error">Unknown result</span>':''}</div><div class="body"></div><div class="row-actions"><button data-act="reply" data-id="${esc(r.event_id)}">Reply</button><button data-act="thread" data-id="${esc(r.event_id)}">Open thread</button><button data-act="reader" data-id="${esc(r.event_id)}">Read message</button><button data-act="react" data-id="${esc(r.event_id)}">Like</button>${r.own?' <button data-act="edit" data-id="'+esc(r.event_id)+'">Edit</button><button data-act="delete" data-id="'+esc(r.event_id)+'">Delete</button>':''}</div></article>`}
 function captureFocus(){const el=document.activeElement;if(!el||el===document.body||!el.id||!root.contains(el))return null;const caret=el.tagName==='INPUT'||el.tagName==='TEXTAREA'?{start:el.selectionStart,end:el.selectionEnd}:null;return{id:el.id,caret}}
 function restoreFocus(seed){if(!seed)return;const el=root.querySelector('#'+CSS.escape(seed.id));if(!el)return;el.focus({preventScroll:true});if(seed.caret&&el.setSelectionRange)try{el.setSelectionRange(seed.caret.start,seed.caret.end)}catch(_){}}
 function render(){if(!state){root.textContent='Connecting…';return}const seed=captureFocus();const scrollY=window.scrollY;const anchorEl=root.querySelector('.rows .row.focus');const anchor=anchorEl&&anchorEl.dataset.rowId?{id:anchorEl.dataset.rowId,top:anchorEl.getBoundingClientRect().top}:null;const rowSeed=anchor?anchor.id:null;root.innerHTML='';const app=document.createElement('div');app.className='app';app.innerHTML=`<aside class="sidebar"><div class="brand">buzzx</div><div class="identity"></div><div class="community"></div><input id="find" placeholder="Find conversation" aria-label="Find conversation"><div class="filters"><button data-filter="All">All</button><button data-filter="Unread">Unread</button><button data-filter="For you">For you</button></div><div class="channels"></div><div class="sidebar-footer"></div></aside><main class="main"><header class="topbar"><button class="back" data-act="back">Inbox</button><div class="title"></div><span class="status"></span><button data-act="search">Search messages</button><button data-act="agents">My agents</button><button data-act="help">Help</button></header><section class="content"></section><footer class="composer"><div class="composer-label"></div><div class="composer-controls"><textarea id="composer" placeholder="Write a message…"></textarea><button data-act="send">Send</button></div></footer></main></div>`;root.appendChild(app);app.querySelector('.identity').textContent=state.identity+' · '+state.relay;const community=app.querySelector('.community');community.textContent='Community: '+(state.community?.name||'default')+' · '+(state.connection||'Connecting');(state.communities||[]).forEach(c=>{const b=document.createElement('button');b.textContent=c.name+(c.active?' ✓':'');b.title=c.relay_url;b.onclick=()=>act({action:'community',community:c.id});community.appendChild(b)});app.querySelector('.status').textContent=state.connection+(state.startup_error?' · '+state.startup_error:'');app.querySelector('.title').textContent=state.title||'Inbox';app.querySelector('.sidebar-footer').textContent=state.status||'';const list=app.querySelector('.channels');const empty=document.createElement('div');empty.className='empty';list.appendChild(empty);state.channels.forEach(c=>{const b=document.createElement('button');b.className='channel'+(c.id===state.selected?' active':'');b.dataset.channel=c.id;b.dataset.matched=c.matched?'1':'';b.hidden=!c.matched;const n=document.createElement('span');n.textContent=c.name;b.appendChild(n);if(c.unread||c.marker==='unknown'){const x=document.createElement('span');x.className='count';x.textContent=c.marker==='unknown'?'?':String(c.unread);b.appendChild(x)}list.appendChild(b)});app.querySelectorAll('[data-filter]').forEach(b=>{const on=b.dataset.filter===state.filter;b.classList.toggle('active',on);b.setAttribute('aria-pressed',on?'true':'false')});const cinput=app.querySelector('#find');cinput.value=fields.get('find')||'';const applyFind=()=>{const q=cinput.value.toLowerCase();let shown=0;list.querySelectorAll('.channel').forEach(b=>{b.hidden=b.dataset.matched!=='1'||!b.textContent.toLowerCase().includes(q);if(!b.hidden)shown++});empty.textContent=shown?'':(q?'No match':(state.filter_empty||''))};cinput.addEventListener('input',()=>{fields.set('find',cinput.value);applyFind()});applyFind();app.querySelector('.composer-label').textContent=state.composer_label||'New message';const content=app.querySelector('.content');
 if(view==='search'){renderSearch(content)}else if(view==='agents'){renderAgents(content)}else if(view==='help'){content.innerHTML='<h2>Help</h2><p>Enter sends. Shift+Enter inserts a newline. Search and inspection keep drafts in this tab. Browser Back returns through the current inspection path.</p><p>Only the local process can authorize this page. Refreshing or closing the tab does not persist drafts.</p>'}else if(view==='reader'){renderReader(content)}else if(view==='thread'){renderRows(content,state.thread,'Thread')}else if(view==='context'){renderRows(content,state.context,'Search context')}else{renderRows(content,state.rows,state.title||'Conversation')}
-wire(app);const d=draftFor();const ta=app.querySelector('#composer');ta.value=d.text;ta.disabled=!!d.pending;ta.oninput=()=>draftFor().text=ta.value;app.querySelector('[data-act="send"]').disabled=!!d.pending;app.querySelectorAll('[data-channel]').forEach(b=>b.onclick=()=>selectChannel(b.dataset.channel));app.querySelector('[data-act="agents"]').onclick=()=>act({action:'agents'});app.querySelector('[data-act="help"]').onclick=()=>act({action:'help'});restoreFocus(seed);const rowNow=root.querySelector('.rows .row.focus');const rowId=rowNow?rowNow.dataset.rowId:null;if(view!==lastView){lastView=view;window.scrollTo(0,0)}else if(rowNow&&rowId!==rowSeed)rowNow.scrollIntoView({block:'nearest'});else if(anchor){const was=root.querySelector('[data-row-id="'+CSS.escape(anchor.id)+'"]');if(was)window.scrollBy(0,was.getBoundingClientRect().top-anchor.top);else window.scrollTo(0,scrollY)}else window.scrollTo(0,scrollY);}
+wire(app);const d=draftFor();const ta=app.querySelector('#composer');ta.value=d.text;ta.disabled=!!d.pending;if(d.caret!=null){try{ta.setSelectionRange(d.caret,d.caret)}catch(_){}d.caret=null}ta.oninput=()=>draftFor().text=ta.value;app.querySelector('[data-act="send"]').disabled=!!d.pending;app.querySelectorAll('[data-channel]').forEach(b=>b.onclick=()=>selectChannel(b.dataset.channel));app.querySelector('[data-act="agents"]').onclick=()=>act({action:'agents'});app.querySelector('[data-act="help"]').onclick=()=>act({action:'help'});restoreFocus(seed);const rowNow=root.querySelector('.rows .row.focus');const rowId=rowNow?rowNow.dataset.rowId:null;if(view!==lastView){lastView=view;window.scrollTo(0,0)}else if(rowNow&&rowId!==rowSeed)rowNow.scrollIntoView({block:'nearest'});else if(anchor){const was=root.querySelector('[data-row-id="'+CSS.escape(anchor.id)+'"]');if(was)window.scrollBy(0,was.getBoundingClientRect().top-anchor.top);else window.scrollTo(0,scrollY)}else window.scrollTo(0,scrollY);}
 function renderRows(content,rows,title){content.innerHTML='<div class="toolbar"><h2></h2><button data-act="older">Older</button><button data-act="newer">Newer</button><button data-act="latest">Latest</button></div>';content.querySelector('h2').textContent=title;const box=document.createElement('div');box.className='rows';content.appendChild(box);const isThread=title==='Thread';const loading=isThread?state.thread_loading:state.context_loading;const failed=isThread?state.thread_failed:state.context_failed;if(loading)box.innerHTML='<div class="loading">Loading…</div>';if(failed){const error=document.createElement('div');error.className='error';error.textContent='Read failed: '+failed+'; use Back and retry.';box.appendChild(error)}rows.forEach((r,i)=>{const holder=document.createElement('div');holder.innerHTML=rowHtml(r,i===(isThread?state.thread_focus:state.context_focus));const article=holder.firstElementChild;article.querySelector('.author').textContent=r.author;article.querySelector('.body').textContent=r.body;box.appendChild(article)});if(!rows.length&&!loading&&!failed)box.insertAdjacentHTML('beforeend','<div class="empty">No messages loaded.</div>')}
 function renderSearch(content){content.innerHTML='<div class="search"><div class="toolbar"><button data-act="back">Back</button></div><div class="search-form"><input id="query" placeholder="Search messages"><button id="submit-search">Search</button></div><div class="toolbar"><label>Scope <select id="scope"><option value="current">Current conversation</option><option value="all">All listed conversations</option></select></label><label>Author <input id="author" placeholder="Exact public key (optional)"></label><label>Time <select id="time"><option value="all">All time</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option></select></label></div><div class="search-status"></div><div class="rows"></div></div>';const query=content.querySelector('#query');query.value=fields.get('query')??(state.search_query||'');query.addEventListener('input',()=>fields.set('query',query.value));const author=content.querySelector('#author');author.value=fields.get('author')||'';author.addEventListener('input',()=>fields.set('author',author.value));const submitSearch=()=>act({action:'search',query:query.value,scope:content.querySelector('#scope').value,author:author.value,time:content.querySelector('#time').value});query.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.isComposing){e.preventDefault();submitSearch()}});author.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.isComposing){e.preventDefault();submitSearch()}});content.querySelector('#submit-search').onclick=submitSearch;const box=content.querySelector('.rows');(state.search||[]).forEach((r,i)=>{const holder=document.createElement('div');holder.innerHTML=rowHtml(r,i===state.search_focus);const article=holder.firstElementChild;article.classList.add('search-result');article.title='Open in context';article.querySelector('.author').textContent=r.author;article.querySelector('.body').textContent=r.body;article.addEventListener('click',event=>{if(event.target.closest('button'))return;act({action:'context',event:r.event_id})});box.appendChild(article)});const hidden=state.search_hidden>0?` · bounded: ${state.search_hidden} hidden by visibility`:'';const applied=!!state.search_applied_query||!!state.search_applied_author;let status='';if(state.search_failed)status=`search failed: ${state.search_failed}`+(state.search_previous?` · results from previous query ${state.search_previous}`:'');else if(state.search_loading)status='searching…'+(state.search_previous?` · showing previous query ${state.search_previous}`:'');else if(state.search_bounded)status=`Top 50; narrow filters${hidden}`;else if(state.search.length)status=`${state.search.length} results returned${hidden}`;else if(applied)status=`no returned matches${hidden}`;content.querySelector('.search-status').textContent=status;if(!state.search||!state.search.length)box.innerHTML=applied?`<div class="empty">no returned matches${hidden}</div>`:'<div class="empty">Enter a query and select Search.</div>';content.querySelector('#scope').value=state.search_scope||'current';content.querySelector('#author').value=state.search_author||'';content.querySelector('#time').value=state.search_time||'all';const scope=content.querySelector('#scope');state.channels.forEach(c=>{const option=document.createElement('option');option.value=c.id;option.textContent='Conversation: '+c.name;scope.appendChild(option)});scope.value=state.search_scope||'current';if(state.search_loading)content.insertAdjacentHTML('afterbegin','<div class="loading">Searching…</div>');if(state.search_failed)content.insertAdjacentHTML('afterbegin','<div class="error">Search failed: '+esc(state.search_failed)+'; previous results are retained.</div>');if(state.search_bounded)content.insertAdjacentHTML('afterbegin','<div class="small">Showing the relay result bound; more matches may exist.</div>')}
 function renderReader(content){const r=state.reader;content.innerHTML='<div class="toolbar"><button data-act="back">Back</button></div><h2>Read message</h2><div class="row"><div class="meta"><span class="author"></span></div><div class="body"></div><div class="row-actions"><button data-act="reply" data-id=""></button></div></div>';content.querySelector('.author').textContent=r?r.author:'';content.querySelector('.body').textContent=r?r.body:'Message unavailable';content.querySelector('[data-act="reply"]').textContent='Reply';if(r)content.querySelector('[data-act="reply"]').dataset.id=r.event_id}
 function renderAgents(content){content.innerHTML='<div class="toolbar"><button data-act="back">Back</button></div><h2>My agents</h2>';if(!state.agents||!state.agents.length){content.innerHTML+='<div class="empty">No owned Agents loaded.</div>';return}state.agents.forEach(a=>{const d=document.createElement('div');d.className='agent';const name=document.createElement('strong');name.textContent=a.name;d.appendChild(name);const status=document.createElement('div');status.className='small';status.textContent=a.status;d.appendChild(status);const detail=document.createElement('div');detail.className='small';detail.textContent=(a.contexts||[]).map(c=>c.kind==='channel'?c.name:c.kind==='unavailable'?'Unavailable conversation':'Scheduled turn').join(', ')||'No observed working context';d.appendChild(detail);content.appendChild(d)})}
 function rowViewport(action,page){if(view!=='channel')return act({action});if(page<0)return window.scrollBy({top:-Math.round(window.innerHeight*0.9),behavior:'smooth'});if(page>0)return window.scrollBy({top:Math.round(window.innerHeight*0.9),behavior:'smooth'});window.scrollTo({top:document.documentElement.scrollHeight})}
 function wire(app){app.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>act({action:'filter',filter:b.dataset.filter}));app.querySelectorAll('[data-act]').forEach(b=>b.onclick=()=>{const a=b.dataset.act,id=b.dataset.id;if(a==='reply')return reply(id);if(a==='edit')return edit(id);if(a==='delete')return act({action:'delete',event:id});if(a==='react')return act({action:'react',event:id});if(a==='thread')return act({action:'thread',event:id});if(a==='reader')return act({action:'reader',event:id});if(a==='send')return send();if(a==='new')return act({action:'new'});if(a==='search')return setView('search');if(a==='submit-search')return act({action:'search',query:document.querySelector('#query').value});if(a==='agents')return setView('agents');if(a==='help')return setView('help');if(a==='back')return back();if(a==='older')return rowViewport('older',-1);if(a==='newer')return rowViewport('newer',1);if(a==='latest')return rowViewport('latest',0)});const ta=app.querySelector('#composer');ta.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}}}
-async function selectChannel(id){saveDraft();const d=draftFor();if(d.text.trim())try{await api('/api/action',{action:'draft',content:d.text})}catch(e){notice=e.message;return}await act({action:'select',channel:id})}
+async function selectChannel(id){saveDraft();const d=draftFor();if(d.text.trim())try{await mentionQueue;await api('/api/action',{action:'draft',content:d.text})}catch(e){notice=e.message;return}await act({action:'select',channel:id})}
 function reconcileDraft(){const d=draftFor();if(!d.pending)return;if(state.write_pending)return;if(state.composer_mode&&state.composer_text){d.text=state.composer_text;d.pending=false;return}d.text='';d.target=null;d.pending=false}
+async function mentionAction(body){mentionQueue=mentionQueue.then(async()=>{try{saveDraft();const result=await api('/api/action',body);const d=draftFor();if(typeof result.composer_text==='string'){d.text=result.composer_text;d.caret=utf16Offset(result.composer_text,result.composer_cursor||0)}await refresh()}catch(e){notice=e.message;await refresh()}});return mentionQueue}
 async function act(body){try{saveDraft();const result=await api('/api/action',body);if(result.view){const previous=view;view=result.view;if(view!==previous&&body.action!=='back')history.pushState({view},'', '#'+view);else history.replaceState({view},'', '#'+view)}await refresh()}catch(e){notice=e.message;await refresh()}}
-async function send(){saveDraft();const d=draftFor();if(!d.text.trim()||d.pending)return;d.pending=true;try{await api('/api/action',{action:'send',content:d.text,event:d.target})}catch(e){d.pending=false;notice=e.message}await refresh()}
+async function send(){saveDraft();const d=draftFor();if(!d.text.trim()||d.pending)return;d.pending=true;try{await mentionQueue;await api('/api/action',{action:'send',content:d.text,event:d.target})}catch(e){d.pending=false;notice=e.message}await refresh()}
 function reply(id){saveDraft();draftFor().target=id;act({action:'reply',event:id})}function edit(id){saveDraft();draftFor().target=id;act({action:'edit',event:id})}function setView(v){saveDraft();view=v;history.pushState({view},'', '#'+view);refresh()}function back(){act({action:'back'})}
-async function refresh(){try{state=await api('/api/state');reconcileDraft();if(!view||view==='channel')view=state.surface||'channel';if(notice){state.status=notice;notice=''}render();reportPresented()}catch(e){root.textContent='Session unavailable: '+e.message}}
+async function refresh(){const serial=++refreshSerial;try{const next=await api('/api/state');if(serial!==refreshSerial)return;if(state&&typeof next.generation==='number'&&typeof state.generation==='number'&&next.generation<state.generation)return;state=next;reconcileDraft();if(!view||view==='channel')view=state.surface||'channel';if(notice){state.status=notice;notice=''}render();reportPresented()}catch(e){if(serial===refreshSerial)root.textContent='Session unavailable: '+e.message}}
 async function browserBack(){if(window.backInFlight)return;window.backInFlight=true;try{await act({action:'back'})}finally{window.backInFlight=false}}document.addEventListener('visibilitychange',reportPresented);window.addEventListener('focus',reportPresented);window.addEventListener('popstate',browserBack);window.addEventListener('hashchange',browserBack);window.addEventListener('load',refresh,{once:true});setInterval(refresh,1200);
 async function reportPresented(){if(!state||view!=='channel'||document.visibilityState!=='visible'||!document.hasFocus()||!state.rows.length||state.focus!==state.rows.length-1)return;const box=document.querySelector('.rows'),last=state.rows[state.rows.length-1];if(!box||window.scrollY+window.innerHeight<document.documentElement.scrollHeight-2)return;try{await api('/api/action',{action:'presented',visible:true,latest:last.event_id})}catch(_){}}
+const utf8Offset=(text,units)=>new TextEncoder().encode(text.slice(0,units)).length;
+const utf16Offset=(text,bytes)=>{let units=0,seen=0;for(const ch of text){if(seen>=bytes)break;seen+=new TextEncoder().encode(ch).length;units+=ch.length}return units};
+function mentionInput(ta){const cursor=utf8Offset(ta.value,ta.selectionStart||0);mentionAction({action:'mention',content:ta.value,cursor});}
+function mentionAvatar(candidate){const avatar=document.createElement('span');avatar.className='mention-avatar';if(candidate.picture){const image=document.createElement('img');image.src=candidate.picture;image.alt='';image.referrerPolicy='no-referrer';image.onerror=()=>{image.remove();avatar.textContent=(candidate.label||'?').trim().slice(0,2).toUpperCase()};avatar.appendChild(image)}else avatar.textContent=(candidate.label||'?').trim().slice(0,2).toUpperCase();return avatar}
+function renderWebExtras(){const ta=document.querySelector('#composer');if(!ta)return;let pop=document.querySelector('.mention-popover');const suggestions=state?.mention_suggestions;if(suggestions){if(!pop){pop=document.createElement('div');pop.className='mention-popover';ta.parentElement.parentElement.appendChild(pop)}pop.replaceChildren();if(suggestions.loading){pop.textContent='Loading members…'}else if(suggestions.failed){const text=document.createElement('span');text.textContent='Member list failed: '+suggestions.failed;pop.append(text);const retry=document.createElement('button');retry.textContent='Retry';retry.onclick=()=>act({action:'mention_retry'});pop.append(retry)}else if(!suggestions.items.length){pop.textContent='No matching members'}else{const counts={};suggestions.items.forEach(item=>counts[item.label]=(counts[item.label]||0)+1);suggestions.items.forEach((item,index)=>{const row=document.createElement('button');row.className='mention-row'+(index===suggestions.selected_index?' selected':'');row.append(mentionAvatar(item));const label=document.createElement('span');label.textContent=item.label;row.append(label);if(item.agent){const marker=document.createElement('b');marker.textContent=' Agent';row.append(marker)}if(item.admin){const marker=document.createElement('b');marker.textContent=' Admin';row.append(marker)}if(counts[item.label]>1){const key=document.createElement('small');key.textContent=' '+item.short_key;row.append(key)}row.onclick=()=>mentionAction({action:'mention_select',index}).then(()=>mentionAction({action:'mention_confirm'}));pop.append(row)})}}else if(pop)pop.remove()}
+let createDraft=null;
+function buildCreateModal(form,communityId){
+  let modal=document.querySelector('.create-channel-modal');
+  if(!modal){modal=document.createElement('div');modal.className='create-channel-modal';document.body.append(modal)}
+  modal.replaceChildren();
+  const backdrop=document.createElement('div');backdrop.className='create-channel-backdrop';backdrop.onclick=()=>act({action:'create_channel_close'});modal.append(backdrop);
+  const panel=document.createElement('div');panel.className='create-channel-panel';panel.setAttribute('role','dialog');panel.setAttribute('aria-modal','true');panel.setAttribute('aria-label','Create channel');modal.append(panel);
+  const heading=document.createElement('strong');heading.textContent='Create channel · '+(state?.community?.name||'current community');panel.append(heading);
+  const locked=form.state==='creating'||form.state==='unknown';
+  const addField=(label,node)=>{const wrap=document.createElement('label');wrap.textContent=label;wrap.append(node);panel.append(wrap);return node};
+  const name=document.createElement('input');name.value=createDraft.name;name.placeholder='Name';name.disabled=locked;name.oninput=()=>{createDraft.name=name.value;syncSubmit()};addField('Name',name);
+  const kind=document.createElement('select');[['stream','stream'],['forum','forum']].forEach(([value,text])=>{const option=document.createElement('option');option.value=value;option.textContent=text;if(createDraft.type===value)option.selected=true;kind.append(option)});kind.disabled=locked;kind.onchange=()=>{createDraft.type=kind.value};addField('Type',kind);
+  const visibility=document.createElement('select');[['open','open'],['private','private']].forEach(([value,text])=>{const option=document.createElement('option');option.value=value;option.textContent=text;if(createDraft.visibility===value)option.selected=true;visibility.append(option)});visibility.disabled=locked;visibility.onchange=()=>{createDraft.visibility=visibility.value};addField('Visibility',visibility);
+  const description=document.createElement('textarea');description.value=createDraft.description;description.placeholder='Description (optional)';description.disabled=locked;description.oninput=()=>{createDraft.description=description.value};addField('Description',description);
+  if(form.failure){const error=document.createElement('div');error.className='error';error.textContent=form.state==='unknown'?'The channel may already exist. Refresh the list to confirm before creating another. '+form.failure:form.failure;panel.append(error)}
+  const actions=document.createElement('div');actions.className='create-channel-actions';panel.append(actions);
+  const submit=document.createElement('button');submit.textContent=form.state==='creating'?'Creating…':'Create';submit.dataset.createSubmit='';submit.onclick=()=>{submit.disabled=true;act({action:'create_channel_submit',community:communityId,name:createDraft.name,type:createDraft.type,visibility:createDraft.visibility,description:createDraft.description})};actions.append(submit);
+  // The name decides whether this submission can go: the button follows every
+  // keystroke, not only the panel's first build.
+  const syncSubmit=()=>{submit.disabled=locked||!createDraft.name.trim()};
+  syncSubmit();
+  if(form.state==='unknown'){const retry=document.createElement('button');retry.textContent='Refresh list';retry.dataset.createRefresh='';retry.onclick=()=>act({action:'create_channel_refresh'});actions.append(retry)}
+  const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=()=>act({action:'create_channel_close'});actions.append(cancel);
+  const hint=document.createElement('div');hint.className='small';hint.textContent='Name is required. The current community in the bar is where this channel is created.';panel.append(hint);
+  name.focus();
+}
+function renderCreateExtras(){
+  const sidebar=document.querySelector('.sidebar');
+  if(sidebar&&!sidebar.querySelector('[data-create-channel]')){const button=document.createElement('button');button.dataset.createChannel='';button.textContent='+ Create channel';button.onclick=()=>act({action:'create_channel'});sidebar.insertBefore(button,sidebar.querySelector('.channels'))}
+  const form=state?.create_channel;
+  // The write outlives the modal: while it is open the page keeps a surface
+  // that says so and offers the refresh which settles it.
+  const unsettled=state?.create_unsettled;
+  let block=document.querySelector('.create-unsettled');
+  if(unsettled&&!form){
+    if(!block){block=document.createElement('div');block.className='create-unsettled notice';document.body.append(block)}
+    block.replaceChildren();
+    const title=document.createElement('strong');title.textContent=(unsettled.state==='unknown'?'Channel creation unresolved: ':'Creating channel: ')+unsettled.name;block.append(title);
+    const detail=document.createElement('div');detail.textContent=unsettled.state==='unknown'?'The relay did not confirm it. Refresh the list to see whether it exists; creating it again could make a second channel.':'The relay has not answered yet.';block.append(detail);
+    const refresh=document.createElement('button');refresh.textContent='Refresh list';refresh.dataset.createRefresh='';refresh.onclick=()=>act({action:'create_channel_refresh'});block.append(refresh);
+    const review=document.createElement('button');review.textContent='Open the form';review.onclick=()=>act({action:'create_channel'});block.append(review);
+  } else if(block) block.remove();
+  if(!form){document.querySelector('.create-channel-modal')?.remove();createDraft=null;return}
+  const communityId=state?.community?.id||'';
+  // The panel is rebuilt only when the session's form state or community
+  // changes: a rebuild between keystrokes would take the caret with it.
+  if(createDraft&&createDraft.community===communityId&&createDraft.state===form.state&&document.querySelector('.create-channel-modal'))return;
+  createDraft={community:communityId,state:form.state,name:form.name,type:form.type,visibility:form.visibility,description:form.description};
+  buildCreateModal(form,communityId);
+}
+document.addEventListener('keydown',event=>{if(event.key==='Escape'&&document.querySelector('.create-channel-modal')){event.preventDefault();act({action:'create_channel_close'})}});
+document.addEventListener('input',event=>{if(event.target?.id==='composer')mentionInput(event.target)});setInterval(()=>{renderWebExtras();renderCreateExtras()},100);
+function renderMentionBlock(){const composer=document.querySelector('.composer');if(!composer)return;let block=composer.querySelector('.mention-block');if(!state?.mention_block){if(block)block.remove();return}if(!block){block=document.createElement('div');block.className='mention-block notice';composer.prepend(block)}block.replaceChildren();const title=document.createElement('strong');title.textContent=state.mention_block.kind+': '+state.mention_block.summary;block.append(title);const detail=document.createElement('div');detail.textContent=(state.mention_block.details||[]).join(' ');block.append(detail);const retry=document.createElement('button');retry.textContent='Edit and retry';retry.onclick=()=>document.querySelector('#composer')?.focus();block.append(retry)}
+setInterval(renderMentionBlock,100);
+const webExtraStyle=document.createElement('style');webExtraStyle.textContent='.mention-popover{position:relative;z-index:5;background:var(--panel);border:1px solid var(--line);padding:6px;max-height:280px;overflow:auto}.mention-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left}.mention-row.selected{border-color:var(--accent)}.mention-avatar{width:28px;height:28px;border-radius:50%;background:var(--panel2);display:inline-flex;align-items:center;justify-content:center;font-size:12px}.mention-avatar img{width:100%;height:100%;border-radius:50%}.create-channel-modal{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center}.create-channel-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}.create-channel-panel{position:relative;z-index:1;background:var(--panel);border:1px solid var(--line);padding:14px;display:flex;flex-direction:column;gap:8px;min-width:320px;max-width:min(560px,92vw);max-height:88vh;overflow:auto}.create-channel-panel label{display:flex;flex-direction:column;gap:4px;font-size:12px}.create-channel-actions{display:flex;gap:6px;justify-content:flex-end}.create-channel-panel input,.create-channel-panel select,.create-channel-panel textarea{min-height:32px}.create-unsettled{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:30;background:var(--panel);border:1px solid var(--line);padding:10px 12px;display:flex;flex-direction:column;gap:6px;max-width:min(560px,92vw)}';document.head.append(webExtraStyle);
 </script></body></html>"##;
 
 struct WebState {
@@ -84,6 +146,10 @@ struct ActionRequest {
     channel: Option<String>,
     event: Option<String>,
     content: Option<String>,
+    cursor: Option<usize>,
+    delta: Option<i64>,
+    /// The row a pointer selected in the mention popover.
+    index: Option<i64>,
     query: Option<String>,
     filter: Option<String>,
     author: Option<String>,
@@ -92,6 +158,14 @@ struct ActionRequest {
     community: Option<String>,
     visible: Option<bool>,
     latest: Option<String>,
+    /// The create form's submitted fields. The browser owns its inputs and
+    /// hands the whole form over in one request, so a tab never depends on
+    /// what another tab typed.
+    name: Option<String>,
+    #[serde(rename = "type")]
+    channel_type: Option<String>,
+    visibility: Option<String>,
+    description: Option<String>,
 }
 
 #[derive(Debug)]
@@ -218,11 +292,12 @@ pub async fn run(resolved: Resolved) -> i32 {
                                 profile["active"] = json!(active);
                             }
                         }
+                        let mut outgoing = guard.app.take_outbox();
                         for view in guard.views.values_mut() {
                             view.apply(event.clone(), now);
-                            let _ = view.take_outbox();
+                            outgoing.extend(view.take_outbox());
                         }
-                        guard.app.take_outbox()
+                        outgoing
                     };
                     send_commands(&event_commands, outgoing).await;
                 }
@@ -437,8 +512,14 @@ async fn serve_connection(
                     }
                 };
                 match action(&state, &session, body).await {
-                    Ok(view) => {
-                        let body = json!({"ok": true, "view": view}).to_string();
+                    Ok(reply) => {
+                        let body = json!({
+                            "ok": true,
+                            "view": reply.view,
+                            "composer_text": reply.composer_text,
+                            "composer_cursor": reply.composer_cursor,
+                        })
+                        .to_string();
                         let _ =
                             response(&mut stream, 200, "application/json", body.as_bytes(), &[])
                                 .await;
@@ -553,12 +634,23 @@ async fn authenticated(request: &Request, state: &Arc<Mutex<WebState>>) -> bool 
     !guard.stopped && guard.sessions.contains(&session)
 }
 
+/// One action's answer: the surface the tab should draw, and the composer the
+/// session now holds. A picker insertion changes the draft, and the browser
+/// owns its own text box, so the text comes back with the answer instead of
+/// being re-derived from a projection the tab has not read yet.
+#[derive(Debug)]
+struct ActionReply {
+    view: &'static str,
+    composer_text: String,
+    composer_cursor: usize,
+}
+
 async fn action(
     state: &Arc<Mutex<WebState>>,
     session: &str,
     request: ActionRequest,
-) -> Result<&'static str, String> {
-    let (commands, view, sender) = {
+) -> Result<ActionReply, String> {
+    let (commands, reply, sender) = {
         let mut guard = state.lock().await;
         if guard.stopped {
             return Err("Session stopped".to_owned());
@@ -566,6 +658,8 @@ async fn action(
         if !ensure_view(&mut guard, session) {
             return Err("session expired".to_owned());
         }
+        let any_write_pending =
+            guard.app.web_write_pending() || guard.views.values().any(App::web_write_pending);
         let app = guard
             .views
             .get_mut(session)
@@ -574,7 +668,7 @@ async fn action(
         let mut switch = None;
         match request.action.as_str() {
             "community" => {
-                if app.web_write_pending() {
+                if any_write_pending {
                     return Err(
                         "a pending or uncertain write blocks community switching".to_owned()
                     );
@@ -587,6 +681,49 @@ async fn action(
                     config::resolve(None, None, None, Some(id)).map_err(|error| error.message)?;
                 switch = Some(SessionCommand::SwitchCommunity(resolved));
                 app.status = format!("switching to {id}");
+            }
+            "mention" => {
+                app.web_mention_sync(
+                    request.content.as_deref().unwrap_or_default(),
+                    request.cursor.unwrap_or_default(),
+                );
+            }
+            "mention_move" => {
+                let delta = request.delta.unwrap_or(1);
+                app.mention_move(delta.clamp(-1, 1) as isize);
+            }
+            "mention_select" => {
+                // The pointer names the row it hit: a row-clicked selection
+                // must land on that row, not one step from the cursor.
+                if let Some(index) = request.index {
+                    app.mention_select(index.max(0) as usize);
+                }
+            }
+            "mention_confirm" => {
+                app.mention_confirm();
+            }
+            "mention_close" => app.mention_dismiss(),
+            "mention_retry" => app.retry_mention_roster(),
+            "create_channel" => app.open_create_channel(),
+            "create_channel_close" => {
+                app.close_create_channel();
+            }
+            "create_channel_refresh" => app.refresh_create_channel(),
+            "create_channel_submit" => {
+                // The submit names the profile it was composed under and the
+                // fields it shows: a tab whose community moved on is refused
+                // here instead of creating in the wrong community. A run
+                // started from a relay flag has no saved profile, and the page
+                // sends the empty id it read, so the two compare equal there.
+                if let Some(id) = request.community.as_deref()
+                    && app.community_id.as_deref().unwrap_or_default() != id
+                {
+                    return Err(
+                        "the active community changed; reopen the form and submit again".to_owned(),
+                    );
+                }
+                apply_create_fields(app, &request)?;
+                app.create_channel_submit();
             }
             "select" => {
                 let id = parse_channel(request.channel.as_deref())?;
@@ -735,15 +872,51 @@ async fn action(
             other => return Err(format!("unknown action: {other}")),
         }
         let view = view_for(app);
+        let reply = ActionReply {
+            view,
+            composer_text: app.composer.text(),
+            composer_cursor: app.composer.offset(),
+        };
         let mut commands = app.take_outbox();
         if let Some(switch) = switch {
             commands.push(switch);
         }
         let sender = guard.commands.clone();
-        (commands, view, sender)
+        (commands, reply, sender)
     };
     send_commands(&sender, commands).await;
-    Ok(view)
+    Ok(reply)
+}
+/// Apply one submit's fields onto the form the session owns. The browser
+/// reads the form back from the projection, so the values it sends are the
+/// values it showed, and the session's copy is what the preflight sees.
+fn apply_create_fields(app: &mut App, request: &ActionRequest) -> Result<(), String> {
+    let kind = match request.channel_type.as_deref() {
+        Some("stream") => Some(buzz_core::channel::ChannelType::Stream),
+        Some("forum") => Some(buzz_core::channel::ChannelType::Forum),
+        Some(raw) => return Err(format!("unsupported channel type: {raw}")),
+        None => None,
+    };
+    let visibility = match request.visibility.as_deref() {
+        Some(raw) => Some(raw.parse::<buzz_core::channel::ChannelVisibility>()?),
+        None => None,
+    };
+    let Some(form) = app.create_channel.as_mut() else {
+        return Err("no channel creation is open".to_owned());
+    };
+    if let Some(name) = request.name.as_deref() {
+        form.name = name.to_owned();
+    }
+    if let Some(kind) = kind {
+        form.kind = kind;
+    }
+    if let Some(visibility) = visibility {
+        form.visibility = visibility;
+    }
+    if let Some(description) = request.description.as_deref() {
+        form.description = description.to_owned();
+    }
+    Ok(())
 }
 
 fn focus(app: &mut App, event: Option<&str>) -> Result<(), String> {
@@ -846,6 +1019,72 @@ async fn snapshot(state: &Arc<Mutex<WebState>>, session: &str) -> Vec<u8> {
     let Some(app) = guard.views.get(session) else {
         return br#"{"error":"session expired"}"#.to_vec();
     };
+    let mention_suggestions = app.mention_picker.as_ref().map(|picker| {
+        json!({
+            "query": picker.active.query,
+            "items": app.mention_items().into_iter().map(|candidate| json!({
+                "pubkey": candidate.pubkey,
+                "label": candidate.label,
+                "picture": candidate.picture,
+                "short_key": candidate.short_key(),
+                "agent": candidate.agent,
+                "admin": candidate.admin,
+            })).collect::<Vec<_>>(),
+            "selected_index": picker.cursor,
+            "loading": app.mention_loading(),
+            "failed": app.mention_failure(),
+            // The roster belongs to one conversation under one session: the
+            // browser compares these before it draws a suggestion.
+            "community_id": app.community_id,
+            "channel_id": picker.channel,
+            "generation": guard.transport_generation,
+        })
+    });
+    let mention_block = app.mention_block.as_ref().map(|block| {
+        json!({
+            "kind": block.kind,
+            "summary": block.summary,
+            "details": block.details,
+            // The refusal's own session, not whatever the tab reads now: an
+            // old block is never relabelled as the current community's.
+            "community_id": block.community,
+            "channel_id": block.channel,
+            "generation": block.generation,
+        })
+    });
+    let create_channel = app.create_channel.as_ref().map(|form| {
+        let (state_name, failure) = match &form.state {
+            CreateState::Editing => ("editing", None),
+            CreateState::Creating => ("creating", None),
+            CreateState::Failed(reason) => ("failed", Some(reason.as_str())),
+            CreateState::Unknown(reason) => ("unknown", Some(reason.as_str())),
+        };
+        json!({
+            "name": form.name,
+            "type": form.kind.as_str(),
+            "visibility": form.visibility.as_str(),
+            "description": form.description,
+            "field": CreateChannelForm::label(form.field),
+            "state": state_name,
+            "ready": form.ready(),
+            "pending": app.create_write_pending(),
+            "failure": failure,
+        })
+    });
+    // The write that outlives the form: the page keeps offering the refresh
+    // that settles it after the modal has been dismissed.
+    let create_unsettled = app.create_unsettled.as_ref().map(|open| {
+        let state_name = match &open.state {
+            CreateState::Unknown(_) => "unknown",
+            _ => "creating",
+        };
+        json!({
+            "name": open.draft.name,
+            "type": open.draft.kind.as_str(),
+            "visibility": open.draft.visibility.as_str(),
+            "state": state_name,
+        })
+    });
     let selected = app
         .channels
         .get(app.selected)
@@ -914,20 +1153,79 @@ async fn snapshot(state: &Arc<Mutex<WebState>>, session: &str) -> Vec<u8> {
         .get(app.selected)
         .map(|entry| app.label(entry))
         .unwrap_or_else(|| "Inbox".to_owned());
-    let mut body = json!({
-        "identity": app.me, "relay": app.relay_label, "community": {"id": app.community_id, "name": app.community_name}, "communities": &guard.communities, "connection": connection(app.conn), "status": app.status,
-        "startup_error": guard.startup_error, "selected": selected, "title": title,
-        "channels": channels, "rows": rows, "focus": app.focus, "thread": thread, "thread_focus": app.thread.focus, "thread_loading": app.thread.loading, "thread_failed": app.thread.failed,
-        "context": context, "context_focus": app.context.focus, "context_loading": app.context.loading, "context_failed": app.context.failed,
-        "search": search, "search_query": app.search.query, "search_applied_query": app.search.applied_query, "search_applied_author": app.search.applied_author, "search_hidden": app.search.hidden, "search_focus": app.search.focus,
-        "search_scope": match app.search.scope { SearchScope::Current => "current".to_owned(), SearchScope::All => "all".to_owned(), SearchScope::Conversation(id) => id.to_string() },
-        "search_author": app.search.author, "search_time": match app.search.time { SearchTime::All => "all", SearchTime::Days7 => "7d", SearchTime::Days30 => "30d" },
-        "search_loading": app.search.loading, "search_failed": app.search.failed, "search_bounded": app.search.bounded, "search_previous": app.search.previous,
-        "reader": reader,
-        "agents": agents, "composer_label": composer_label(app), "composer_text": app.composer.text(),
-        "composer_mode": app.mode == Mode::Composer, "write_pending": app.web_write_pending(),
-        "surface": view_for(app),
-    });
+    let mut body = Map::new();
+    body.insert("identity".to_owned(), json!(app.me));
+    body.insert("relay".to_owned(), json!(app.relay_label));
+    body.insert("generation".to_owned(), json!(guard.transport_generation));
+    body.insert(
+        "community".to_owned(),
+        json!({"id": app.community_id, "name": app.community_name}),
+    );
+    body.insert("communities".to_owned(), json!(&guard.communities));
+    body.insert("connection".to_owned(), json!(connection(app.conn)));
+    body.insert("status".to_owned(), json!(app.status));
+    body.insert("startup_error".to_owned(), json!(guard.startup_error));
+    body.insert("selected".to_owned(), json!(selected));
+    body.insert("title".to_owned(), json!(title));
+    body.insert("channels".to_owned(), json!(channels));
+    body.insert("rows".to_owned(), json!(rows));
+    body.insert("focus".to_owned(), json!(app.focus));
+    body.insert("thread".to_owned(), json!(thread));
+    body.insert("thread_focus".to_owned(), json!(app.thread.focus));
+    body.insert("thread_loading".to_owned(), json!(app.thread.loading));
+    body.insert("thread_failed".to_owned(), json!(app.thread.failed));
+    body.insert("context".to_owned(), json!(context));
+    body.insert("context_focus".to_owned(), json!(app.context.focus));
+    body.insert("context_loading".to_owned(), json!(app.context.loading));
+    body.insert("context_failed".to_owned(), json!(app.context.failed));
+    body.insert("search".to_owned(), json!(search));
+    body.insert("search_query".to_owned(), json!(app.search.query));
+    body.insert("search_focus".to_owned(), json!(app.search.focus));
+    body.insert(
+        "search_applied_query".to_owned(),
+        json!(app.search.applied_query),
+    );
+    body.insert(
+        "search_applied_author".to_owned(),
+        json!(app.search.applied_author),
+    );
+    body.insert("search_hidden".to_owned(), json!(app.search.hidden));
+    body.insert(
+        "search_scope".to_owned(),
+        json!(match app.search.scope {
+            SearchScope::Current => "current".to_owned(),
+            SearchScope::All => "all".to_owned(),
+            SearchScope::Conversation(id) => id.to_string(),
+        }),
+    );
+    body.insert("search_author".to_owned(), json!(app.search.author));
+    body.insert(
+        "search_time".to_owned(),
+        json!(match app.search.time {
+            SearchTime::All => "all",
+            SearchTime::Days7 => "7d",
+            SearchTime::Days30 => "30d",
+        }),
+    );
+    body.insert("search_loading".to_owned(), json!(app.search.loading));
+    body.insert("search_failed".to_owned(), json!(app.search.failed));
+    body.insert("search_bounded".to_owned(), json!(app.search.bounded));
+    body.insert("search_previous".to_owned(), json!(app.search.previous));
+    body.insert("reader".to_owned(), json!(reader));
+    body.insert("agents".to_owned(), json!(agents));
+    body.insert("composer_label".to_owned(), json!(composer_label(app)));
+    body.insert("composer_text".to_owned(), json!(app.composer.text()));
+    body.insert(
+        "composer_mode".to_owned(),
+        json!(app.mode == Mode::Composer),
+    );
+    body.insert("write_pending".to_owned(), json!(app.web_write_pending()));
+    body.insert("mention_suggestions".to_owned(), json!(mention_suggestions));
+    body.insert("mention_block".to_owned(), json!(mention_block));
+    body.insert("create_channel".to_owned(), json!(create_channel));
+    body.insert("create_unsettled".to_owned(), json!(create_unsettled));
+    body.insert("surface".to_owned(), json!(view_for(app)));
+    let mut body = Value::Object(body);
     body["filter"] = json!(app.filter.name());
     body["filter_empty"] = json!(app.empty_view());
     serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())
@@ -1145,5 +1443,86 @@ mod tests {
         let value = row_json(&row, "me");
         assert_eq!(value["body"], "<img src=x onerror=alert(1)>");
         assert_eq!(value["author"], "<script>alert(1)</script>");
+    }
+    #[test]
+    fn mention_and_channel_actions_parse_their_payloads() {
+        let request: ActionRequest =
+            serde_json::from_str(r#"{"action":"mention","content":"@Zoë","cursor":5}"#)
+                .expect("mention request");
+        assert_eq!(request.action, "mention");
+        assert_eq!(request.cursor, Some(5));
+        let request: ActionRequest = serde_json::from_str(
+            r#"{"action":"create_channel_submit","community":"work","name":"项目讨论","type":"forum","visibility":"private","description":"可选说明"}"#,
+        )
+        .expect("channel submit request");
+        assert_eq!(request.community.as_deref(), Some("work"));
+        assert_eq!(request.name.as_deref(), Some("项目讨论"));
+        assert_eq!(request.channel_type.as_deref(), Some("forum"));
+        assert_eq!(request.visibility.as_deref(), Some("private"));
+        assert_eq!(request.description.as_deref(), Some("可选说明"));
+    }
+
+    fn web_state() -> Arc<Mutex<WebState>> {
+        let (commands, receiver) = mpsc::channel(8);
+        drop(receiver);
+        Arc::new(Mutex::new(WebState {
+            app: App::new(&nostr::Keys::generate(), "http://relay.test"),
+            views: HashMap::new(),
+            commands,
+            run_token: "token".to_owned(),
+            sessions: HashSet::from(["tab".to_owned()]),
+            stopped: false,
+            startup_error: None,
+            communities: Vec::new(),
+            active_community_id: None,
+            transport_generation: 0,
+        }))
+    }
+
+    /// The page names the community it read from the snapshot, and a run
+    /// started from a relay flag has no saved profile: the empty id must not
+    /// read as "the tab moved on" and refuse the submit.
+    #[tokio::test]
+    async fn a_submit_without_a_saved_profile_is_not_a_community_change() {
+        let state = web_state();
+        let open: ActionRequest =
+            serde_json::from_str(r#"{"action":"create_channel"}"#).expect("open request");
+        action(&state, "tab:1", open).await.expect("the form opens");
+        let request: ActionRequest = serde_json::from_str(
+            r#"{"action":"create_channel_submit","community":"","name":"项目讨论","type":"stream","visibility":"open","description":""}"#,
+        )
+        .expect("channel submit request");
+        action(&state, "tab:1", request)
+            .await
+            .expect("a submit that names the active profile is not a community change");
+        let guard = state.lock().await;
+        let form = guard
+            .views
+            .get("tab:1")
+            .and_then(|view| view.create_channel.as_ref())
+            .expect("the form stays open while its write is in flight");
+        assert_eq!(form.name, "项目讨论");
+        assert_eq!(form.state, CreateState::Creating);
+    }
+
+    /// A tab that composed under another profile is still refused.
+    #[tokio::test]
+    async fn a_submit_naming_another_profile_is_refused() {
+        let state = web_state();
+        {
+            let mut guard = state.lock().await;
+            guard.app.open_create_channel();
+        }
+        let request: ActionRequest = serde_json::from_str(
+            r#"{"action":"create_channel_submit","community":"work","name":"work notes","type":"stream","visibility":"open","description":""}"#,
+        )
+        .expect("channel submit request");
+        let refusal = action(&state, "tab:1", request)
+            .await
+            .expect_err("a submit from another profile is refused");
+        assert_eq!(
+            refusal,
+            "the active community changed; reopen the form and submit again"
+        );
     }
 }

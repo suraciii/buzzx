@@ -13,7 +13,7 @@ use crate::client::{Client, WriteOutcome, event_id};
 use crate::config::Resolved;
 use crate::content;
 use crate::failure::{Category, Failure};
-use crate::mentions;
+
 use crate::sub::{self, SubControl};
 
 /// How many history events one open fetches.
@@ -236,12 +236,26 @@ pub enum ChatEvent {
     Status(String),
     /// A send the relay never saw: the draft's mention text did not resolve to
     /// current members, or the membership read failed. Nothing was published.
-    /// `summary` is the status line; `details` are the exact references the
-    /// scrollable help surface shows.
+    /// The block carries its own kind, summary and correction details.
     MentionBlocked {
         local: String,
-        summary: String,
-        details: Vec<String>,
+        channel: Uuid,
+        block: crate::mentions::Block,
+    },
+    /// The candidate identities of one conversation, read for the composer's
+    /// `@` picker. `request` is the token the picker asked with, so a late
+    /// answer for a superseded query is dropped rather than shown.
+    MentionCandidates {
+        channel: Uuid,
+        request: u64,
+        result: Result<Vec<crate::mentions::Candidate>, String>,
+    },
+    /// The answer to a channel-creation request. `draft` is what the form
+    /// submitted, so the result can name the channel it describes.
+    ChannelCreated {
+        request: u64,
+        draft: crate::client::ChannelDraft,
+        outcome: crate::client::CreateOutcome,
     },
     WriteOk {
         local: String,
@@ -325,6 +339,19 @@ pub enum SessionCommand {
         /// `(root, parent)` thread context, both full hex ids.
         thread: Option<(String, String)>,
         local: String,
+        /// The identities the composer inserted from the picker, draft-local.
+        /// The preflight still resolves the text itself.
+        bindings: Vec<crate::mentions::Binding>,
+    },
+    /// Read one conversation's candidate identities for the `@` picker.
+    MentionCandidates {
+        channel: Uuid,
+        request: u64,
+    },
+    /// Create a channel in the active community.
+    CreateChannel {
+        draft: crate::client::ChannelDraft,
+        request: u64,
     },
     Edit {
         channel: Uuid,
@@ -605,29 +632,19 @@ async fn run_command_pump(
                 content,
                 thread,
                 local,
+                bindings,
             } => {
-                // A draft with no mention input is sent without reading the
-                // roster; one that names someone is resolved against the
-                // current membership first, and a draft that cannot be
-                // resolved is not published at all.
-                let planned = if mentions::needs_lookup(&content) {
-                    match client.mention_directory(channel).await {
-                        Ok(directory) => mentions::plan(&content, &directory),
-                        Err(failure) => Err(mentions::Block::LookupFailed {
-                            reason: failure.detail,
-                        }),
-                    }
-                } else {
-                    Ok(Vec::new())
-                };
-                let recipients = match planned {
+                // The CLI and this pump share one preflight: a draft that
+                // names someone is resolved against the current membership,
+                // and a draft that cannot be resolved is not published at all.
+                let recipients = match client.plan_mentions(channel, &content, &bindings).await {
                     Ok(recipients) => recipients,
                     Err(block) => {
                         let _ = events
                             .send(ChatEvent::MentionBlocked {
                                 local,
-                                summary: block.summary(),
-                                details: block.details(),
+                                channel,
+                                block,
                             })
                             .await;
                         continue;
@@ -642,6 +659,31 @@ async fn run_command_pump(
                     Err(failure) => failure.into(),
                 };
                 report(outcome, local, &events).await;
+            }
+            SessionCommand::MentionCandidates { channel, request } => {
+                // The picker's own read: a failed directory stays visible as a
+                // failure, never as an empty member list.
+                let result = match client.mention_directory(channel).await {
+                    Ok(directory) => Ok(directory.candidates()),
+                    Err(failure) => Err(failure.detail),
+                };
+                let _ = events
+                    .send(ChatEvent::MentionCandidates {
+                        channel,
+                        request,
+                        result,
+                    })
+                    .await;
+            }
+            SessionCommand::CreateChannel { draft, request } => {
+                let outcome = client.create_channel(&draft).await;
+                let _ = events
+                    .send(ChatEvent::ChannelCreated {
+                        request,
+                        draft,
+                        outcome,
+                    })
+                    .await;
             }
             SessionCommand::Edit {
                 channel,
