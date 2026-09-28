@@ -471,7 +471,7 @@ impl ChannelEntry {
 impl Filter {
     /// Whether one conversation belongs in this view. An unknown conversation
     /// is never counted as unread: the view says it is unknown instead.
-    fn matches(self, entry: &ChannelEntry) -> bool {
+    pub(crate) fn matches(self, entry: &ChannelEntry) -> bool {
         match self {
             Filter::All => true,
             Filter::Unread => entry.read.has_unread(),
