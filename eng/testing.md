@@ -65,6 +65,21 @@ A fake holds state, asserts nothing, and returns what the test asks for in the
 order the test asks. A test reads like a session. A mock that asserts a call is
 a test of the call, not the behavior.
 
+## No test reaches a real relay
+
+A test in this repository never sends a real message. It runs against the fake
+relay the test process starts on `127.0.0.1`, or against no relay at all, and
+every spawn pins the environment: `BUZZ_RELAY_URL` names the fake or an
+unreachable loopback address, `BUZZX_CONFIG` names a path that does not exist,
+and `BUZZ_PRIVATE_KEY` and `BUZZ_AUTH_TAG` are removed. A spawn that inherited
+an operator's shell would otherwise write into the community the operator is
+working in, with the operator's identity.
+
+The live-relay run stays a manual step. It is how a change to the session, the
+transport, or the render contract is accepted, and it is never a `cargo test`
+target, a Justfile recipe, or a CI job; [ci.md](ci.md) lists what CI does not
+run.
+
 ## Determinism
 
 A test with the same inputs always produces the same result. Do not rely on
