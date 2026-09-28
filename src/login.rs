@@ -1,17 +1,17 @@
 //! `buzzx login`: identity onboarding. The contract is docs/configuration.md:
-//! the key comes from a flag, a 0600 file, stdin, the environment, or an
+//! the key comes from a flag, a user-only file, stdin, the environment, or an
 //! interactive wizard; the identity is verified against the relay before the
 //! config file is replaced atomically. A secret never reaches stdout, stderr,
 //! logs, or an error message.
 
 use std::io::{self, BufRead, IsTerminal, Read, Write as _};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use buzz_ws_client::{NostrWsConnection, WsClientError};
 use nostr::Keys;
 
 use crate::config::{self, ConfigFile, StartupError};
+use crate::platform;
 
 /// How long the hidden reader waits for further input before deciding the
 /// paste is over and the leftover bytes can be discarded.
@@ -85,10 +85,10 @@ pub fn validate_key(raw: &str) -> Result<Keys, StartupError> {
 }
 
 /// Read the key from a file the current user alone may read. The permission
-/// check comes first: a group-readable key file is refused before its bytes
-/// are touched, and before any network call.
+/// check comes first: a key file another user can read is refused before its
+/// bytes are touched, and before any network call. What "may read" means is
+/// the platform's answer, not this function's.
 pub fn read_key_file(path: &Path) -> Result<String, StartupError> {
-    use std::os::unix::fs::PermissionsExt;
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(_) => {
@@ -104,12 +104,7 @@ pub fn read_key_file(path: &Path) -> Result<String, StartupError> {
             path.display()
         )));
     }
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(StartupError::auth(format!(
-            "key file {} is readable by other users; run chmod 600 on it",
-            path.display()
-        )));
-    }
+    platform::check_secret(path, "key file").map_err(StartupError::auth)?;
     std::fs::read_to_string(path)
         .map_err(|e| StartupError::usage(format!("cannot read key file {}: {e}", path.display())))
 }
@@ -331,12 +326,11 @@ fn login(cli: LoginCli) -> Result<i32, StartupError> {
     verify_online(&http_url, &keys, auth_tag.as_deref())?;
 
     config::replace_at(&path, &http_url, key_text.trim(), auth_tag.as_deref())?;
-    let mode = std::fs::metadata(&path)
-        .map(|m| m.permissions())
-        .map(|p| format!("{:o}", p.mode() & 0o777))
-        .unwrap_or_else(|_| "600".to_owned());
     println!("identity verified: {short}");
-    println!("saved to {} ({mode})", path.display());
+    match crate::platform::mode_note(&path) {
+        Some(mode) => println!("saved to {} ({mode})", path.display()),
+        None => println!("saved to {}", path.display()),
+    }
     println!("next: buzzx tui");
     Ok(0)
 }
@@ -418,7 +412,6 @@ mod tests {
     use super::*;
     use nostr::nips::nip19::ToBech32;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     fn fixed_key() -> String {
         let secret = nostr::SecretKey::from_slice(&[7u8; 32]).expect("a fixed test key");
@@ -460,18 +453,19 @@ mod tests {
     }
 
     #[test]
-    fn key_file_requires_owner_only_permissions_before_reading() {
+    fn key_file_reads_a_file_the_platform_reports_as_the_users_alone() {
         let dir = temp_dir("file");
         let path = dir.join("work.nsec");
         fs::write(&path, fixed_key()).expect("write");
+        crate::platform::restrict_file(&path).expect("restrict");
 
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
         assert_eq!(read_key_file(&path).unwrap(), fixed_key());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
-        let err = read_key_file(&path).unwrap_err();
-        assert_eq!(err.code, crate::config::EXIT_AUTH);
-        assert!(err.message.contains("chmod 600"), "{err}");
+    #[test]
+    fn key_file_names_a_missing_file_and_a_directory_before_reading() {
+        let dir = temp_dir("missing");
 
         let err = read_key_file(&dir.join("missing.nsec")).unwrap_err();
         assert_eq!(err.code, crate::config::EXIT_USAGE);
@@ -483,6 +477,23 @@ mod tests {
             crate::config::EXIT_USAGE,
             "a directory is not a key file"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_file_refuses_a_file_another_user_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("shared");
+        let path = dir.join("work.nsec");
+        fs::write(&path, fixed_key()).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
+
+        let err = read_key_file(&path).unwrap_err();
+        assert_eq!(err.code, crate::config::EXIT_AUTH);
+        assert!(err.message.contains("chmod 600"), "{err}");
+        assert!(!err.message.contains(&fixed_key()), "leaks the key: {err}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -540,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_writes_tight_permissions_and_replaces_existing() {
+    fn replace_writes_a_user_only_file_and_replaces_existing() {
         let dir = temp_dir("replace");
         let path = dir.join("config.toml");
         let other = Keys::generate().secret_key().to_secret_hex();
@@ -549,9 +560,9 @@ mod tests {
             crate::config::replace_at(&path, "https://relay.example/", &fixed_key(), None)
                 .expect("first write");
         assert_eq!(written, path);
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
+        assert!(
+            crate::platform::check_secret(&path, "config").is_ok(),
+            "a config this tool wrote is not readable by other users"
         );
 
         crate::config::replace_at(&path, "http://other.example", &other, None).expect("replace");
@@ -567,8 +578,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn replace_failure_leaves_the_old_file_intact() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = temp_dir("fail");
         let path = dir.join("config.toml");
         fs::write(&path, "relay_url = \"http://old\"\n").expect("old config");
