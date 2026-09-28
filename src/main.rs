@@ -14,6 +14,7 @@ mod keys;
 mod layout;
 mod login;
 mod mentions;
+mod platform;
 mod read_state;
 mod session;
 mod sub;
@@ -89,7 +90,8 @@ enum Command {
     /// config file. Interactive when no key source is given.
     Login {
         /// Read the key from this file. The file must be readable by the
-        /// current user alone (0600).
+        /// current user alone: mode 0600 on Unix, and inside the user profile
+        /// on Windows.
         #[arg(long)]
         private_key_file: Option<PathBuf>,
         /// Read the key from stdin. Hidden when stdin is a terminal.
@@ -425,7 +427,8 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             let show_cursor = app.mode == app::Mode::Composer
                 && layout != layout::LayoutMode::TooSmall
                 && !app.help
-                && app.picker.is_none()
+                && app.switcher.is_none()
+                && app.palette.is_none()
                 && !app.agents.open;
             if show_cursor {
                 terminal.show_cursor().map_err(|e| e.to_string())?;

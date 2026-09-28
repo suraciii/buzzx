@@ -26,7 +26,7 @@ This follows the [product contract](../core.md).
 ## Scope and authority
 
 Implement this visual language across the channel/DM timeline, focused thread,
-composer, Inbox picker, Agent list/detail and help. All pages use the same
+composer, conversation switcher, Agent list/detail and help. All pages use the same
 styles, spacing and selection rules. Do not stop at the main channel screen.
 
 This document owns visual appearance and density. [The manual](tui-use.md)
@@ -50,17 +50,27 @@ permanent column. The current [keys and behavior](tui-use.md) remain authoritati
 
 | Surface | Context | Main content | Action destination |
 | --- | --- | --- | --- |
-| Channel or DM | Conversation name | Continuous timeline, sidebar in wide mode | New message or explicit reply/edit target |
+| Channel or DM | Conversation name and Inbox answer | Continuous full-width timeline | New message or explicit reply/edit target |
 | Thread | Conversation / Thread | Root and replies in one timeline | Explicit root, reply or edit target |
-| Inbox picker | Inbox / active filter | Channels and DMs with one selection | Selected conversation |
+| Conversation switcher | Switch conversation / active filter | Channels and DMs with one selection | Selected conversation |
 | My agents | My agents | Names and observed states | Selected Agent's details |
 | Agent detail | My agents / name | State, evidence age, accessible contexts | Selected accessible channel |
 | Help | Help / current context | Full labels, reasons and available keys | Return to previous view |
 
-The channel sidebar is the embedded Inbox list. Opening the picker enlarges
-that same list, not a separate product. Agent detail uses the same selection
-row for accessible contexts. Unavailable contexts remain plain, non-actionable
-text. These views do not gain search fields, tabs or management buttons.
+The timeline header keeps the conversation name on the left and the connection
+and Inbox answer on the right. With two or more saved community profiles it
+prefixes the active community as `community / conversation`, so switching
+relays is never a guess; with one profile the prefix would only repeat a name
+the config file already carries. The prefix yields before the conversation
+name does.
+
+The conversation switcher is the Inbox list at every width: it is an overlay
+over the timeline, never a permanent column, so the timeline keeps the whole
+terminal at 80 columns and up. Agent detail uses the same selection row for
+accessible contexts. Unavailable contexts remain plain, non-actionable text.
+These views do not gain search fields, tabs or management buttons, and the
+switcher's filter tabs are the one tab row the product has: they mirror
+`All`, `Unread` and `For you` rather than introducing a second filter set.
 
 ## Visual grammar
 
@@ -77,10 +87,11 @@ Three meanings use different treatments. They may coexist without merging:
   Their treatment survives selection and does not tint the message body.
 
 An Inbox, Agent or context list has one filled selected row and a leading `>`
-when it is the active picker. The embedded sidebar uses its existing number
-slot; reverse video supplies a non-color selection cue. In the timeline a
-message is never a full-width inverse block or a filled card. Focus moves
-without changing its line count or padding.
+when it is the active overlay. The switcher's rows keep the existing number
+and signal slots, and the active filter tab uses the same reverse video, so
+the selection reads without color. In the timeline a message is never a
+full-width inverse block or a filled card. Focus moves without changing its
+line count or padding.
 
 While composing, the target describes where the draft will go. It is not
 inferred from the author nearest the bottom of the timeline. A reply target
@@ -102,11 +113,13 @@ messages; compact timelines use no extra separator row. Lists may have one
 intervening blank row in roomy mode, but do not inherit timeline separators.
 Existing newlines in message content are content and are not removed.
 
-The channel sidebar stays 22 cells wide. Content starts with a two-cell focus
-gutter and one additional cell after the sidebar; an overlay uses a two-cell
-outer inset plus its focus gutter. At widths below 40, reduce outer padding
-before reducing body width. At 24 columns, padding can be zero. At 24x6,
-composition uses exactly the six rows illustrated in the density studies.
+The timeline starts at the left edge of the terminal: there is no sidebar
+column to inset it by. A message's focus gutter is two cells, and its body
+follows one cell later; the header, hint and status lines use the full width.
+An overlay draws a one-cell border and its own two-cell focus gutter. At
+widths below 40, reduce outer padding before reducing body width. At 24
+columns, padding can be zero. At 24x6, composition uses exactly the six rows
+illustrated in the density studies.
 
 A compact composer uses one target row immediately followed by one input row.
 A roomy composer uses one target row, one blank row and two input rows. Keep
@@ -132,7 +145,8 @@ when a message is focused, mentioned, pending or uncertain.
 
 - **Roomy timeline:** replace the single gap between adjacent messages with
   one rule row. Start at the body left edge and end at the content right inset;
-  do not cross the focus gutter or sidebar. The rule follows the entire message,
+  do not cross the focus gutter. The timeline holds the full terminal width,
+  so that inset is the terminal's own edge minus one cell. The rule follows the entire message,
   including attachment and reaction lines, and precedes the next author. Do not
   add another gap above or below it, or a rule before the first/after the last
   message in the loaded sequence.
@@ -166,7 +180,7 @@ item. This keeps boundaries consistent with the type of content.
 ## Region budgets
 
 Reserve from the bottom before laying out the timeline. Every supported view
-has a one-row context header, one keys row and one state row. In minimal mode
+
 the state word can replace a redundant mode word. The remaining rows are
 content; reading mode has no reserved empty composer.
 
@@ -178,14 +192,15 @@ content; reading mode has no reserved empty composer.
 
 The channel typing line may take one additional row only when at least one
 context row remains. Otherwise omit that decorative activity line for the
-frame, retaining its existing state and sidebar signal. A thread never labels
+frame, retaining its existing state and its signal in the switcher row. A thread never labels
 channel typing as thread activity. Full errors must not replace the target or
 input; expose the short reason in the state row and full detail through help.
 
 At 24x6, composing is exactly: header, context, target, input, keys, state.
-At that size, reading has three content rows. At 80x12 a channel still keeps
-its 22-cell sidebar; at 79x12 the existing one-column navigation applies. A
-thread and overlays remain full-screen at both widths. Below the supported
+At that size, reading has three content rows. At 80x12 and up the channel
+keeps the full width, as it does at 79x12 and below: the conversation list is
+an overlay at every size, so no width spends columns on a permanent sidebar. A
+thread and overlays remain full-screen at every width. Below the supported
 minimum, show the existing size message and preserve state for the next resize.
 
 ## Palette and terminal defaults

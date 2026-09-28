@@ -18,10 +18,15 @@ confirmed on the mobile client.
 
 ## Decision
 
-`buzzx login` ships with three key inputs - flag, 0600 file, stdin - plus
+`buzzx login` ships with three key inputs - flag, user-only file, stdin - plus
 the environment and an interactive wizard. The wizard lists the scan entry
 and answers it honestly: scan login is not available, because no mobile
 remote-signing protocol is confirmed. No pairing transport is improvised.
+
+What "user-only" means is the platform's answer, and
+[decision 0007](0007-windows-secret-protection.md) records it: mode 0600 on
+Unix, the user profile ACL on Windows. See
+[file permissions](../../docs/configuration.md#file-permissions).
 
 Concretely:
 

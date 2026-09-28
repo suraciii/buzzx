@@ -67,6 +67,7 @@ against a fake relay in `tests/cli.rs` and against the live relay by hand.
 |---|---|---|
 | `main.rs` | Raw mode, alternate screen, the loop that polls input and drains events | Hold relay state or decide behavior |
 | `config.rs` | Identity, relay URL, and auth-tag resolution; the config file | Open a connection or sign |
+| `platform.rs` | File protection as the running platform provides it: the create mode for a secret file, the restriction calls, and the verdict on a path another user may be able to read | Read the file, or choose an exit code |
 | `app.rs` | Conversations, rows, composer, filters, unread tracking, read frontiers, selection, and quit | Sign, send, parse frames, or draw |
 | `ui.rs` | Layout and rendering of the Inbox, timeline, picker, and help | Mutate `app.rs` state or call the network |
 | `keys.rs` | `KeyEvent` to `Action` | Read terminal state |

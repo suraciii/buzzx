@@ -49,8 +49,8 @@ Web entries define the required browser equivalent.
 | Capability and behavior owner | TUI entry | Web entry |
 | --- | --- | --- |
 | [Configured identity and one active relay](configuration.md#community-profiles) | `buzzx tui` | `buzzx web`, session identity header |
-| [Community context and profile switching](configuration.md#selection) | Community line beside the channel; `C` picker to switch saved profiles | Community selector in the Inbox sidebar or app bar |
-| [Find a listed conversation](tui-context.md#c1-find-a-conversation) | `/` in picker | Find conversation field beside Inbox filters |
+| [Community context and profile switching](configuration.md#selection) | Community line beside the channel when more than one profile is saved; `C` picker to switch saved profiles | Community selector in the Inbox sidebar or app bar |
+| [Find a listed conversation](tui-context.md#c1-find-a-conversation) | `c` switcher, then type to filter | Find conversation field beside Inbox filters |
 | [Message search, scope, author and time](tui-context.md#c2-search-messages) | `/`; Ctrl+f from composer | Search messages button and filter form |
 | [Exact result context](tui-context.md#c3-open-the-result-in-context) | Enter on hit | Open result at its event |
 | [Older/newer history and latest](tui-context.md#c4-read-earlier-and-later-history) | Boundary navigation, `[`/`]` in context, `G` | Load older/newer and Jump to latest |

@@ -24,6 +24,9 @@ an implementation must preserve.
 - [decisions/0006-read-state.md](decisions/0006-read-state.md) records why
   read state uses per-client encrypted slots and what that choice leaves
   unknown or local.
+- [decisions/0007-windows-secret-protection.md](decisions/0007-windows-secret-protection.md)
+  is what protects the config file on Windows, where mode bits do not exist,
+  and what the tool says when it cannot promise that protection.
 
 The product contract, which states why `buzzx` exists, lives in
 [../core.md](../core.md). The term definitions live in

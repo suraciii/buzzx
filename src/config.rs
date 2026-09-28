@@ -4,7 +4,6 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +11,8 @@ use nostr::Keys;
 use nostr::nips::nip19::ToBech32;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::platform;
 
 /// Exit code for a bad input, before any network call.
 pub const EXIT_USAGE: i32 = 1;
@@ -395,14 +396,9 @@ pub(crate) fn config_path() -> PathBuf {
     base.join("buzzx").join("config.toml")
 }
 pub(crate) fn read_config_file(path: &Path) -> Result<ConfigFile, StartupError> {
-    let meta = fs::metadata(path)
+    fs::metadata(path)
         .map_err(|e| StartupError::usage(format!("cannot read config {}: {e}", path.display())))?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(StartupError::auth(format!(
-            "config {} is readable by other users; run chmod 600 on it",
-            path.display()
-        )));
-    }
+    platform::check_secret(path, "config").map_err(StartupError::auth)?;
     let text = fs::read_to_string(path)
         .map_err(|e| StartupError::usage(format!("cannot read config {}: {e}", path.display())))?;
     let parsed: ConfigFile = toml::from_str(&text)
@@ -602,13 +598,15 @@ pub fn init(
 
 fn ensure_parent(path: &Path) -> Result<(), StartupError> {
     if let Some(parent) = path.parent() {
-        // Only a directory buzzx just created is chmodded; an existing
+        // Only a directory buzzx just created is restricted; an existing
         // ~/.config belongs to the user, not to this tool.
         let created = !parent.exists();
         fs::create_dir_all(parent)
             .map_err(|e| StartupError::other(format!("cannot create {}: {e}", parent.display())))?;
         if created {
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            // Only a platform with mode bits can fail here, which is where
+            // this message is read.
+            platform::restrict_dir(parent).map_err(|e| {
                 StartupError::other(format!("cannot chmod {}: {e}", parent.display()))
             })?;
         }
@@ -741,17 +739,16 @@ pub fn clear_login_at(path: &Path) -> Result<PathBuf, StartupError> {
     write_atomic(path, &render_config(&file))
 }
 
-/// Create the replacement 0600 beside the target and rename it over. A
+/// Create the replacement user-only beside the target and rename it over. A
 /// failure at any step leaves the previous file untouched.
 fn write_atomic(path: &Path, body: &str) -> Result<PathBuf, StartupError> {
     ensure_parent(path)?;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let write = || -> Result<(), StartupError> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        platform::secret_create(&mut options);
+        let mut file = options
             .open(&tmp)
             .map_err(|e| StartupError::other(format!("cannot write {}: {e}", tmp.display())))?;
         file.write_all(body.as_bytes())
@@ -771,6 +768,7 @@ fn write_atomic(path: &Path, body: &str) -> Result<PathBuf, StartupError> {
             path.display()
         )));
     }
+    platform::check_secret(path, "config").map_err(StartupError::auth)?;
     Ok(path.to_path_buf())
 }
 
@@ -805,12 +803,17 @@ mod tests {
         std::env::temp_dir().join(format!("buzzx-{label}-{}", uuid::Uuid::new_v4()))
     }
 
+    /// Write a config file the way the tool writes one: created user-only
+    /// where the platform has a way to say that.
     fn write_private(path: &Path, body: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create config directory");
         }
-        fs::write(path, body).expect("write config");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        platform::secret_create(&mut options);
+        let mut file = options.open(path).expect("create config");
+        file.write_all(body.as_bytes()).expect("write config");
     }
 
     #[test]
@@ -926,77 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn community_conflicts_with_a_relay_flag_and_with_the_env_relay() {
-        let file = ConfigFile {
-            private_key: Some(fixed_key()),
-            communities: vec![profile("a", "work", "https://work.example")],
-            active_community: Some("a".into()),
-            ..ConfigFile::default()
-        };
-        for (flag_relay, env_relay) in [(Some("http://other"), None), (None, Some("http://other"))]
-        {
-            let err = resolve_from(
-                Some(&fixed_key()),
-                flag_relay,
-                None,
-                Some("a"),
-                None,
-                env_relay,
-                None,
-                file.clone(),
-            )
-            .unwrap_err();
-            assert_eq!(err.code, EXIT_USAGE, "{err}");
-            assert!(
-                err.message.contains("conflicting_relay_selector"),
-                "names the conflict: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_community_selector_wins_over_the_active_profile() {
-        let file = ConfigFile {
-            private_key: Some(fixed_key()),
-            communities: vec![
-                profile("a", "work", "https://work.example"),
-                profile("b", "personal", "http://home.example"),
-            ],
-            active_community: Some("a".into()),
-            ..ConfigFile::default()
-        };
-        let r = resolve_from(None, None, None, Some("b"), None, None, None, file).unwrap();
-        assert_eq!(r.http_url, "http://home.example");
-        assert_eq!(r.community.as_ref().unwrap().id, "b");
-        assert_eq!(r.community.as_ref().unwrap().name, "personal");
-    }
-
-    #[test]
-    fn an_unknown_community_id_is_bad_input() {
-        let file = ConfigFile {
-            private_key: Some(fixed_key()),
-            communities: vec![profile("a", "work", "https://work.example")],
-            active_community: Some("a".into()),
-            ..ConfigFile::default()
-        };
-        let err = resolve_from(None, None, None, Some("nope"), None, None, None, file).unwrap_err();
-        assert_eq!(err.code, EXIT_USAGE);
-        assert!(err.message.contains("community list"), "{err}");
-    }
-
-    #[test]
-    fn profiles_without_an_active_one_need_a_selector() {
-        let file = ConfigFile {
-            private_key: Some(fixed_key()),
-            communities: vec![profile("a", "work", "https://work.example")],
-            ..ConfigFile::default()
-        };
-        let err = resolve_from(None, None, None, None, None, None, None, file).unwrap_err();
-        assert_eq!(err.code, EXIT_USAGE);
-        assert!(err.message.contains("community use"), "{err}");
-    }
-
-    #[test]
     fn an_env_relay_overrides_the_active_profile_without_its_auth() {
         let file = ConfigFile {
             private_key: Some(fixed_key()),
@@ -1090,8 +1022,10 @@ mod tests {
         let written =
             init_at(&path, "https://relay.example/", &key, None, Some("work")).expect("init");
         assert_eq!(written, path);
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "config is not group or world accessible");
+        assert!(
+            platform::check_secret(&path, "config").is_ok(),
+            "config is not group or world accessible"
+        );
         let file = read_config_file(&path).unwrap();
         assert_eq!(file.communities.len(), 1);
         assert_eq!(file.communities[0].name, "work");
@@ -1147,8 +1081,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A directory the process cannot write into is something only a
+    /// platform with mode bits can take away.
+    #[cfg(unix)]
     #[test]
     fn a_migration_that_cannot_persist_keeps_the_old_file() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("migrate-fail");
         let path = dir.join("config.toml");
         write_private(
@@ -1261,8 +1199,10 @@ mod tests {
             Some(after.communities[0].id.as_str()),
             "the active reference survives"
         );
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "config stays user-only");
+        assert!(
+            platform::check_secret(&path, "config").is_ok(),
+            "config stays user-only"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

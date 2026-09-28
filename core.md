@@ -52,11 +52,14 @@ operating a relay.
 
 `buzzx tui` opens a session with three regions:
 
-1. A channel list on the left. It shows the channels the identity belongs to.
-2. A timeline on the right. It shows the messages of the selected channel.
+1. A conversation navigation layer: the full-screen conversation switcher
+   (opened with `c`, listed by the `Ctrl+P` palette). It shows the channels and
+   direct conversations the identity belongs to.
+2. A timeline. It shows the messages of the selected conversation, and it
+   takes the full terminal width at every size: there is no permanent sidebar.
 3. A composer at the bottom. It sends, replies, reacts, edits, and deletes.
 
-The channel list groups channels and direct conversations and carries a
+The navigation layer groups channels and direct conversations and carries a
 lightweight Inbox view. Unread is computed from a read marker (kind 30078)
 plus events observed while a conversation is not selected. If either lookup
 is incomplete, the client shows an unknown/checking state rather than claiming
@@ -140,7 +143,7 @@ These terms have one meaning across all documents.
 The first phase is the terminal user's path, end to end:
 
 1. The identity resolves, and the relay is reachable.
-2. The channel list fills from the identity's membership.
+2. The navigation layer fills from the identity's membership.
 3. A channel opens and shows its history.
 4. A message sends, and it appears in the timeline.
 5. A reply, a reaction, an edit, and a delete each work on the identity's own

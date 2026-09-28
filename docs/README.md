@@ -5,6 +5,9 @@ works with it.
 
 - [interactive.md](interactive.md) owns the shared TUI/Web capability catalog
   and synchronized acceptance, including find-and-resume and complete reading.
+- [installation.md](installation.md) is the install guide: the artifact for
+  each platform, the checksums, the warnings an unsigned binary raises, and
+  the first run.
 - [tui.md](tui.md) is the TUI capability: its layout modes, its unified keys,
   and the criteria it must satisfy.
 - [tui-use.md](tui-use.md) is the TUI manual: the keys, the modes, and the

@@ -26,7 +26,8 @@ comes later.
 The identity is one Nostr keypair. It resolves in this order:
 
 1. `BUZZ_PRIVATE_KEY`, then `--private-key`.
-2. `~/.config/buzzx/config.toml`.
+2. the config file, whose location and protection are in
+   [configuration.md](../docs/configuration.md#config-file).
 
 The key is hex or `nsec`. `buzzx` fails at startup when neither source has a
 key. It never prompts, because a prompt blocks the TUI's raw-mode loop and has
