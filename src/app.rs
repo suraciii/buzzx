@@ -947,6 +947,12 @@ pub struct App {
     /// The focused row of the selected channel. It is also the scroll
     /// position: the viewport keeps the focused row visible.
     pub focus: usize,
+    /// True while the cursor is on the newest loaded row because the row the
+    /// reader left is gone. The rows that arrive with the next load must put
+    /// the reader on the newest message, not on the row a stale list happened
+    /// to end with, so the focus is not read as a chosen row until the reader
+    /// moves it.
+    newest_fallback: bool,
     pub mode: Mode,
     pub help: bool,
     /// How far the help text is scrolled: at the minimum size the text is
@@ -1055,6 +1061,7 @@ impl App {
             switcher_editing: false,
             switcher: None,
             palette: None,
+            newest_fallback: false,
             roster_complete: false,
             inbox_failed: HashSet::new(),
             history_failed: HashSet::new(),
@@ -1365,6 +1372,8 @@ impl App {
     fn set_focus(&mut self, index: usize) {
         let len = self.selected_rows().len();
         self.focus = len.saturating_sub(1).min(index);
+        // A move is a choice: the cursor is on a row the reader picked.
+        self.newest_fallback = false;
         // Focus is the scroll position, so landing on the newest row is what
         // presenting the latest message means.
         self.note_presented();
@@ -2414,23 +2423,29 @@ impl App {
     /// A typed query is a question, and a conversation that does not match it
     /// is not an answer: the cursor stays where it was, but the list shows the
     /// matches only, and an empty list means no match.
+    /// How well one conversation answers the open query: 0 for an exact
+    /// name, 1 for a prefix of it, 2 for a name that merely contains it. The
+    /// list sorts by this inside a section, and the cursor picks the best
+    /// answer across both sections.
+    fn switcher_rank(&self, id: Uuid) -> u8 {
+        let query = self.switcher_query.trim().to_lowercase();
+        let label = self
+            .entry(id)
+            .map(|entry| self.label(entry).to_lowercase())
+            .unwrap_or_default();
+        if label == query {
+            0
+        } else if label.starts_with(&query) {
+            1
+        } else {
+            2
+        }
+    }
+
     pub fn switcher_view(&self) -> Sections {
         let mut view = self.view().clone();
         let query = self.switcher_query.trim().to_lowercase();
         if !query.is_empty() {
-            let rank = |id: Uuid| {
-                let label = self
-                    .entry(id)
-                    .map(|entry| self.label(entry).to_lowercase())
-                    .unwrap_or_default();
-                if label == query {
-                    0
-                } else if label.starts_with(&query) {
-                    1
-                } else {
-                    2
-                }
-            };
             view.channels.retain(|id| {
                 self.entry(*id)
                     .is_some_and(|entry| self.label(entry).to_lowercase().contains(&query))
@@ -2439,8 +2454,8 @@ impl App {
                 self.entry(*id)
                     .is_some_and(|entry| self.label(entry).to_lowercase().contains(&query))
             });
-            view.channels.sort_by_key(|id| rank(*id));
-            view.dms.sort_by_key(|id| rank(*id));
+            view.channels.sort_by_key(|id| self.switcher_rank(*id));
+            view.dms.sort_by_key(|id| self.switcher_rank(*id));
             return view;
         }
         let Some(switcher) = &self.switcher else {
@@ -2552,10 +2567,12 @@ impl App {
 
     /// The Inbox as the header states it in one segment: whether anything
     /// waits outside the open conversation, and how much of that is known.
-    /// The count is what the switcher rows count, never a guess.
+    /// The count is what the switcher rows count, never a guess. The open
+    /// conversation is left out: its unread is on the timeline itself, and the
+    /// header answers for everything else. An empty roster the relay called
+    /// complete is an answer like any other, not an unknown.
     pub fn inbox_summary(&self) -> String {
-        if self.channels.is_empty()
-            || !self.marker_read
+        if !self.marker_read
             || !self.roster_complete
             || self
                 .channels
@@ -2564,20 +2581,20 @@ impl App {
         {
             return "Inbox ?".to_owned();
         }
-        let mentions: usize = self
-            .channels
-            .iter()
-            .filter(|entry| entry.read.mentioned())
-            .map(|entry| entry.read.unread.len())
+        let elsewhere = || {
+            self.channels
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| *at != self.selected)
+        };
+        let mentions: usize = elsewhere()
+            .filter(|(_, entry)| entry.read.mentioned())
+            .map(|(_, entry)| entry.read.unread.len())
             .sum();
         if mentions > 0 {
             return format!("Inbox @ {mentions}");
         }
-        let unread: usize = self
-            .channels
-            .iter()
-            .map(|entry| entry.read.unread.len())
-            .sum();
+        let unread: usize = elsewhere().map(|(_, entry)| entry.read.unread.len()).sum();
         if unread > 0 {
             return format!("Inbox ● {unread}");
         }
@@ -2601,8 +2618,15 @@ impl App {
             return "Checking failed";
         }
         if self.channels.is_empty() {
-            // Nothing to read is not the same answer as everything read.
-            return "No conversations";
+            // Nothing to read is not the same answer as everything read, and
+            // neither is a listing that never reported itself complete: the
+            // footer carries the reason, and the empty row does not claim a
+            // roster the relay did not answer for.
+            return if self.roster_complete {
+                "No conversations"
+            } else {
+                "Checking..."
+            };
         }
         match self.filter {
             Filter::All => "No conversations",
@@ -2999,6 +3023,9 @@ impl App {
             });
             self.focus = restored
                 .unwrap_or_else(|| focus.min(self.channels[index].rows.len().saturating_sub(1)));
+            // The reader is back on the row they left, whether or not it is
+            // still there: this is a position, not a fallback.
+            self.newest_fallback = false;
             saved_message_missing = focused.is_some() && restored.is_none();
         } else {
             self.draft_blocked = !self.composer.text().is_empty();
@@ -3030,6 +3057,7 @@ impl App {
         self.switcher = None;
         self.switcher_editing = false;
         self.agents.open = false;
+        self.palette = None;
         // The search surface owns the keys while it is open; the composer
         // mode it was opened from is restored by the origin on Esc.
         self.mode = Mode::Navigation;
@@ -3490,6 +3518,9 @@ impl App {
                                 .position(|row| row.event_id == reader.event_id)
                         })
                         .unwrap_or_else(|| focus.min(selected.rows.len().saturating_sub(1)));
+                    // The reader left the reader on a row of this
+                    // conversation, so the position is theirs again.
+                    self.newest_fallback = false;
                 }
             }
             ReaderOrigin::Thread { focus, .. } => {
@@ -5607,13 +5638,42 @@ impl App {
         self.settle_switcher_cursor(&view);
     }
 
-    /// Typing a name is aiming at a conversation: when the row the cursor is
-    /// on is not among the matches, the first match takes it. A query that
-    /// matches nothing leaves the cursor where it was - the list is empty, not
-    /// the choice - so the editor keeps its text and the cursor its meaning.
+    /// Typing a name is aiming at a conversation. Every keystroke puts the
+    /// cursor on the best answer to the query - exact, then prefix, then
+    /// substring, in either section - so a name typed in full and one `Enter`
+    /// open it, whatever row the cursor started on. A query that matches
+    /// nothing leaves the cursor where it was: the list is empty, not the
+    /// choice, so the editor keeps its text and the cursor its meaning.
     fn settle_on_query(&mut self) {
         let view = self.switcher_view();
-        self.settle_switcher_cursor(&view);
+        if self.switcher_query.trim().is_empty() {
+            self.settle_switcher_cursor(&view);
+            return;
+        }
+        let Some(switcher) = self.switcher.clone() else {
+            return;
+        };
+        // Each section is sorted by rank, so its head is its best match, and
+        // the better of the two heads is the best match overall.
+        let best = view
+            .channels
+            .first()
+            .into_iter()
+            .chain(view.dms.first())
+            .min_by_key(|id| self.switcher_rank(**id))
+            .copied();
+        let Some(best) = best else {
+            return;
+        };
+        if best == switcher.cursor {
+            return;
+        }
+        let at = self
+            .view()
+            .all()
+            .position(|id| id == best)
+            .unwrap_or(switcher.at);
+        self.switcher = Some(Switcher { cursor: best, at });
     }
 
     fn settle_switcher_cursor(&mut self, view: &Sections) {
@@ -5623,7 +5683,18 @@ impl App {
         if view.contains(switcher.cursor) {
             return;
         }
-        let Some(first) = view.all().next() else {
+        // The best answer to the query, not the first row of the list: each
+        // section is sorted by rank, so the two heads are the candidates, and
+        // an exact name in the DMs wins over a longer channel name that only
+        // contains the query.
+        let Some(first) = view
+            .channels
+            .first()
+            .into_iter()
+            .chain(view.dms.first())
+            .min_by_key(|id| self.switcher_rank(**id))
+            .copied()
+        else {
             return;
         };
         let at = self
@@ -5780,7 +5851,9 @@ impl App {
 
     /// Land a freshly loaded conversation where its reader left it. A row the
     /// reload no longer carries - deleted, or outside the loaded window -
-    /// falls back to the newest message: a return never guesses another row.
+    /// falls back to the newest message: a return never guesses another row,
+    /// and the newest means the newest the next load carries, not the last row
+    /// of whatever stale list was on screen when the conversation was picked.
     fn restore_position(&mut self) {
         let saved = self
             .channels
@@ -5793,7 +5866,10 @@ impl App {
         });
         match target {
             Some(index) => self.set_focus(index),
-            None => self.set_focus(usize::MAX),
+            None => {
+                self.set_focus(usize::MAX);
+                self.newest_fallback = true;
+            }
         }
     }
 
@@ -5819,8 +5895,13 @@ impl App {
 
     /// The row the reader is on in the conversation, when there is one: an
     /// empty list has a cursor, not a row, and a reload on top of it lands on
-    /// the end instead of keeping index zero.
+    /// the end instead of keeping index zero. A cursor that only follows the
+    /// newest message after a missing saved row is not a row either: the load
+    /// that follows must land on its own newest message.
     fn focused_row_id(&self, channel: Uuid) -> Option<String> {
+        if self.newest_fallback {
+            return None;
+        }
         self.selected_entry()
             .filter(|entry| entry.id == channel)
             .and_then(|entry| entry.rows.get(self.focus))
@@ -6818,6 +6899,50 @@ mod tests {
     }
 
     #[test]
+    fn the_switcher_cursor_takes_the_best_match_in_either_section() {
+        let mut app = app();
+        app.apply(
+            ChatEvent::Channels(roster(vec![channel_info(1), channel_info(2)])),
+            0,
+        );
+        app.channels[0].name = "planning".to_owned();
+        app.channels[1].name = "Plan".to_owned();
+        app.channels[1].kind = ChannelKind::Dm;
+        app.stub_roster();
+        let plan = app.channels[1].id;
+        app.handle(Action::ToggleSwitcher, 0);
+        for character in "plan".chars() {
+            app.handle(Action::SwitcherInput(character), 0);
+        }
+        assert_eq!(app.switcher_query, "plan");
+        assert_eq!(
+            picked(&app),
+            Some(plan),
+            "the exact name in the DMs wins over the channel that merely contains it"
+        );
+        app.handle(Action::SwitcherConfirm, 0);
+        assert_eq!(app.channels[app.selected].id, plan);
+        // The section order still breaks a tie: a prefix match in the DM
+        // section keeps the cursor when the channel name only contains the
+        // query.
+        app.handle(Action::ToggleSwitcher, 0);
+        app.switcher_query.clear();
+        app.switcher_editing = false;
+        app.channels[0].name = "planning".to_owned();
+        app.channels[1].name = "planet".to_owned();
+        app.stub_roster();
+        app.handle(Action::SwitcherInput('p'), 0);
+        for character in "plann".chars() {
+            app.handle(Action::SwitcherInput(character), 0);
+        }
+        assert_eq!(
+            picked(&app),
+            Some(app.channels[0].id),
+            "an equal rank keeps section order"
+        );
+    }
+
+    #[test]
     fn the_switcher_ranks_exact_prefix_then_substring_matches() {
         let mut app = app();
         app.apply(
@@ -7044,6 +7169,130 @@ mod tests {
         app.take_outbox();
         app.handle(Action::ThreadRetry, 52);
         assert!(take_commands(&mut app).is_empty());
+    }
+
+    /// One unread candidate on a conversation whose read state is fully known.
+    fn unread(entry: &mut ChannelEntry, id: &str, mention: bool) {
+        entry.read.known = true;
+        entry.read.coverage = Coverage::Complete;
+        entry.read.marked = true;
+        entry
+            .read
+            .unread
+            .insert(id.to_owned(), Candidate { at: 1, mention });
+    }
+
+    #[test]
+    fn a_return_whose_saved_row_is_gone_lands_on_the_newest_after_the_load() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        let id = channel(1).id;
+        let author = keys();
+        let first = message_event(&author, id, "first", 10);
+        let second = message_event(&author, id, "second", 20);
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![first.clone(), second.clone()],
+            },
+            30,
+        );
+        app.set_focus(1);
+        app.save_position();
+        assert_eq!(app.channels[0].saved_row, Some(second.id.to_hex()));
+        // The row the reader left is gone by the time they come back: the
+        // loaded list still ends on an older row, and the return must not
+        // mistake that row for a position the reader chose.
+        app.channels[0].saved_row = Some("d".repeat(64));
+        app.restore_position();
+        assert_eq!(app.focus, 1, "the stale list ends on its own last row");
+        let third = message_event(&author, id, "third", 40);
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![first, second, third.clone()],
+            },
+            50,
+        );
+        assert_eq!(app.focus, 2, "the reload lands on the newest message");
+        assert!(
+            app.focused_row_id(id).is_none(),
+            "following the newest is not a row the reader chose"
+        );
+        // Once the reader moves, the reload keeps the row they chose.
+        app.set_focus(0);
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![third],
+            },
+            60,
+        );
+        assert_eq!(app.focus, 0);
+    }
+
+    #[test]
+    fn the_header_counts_unread_outside_the_open_conversation() {
+        let mut app = app();
+        app.apply(
+            ChatEvent::Channels(roster(vec![channel_info(1), channel_info(2)])),
+            0,
+        );
+        app.marker_read = true;
+        app.selected = 0;
+        unread(&mut app.channels[0], "a", false);
+        unread(&mut app.channels[1], "b", true);
+        assert_eq!(app.inbox_summary(), "Inbox @ 1");
+        app.selected = 1;
+        assert_eq!(
+            app.inbox_summary(),
+            "Inbox ● 1",
+            "the open conversation's own unread is on the timeline, not in the header"
+        );
+        app.channels[0].read.unread.clear();
+        assert_eq!(
+            app.inbox_summary(),
+            "Inbox read",
+            "and the conversation that is open never counts itself"
+        );
+        app.selected = 0;
+        assert_eq!(
+            app.inbox_summary(),
+            "Inbox @ 1",
+            "what waits outside the new open conversation still counts"
+        );
+    }
+
+    #[test]
+    fn the_header_reads_a_complete_empty_roster_as_read_and_a_missing_one_as_unknown() {
+        let mut app = app();
+        app.marker_read = true;
+        app.apply(ChatEvent::Channels(roster(vec![])), 0);
+        assert_eq!(app.inbox_summary(), "Inbox read");
+        app.apply(
+            ChatEvent::Channels(Roster {
+                items: vec![],
+                complete: false,
+            }),
+            0,
+        );
+        assert_eq!(app.inbox_summary(), "Inbox ?");
+    }
+
+    #[test]
+    fn an_empty_list_is_only_no_conversations_once_the_roster_answered() {
+        let mut app = app();
+        app.marker_read = true;
+        app.apply(
+            ChatEvent::Channels(Roster {
+                items: vec![],
+                complete: false,
+            }),
+            0,
+        );
+        assert_eq!(app.empty_view(), "Checking...");
+        app.apply(ChatEvent::Channels(roster(vec![])), 0);
+        assert_eq!(app.empty_view(), "No conversations");
     }
 
     #[test]

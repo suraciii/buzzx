@@ -136,14 +136,21 @@ merges each context by its maximum. (Sources: `src/read_state.rs::slot`,
 `builder`, `parse`; `src/client.rs::read_state`, `publish_read_state`.)
 
 A failed marker lookup or unreadable slot is unknown, not read. Failed or
-truncated catch-up is also unknown; the list can show `?` or `Checking...`
-frontier stays advanced and the list shows `Read here; not synced (<reason>)`.
-This note remains until a later publish succeeds. The session keeps working
-and does not retry the failed publish automatically; a later read advance can
-issue a new publish. If the failed read was not stored, a later session can
-show those messages as unread again. (Sources: `src/app.rs::apply_read_state`,
-`apply_catch_up`, `inbox_footer`; `src/session.rs::load_read_state`,
-`publish_read`, `run_command_pump`.)
+truncated catch-up is also unknown, and the list says `?` or `Checking...`
+rather than an empty answer. A roster the relay never reported complete is
+unknown the same way: an empty list it did not vouch for is not
+`No conversations`, and the footer says the listing may be missing rows. The
+header counts what waits outside the conversation that is open; it answers
+`Inbox ?` while any of those conversations is unknown, and an empty roster the
+relay called complete reads as `Inbox read`.
+A failed publish leaves the frontier advanced and the list shows `Read here;
+not synced (<reason>)`. This note remains until a later publish succeeds. The
+session keeps working and does not retry the failed publish automatically; a
+later read advance can issue a new publish. If the failed read was not stored,
+a later session can show those messages as unread again. (Sources:
+`src/app.rs::apply_read_state`, `apply_catch_up`, `empty_view`, `inbox_summary`,
+`inbox_footer`; `src/session.rs::load_read_state`, `publish_read`,
+`run_command_pump`.)
 
 
 ## Keys
@@ -195,11 +202,13 @@ j/k move  type to filter  enter open  esc back  ? help
 - `j`/`k` or the arrows move the cursor; `Enter` opens the conversation the
   cursor is on and closes the list.
 - Typing filters by name against the labels the list shows. Matches rank
-  exact, then prefix, then substring, and keep their section and roster order
-  inside each rank. The cursor follows the matches: when the row it was on is
-  not among them, the first match takes it, so typing a name and pressing
-  `Enter` opens it. A query that matches nothing says `No match`, opens
-  nothing, and leaves the cursor where it was.
+  exact, then prefix, then substring; equal ranks keep section order (Channels
+  before DMs) and then roster order. The list keeps its sections, while every
+  keystroke puts the cursor on the best match in either of them: an exact name
+  wins over a longer name that merely contains the query, so typing a name in
+  full and pressing `Enter` opens it. A cleared query leaves the cursor where
+  it is, and a query that matches nothing says `No match`, opens nothing, and
+  keeps the cursor too.
 - `Backspace` edits the query; `/` resumes it without adding a slash; `Esc`
   cancels the query and returns the list to the applied one, and `Esc` again
   closes the list.
@@ -227,11 +236,15 @@ no state of its own.
 | Quit | `q` | Ends the session. |
 
 `j`/`k` move the cursor, `Enter` runs the highlighted command through the same
-handler its key uses, and `Esc` closes the palette without running anything.
+handler its key uses, and `Esc` closes the palette without running anything. A
+second `Ctrl+P` closes it too, and `Ctrl+F` opens search from it, the command
+the list offers.
 The palette, the switcher, the Agents overlay and help never share the screen:
-opening one closes the others. It opens only over the channel timeline; inside
-a thread, search, context, or the reader the destination is protected until
-the user returns.
+opening one closes the others. It opens only over the channel timeline itself:
+with the switcher, help or the Agents list open, `Ctrl+F` and `Ctrl+P` do
+nothing and the overlay keeps its keys; the under-minimum size message answers
+`q` alone; and inside a thread, search, context, or the reader the destination
+is protected until the user returns.
 
 ### Message search and context (M2)
 

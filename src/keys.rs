@@ -181,13 +181,20 @@ pub fn map_navigation(
     search_mode: SearchMode,
 ) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // `Ctrl+F` and `Ctrl+P` are the timeline's own: they open over the
+        // channel timeline itself and nowhere else. An open overlay keeps its
+        // own keys - help, the switcher and the Agents list are dismissed on
+        // their own terms, and the switcher's query must survive - the
+        // size message answers only `q`, and inside a thread, search, context
+        // or reader the destination is protected until the user returns.
+        // `Ctrl+P` a second time closes the palette it opened.
+        let timeline_only = surface == Surface::Channel
+            && layout != LayoutMode::TooSmall
+            && matches!(overlay, Overlay::None | Overlay::Palette);
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
-            KeyCode::Char('f') => Action::OpenSearch,
-            // The palette only opens over the channel timeline: inside a
-            // thread, search, context or reader, the destination is protected
-            // until the user returns.
-            KeyCode::Char('p') if surface == Surface::Channel => Action::TogglePalette,
+            KeyCode::Char('f') if timeline_only => Action::OpenSearch,
+            KeyCode::Char('p') if timeline_only => Action::TogglePalette,
             _ => Action::Ignored,
         };
     }
@@ -788,7 +795,74 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_opens_the_palette_in_navigation_mode_only() {
+    fn ctrl_f_opens_search_over_the_channel_timeline_only() {
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                Overlay::None,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::OpenSearch
+        );
+        // The palette's own shortcut reaches search too: it is the command
+        // the list offers, and opening search closes the palette.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                Overlay::Palette,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::OpenSearch
+        );
+        // Every other overlay keeps its keys.
+        for overlay in [
+            Overlay::Switcher,
+            Overlay::SwitcherSearch,
+            Overlay::Help,
+            Overlay::Agents,
+        ] {
+            assert_eq!(
+                map_navigation(
+                    key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                    LayoutMode::Wide,
+                    overlay,
+                    Surface::Channel,
+                    SearchMode::Results,
+                ),
+                Action::Ignored,
+                "{overlay:?}"
+            );
+        }
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                LayoutMode::TooSmall,
+                Overlay::None,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::Ignored
+        );
+        // `/` remains the search entry on the thread surface, where the
+        // destination is the thread itself.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('/'), KeyModifiers::NONE),
+                LayoutMode::Wide,
+                Overlay::None,
+                Surface::Thread,
+                SearchMode::Results,
+            ),
+            Action::OpenSearch
+        );
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_palette_over_the_channel_timeline_only() {
         for layout in [LayoutMode::Wide, LayoutMode::Narrow] {
             assert_eq!(
                 map_navigation(
@@ -802,18 +876,68 @@ mod tests {
                 "{layout:?}"
             );
         }
-        // The palette opens from an overlay too: it is the one surface that
-        // can be called from anywhere in navigation mode.
+        // A second press closes the palette it opened, like its own name says.
         assert_eq!(
             map_navigation(
                 key(KeyCode::Char('p'), KeyModifiers::CONTROL),
                 LayoutMode::Wide,
-                Overlay::Switcher,
+                Overlay::Palette,
                 Surface::Channel,
                 SearchMode::Results,
             ),
             Action::TogglePalette
         );
+        // An overlay owns its keys: the palette must not open over the
+        // switcher (its query would be destroyed), help or the Agents list.
+        for overlay in [
+            Overlay::Switcher,
+            Overlay::SwitcherSearch,
+            Overlay::Help,
+            Overlay::Agents,
+        ] {
+            assert_eq!(
+                map_navigation(
+                    key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    LayoutMode::Wide,
+                    overlay,
+                    Surface::Channel,
+                    SearchMode::Results,
+                ),
+                Action::Ignored,
+                "{overlay:?}"
+            );
+        }
+        // The size message answers `q` alone, whatever else is pressed with
+        // Ctrl.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                LayoutMode::TooSmall,
+                Overlay::None,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::Ignored
+        );
+        // A surface that carries a destination of its own keeps it.
+        for surface in [
+            Surface::Thread,
+            Surface::Search,
+            Surface::Context,
+            Surface::Reader,
+        ] {
+            assert_eq!(
+                map_navigation(
+                    key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    LayoutMode::Wide,
+                    Overlay::None,
+                    surface,
+                    SearchMode::Results,
+                ),
+                Action::Ignored,
+                "{surface:?}"
+            );
+        }
         // The composer keeps its draft: Ctrl+P is not a composer key.
         assert_eq!(
             map_composer(key(KeyCode::Char('p'), KeyModifiers::CONTROL)),

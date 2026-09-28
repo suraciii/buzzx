@@ -77,8 +77,10 @@ directory search.
 
 Rank exact, prefix and substring matches, retaining the existing stable order
 within each group. Do not reshuffle because a live message arrives. An empty
-query restores the same list, and the cursor follows the matches: when the row
-it was on is not among them, the first match takes it. Enter opens the
+query restores the same list and leaves the cursor where it is; every
+keystroke puts the cursor on the highest-ranked match in either section, so an
+exact name wins over a longer name that merely contains the query and one
+`Enter` opens the name that was typed. Enter opens the
 conversation the cursor is on, whether or not the query is still being edited;
 the query is applied live, so there is no separate submit step. Escape from
 query editing restores the previous applied query and keeps the list open;
