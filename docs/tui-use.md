@@ -570,10 +570,15 @@ active turn observed` follows only a feed the relay has answered with `EOSE`.
 
 ## Mentions when sending
 
+The implementation target for the next synchronized slice is
+[Mention suggestions and channel creation](mentions-and-channel-creation.md).
+The current baseline resolves names at send time; the target adds a draft-local
+suggestion picker while retaining the same final signed-recipient rules.
+
 A draft that names someone carries that person's identity with it. The composer
-stays plain text: resolution happens on send, and the visible message is stored
-exactly as typed. There is no candidate overlay, identity token, recipient
-panel, or extra confirmation dialog.
+stays plain text: selection inserts a readable name, while final resolution
+happens on send and the visible message is stored exactly as typed. The target
+picker is draft-local; it is not a durable identity token or recipient panel.
 
 ### Behavior
 
