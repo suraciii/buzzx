@@ -106,8 +106,14 @@ download is authorized by an event in the query.
 ## buzzx terms
 
 **buzzx**:
-Buzz's extension CLI (`buzz ext`), with a TUI and non-interactive commands.
+Buzz's extension CLI (`buzz ext`), with a TUI, a local Web surface and
+non-interactive commands.
 Its product boundary is defined in [core.md](core.md).
+
+**Web surface**:
+The browser interface to a locally running buzzx session, with the TUI's
+conversation capabilities. The two surfaces share the
+[interactive capability contract](docs/interactive.md).
 
 **core**:
 The relay operations that both the TUI and the CLI perform. One call per
@@ -117,7 +123,7 @@ core; see [design/shared-core.md](design/shared-core.md).
 
 **CLI**:
 The non-interactive way to drive `buzzx`: one command per run, one JSON value
-on stdout, and an exit code. The TUI is the interactive one. The first CLI
+on stdout, and an exit code. TUI and Web are interactive surfaces. The first CLI
 slice is [docs/browse-collab-cli.md](docs/browse-collab-cli.md).
 
 **terminal user**:
@@ -136,7 +142,7 @@ One rendered timeline entry. A row is built from one event. Kinds that overlay
 other events never produce a row of their own.
 
 **composer**:
-The text input at the bottom of the TUI. It holds the message being written,
+The text input in an interactive surface. It holds the message being written,
 the reply target, and the edit target.
 
 **reply target**:
@@ -146,9 +152,21 @@ The event that the next sent message answers. It is cleared by every send.
 The event that the next sent message replaces. It is cleared by every send.
 The reply target and the edit target are mutually exclusive.
 
+**community profile**:
+The saved local record of one community: a stable `id`, a user-chosen name,
+a normalized relay URL, an optional profile-level auth tag and local usage
+state. Storage, selection and migration live in
+[the configuration reference](docs/configuration.md).
+
+**active community**:
+The community profile a session uses when no selector names another one. A
+process keeps one active community, therefore one relay connection; it never
+aggregates communities.
+
 **session**:
-One run of `buzzx`: one identity, one relay, one WebSocket connection, and
-the state that both pumps share.
+One run of `buzzx`: one identity, at most one active relay connection, and
+the state that both pumps share. Switching the active community re-binds the
+relay connection inside the same session.
 
 **bridge**:
 The relay's HTTP surface. `buzzx` uses `POST /query` to read and
@@ -177,6 +195,6 @@ Do not use these words for a `buzzx` concept:
 ## Reader
 
 **reader**:
-A proposed full-screen view of one loaded, confirmed row's rendered text. It
+A focused view of one loaded, confirmed row's complete rendered text. It
 scrolls within that row and retains the originating conversation and event
 identity. Its behavior is specified in [complete-message reading](docs/tui-reading.md).

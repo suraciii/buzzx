@@ -1,6 +1,13 @@
 # Using `buzzx tui`
 
-`buzzx tui` opens a live terminal chat session against one Buzz relay.
+`buzzx tui` opens a live terminal chat session against one active Buzz
+community. With more than one saved profile the current community is shown
+beside the channel; `C` opens the saved-profile picker and switches the single
+active relay connection in place.
+
+The [shared interactive contract](interactive.md) maps these capabilities to
+both TUI and Web. This manual owns terminal controls; its linked functional
+rules remain shared where the catalog names them.
 
 Start it:
 
@@ -165,6 +172,9 @@ In navigation mode:
   the same filters.
 - `c` opens the conversation switcher at every layout size. The section
   below owns its keys.
+- `C` opens the saved-community selector. `j` and `k` move between saved
+  profiles, `Enter` switches the active relay, and `Esc` closes it. Add,
+  rename and remove profiles with `buzzx community`.
 - `Ctrl+P` opens the command palette.
 - `g` or `Home` focuses the oldest loaded message.
 - `G` or `End` focuses the newest message.
@@ -778,12 +788,14 @@ On missing or inaccessible root, or query failure, show an explicit error and
 keep Esc available. `t` retries a failed read only; it never retries a write.
 Late results from a closed thread must not replace the active timeline.
 
-Reuse the current bounded thread read: root plus at most 500 replies. If the
+The initial thread read is bounded: root plus at most 500 replies. If the
 reply query reaches its limit, show `Partial thread: reply limit reached`.
 Determine saturation from the raw reply query before deduplication or filtering.
-The cap is not a total reply count; do not claim complete history. Pagination,
-thread search, follow/unfollow, thread unread badges, and reply-count queries
-are deferred. If the deployment cannot provide this bounded read, report that
+The initial cap is not a total reply count or an archive boundary. Continue
+through [incremental history](tui-context.md#c4-read-earlier-and-later-history)
+and use that contract's saturation and error behavior. Thread-only search,
+follow/unfollow, thread unread badges, and reply-count queries remain deferred.
+If the deployment cannot provide the initial bounded read, report that
 as an implementation blocker rather than silently using channel cache only.
 
 Display only messages from the selected conversation belonging to this root.

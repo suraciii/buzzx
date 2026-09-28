@@ -6,6 +6,11 @@ This expands the accepted complete-message reading direction into one coherent
 TUI release. Its baseline is merged commit 88595b9. The reader remains a
 component specified in [tui-reading.md](tui-reading.md).
 
+The six modules are shared TUI/Web capabilities under
+[interactive.md](interactive.md). Their functional rules and limits apply to
+both; the keys and cell budgets here specify TUI presentation. Browser entry
+points and return controls are in [web.md](web.md#search-inspect-and-resume).
+
 ## Outcome
 
 A terminal user returns to a busy workspace, finds an earlier decision with

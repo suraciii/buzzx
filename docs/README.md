@@ -3,6 +3,8 @@
 Product documentation. It states what the product must satisfy and how a user
 works with it.
 
+- [interactive.md](interactive.md) owns the shared TUI/Web capability catalog
+  and synchronized acceptance, including find-and-resume and complete reading.
 - [installation.md](installation.md) is the install guide: the artifact for
   each platform, the checksums, the warnings an unsigned binary raises, and
   the first run.
@@ -17,6 +19,8 @@ works with it.
   revision and what it provides.
 - [browse-collab-cli.md](browse-collab-cli.md) specifies the first `buzz ext`
   browse-and-collaborate flow for terminal users and agents.
+- [web.md](web.md) specifies the proposed local browser surface, its TUI
+  equivalent controls, interaction flows and acceptance. It is not implemented.
 
 The design documents, which state the boundaries and the contracts to
 preserve, live in [../design/](../design/). The product contract, which states
@@ -30,12 +34,12 @@ recipient-correctness rule for the composer: a complete `@member name` in a new
 message or reply becomes a signed recipient, and a draft that cannot be resolved
 is not published.
 
-The [Focused thread reading](tui-use.md#focused-thread-reading) section documents the implemented thread navigation: open one discussion, reply, and return to the channel.
-It is a product capability, not a planned slice.
+[Focused thread reading](tui-use.md#focused-thread-reading) opens one
+discussion, replies, and returns to the channel. See its status in the manual.
 
 [tui-visual.md](tui-visual.md) is the approved implementation spec for the shared TUI
 visual language, with message separators, region budgets and acceptance checks.
-Its atlas shows intended appearance; the change is not yet implemented.
+Its status section separates implementation evidence from the intended atlas.
 
 [Complete-message reading](tui-reading.md) documents the implemented full-screen reader for a
 loaded row whose content exceeds the timeline, with line scrolling and return

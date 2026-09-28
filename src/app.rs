@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::agents;
 use crate::client::{CatchUp, ChannelInfo, ChannelKind, HistoryDirection, Roster};
+use crate::config;
 use crate::content::{self, Row};
 use crate::keys::{self, Action, PAGE_ROWS};
 use crate::session::{ChatEvent, HistorySurface, SessionCommand};
@@ -373,6 +374,15 @@ pub struct Switcher {
     pub at: usize,
 }
 
+/// A saved community available to the TUI selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommunityChoice {
+    pub id: String,
+    pub name: String,
+    pub relay_url: String,
+    pub last_channel: Option<Uuid>,
+}
+
 /// A filter's order: sections decide where a row is shown, and first-seen order
 /// decides where it sits within one. New qualifying conversations append to
 /// their section, so a new message never reorders the rows already there.
@@ -554,7 +564,7 @@ pub enum Context {
 
 /// The Agents overlay: the owned roster, the observed work behind it, and the
 /// cursor. The state outlives the overlay, so reopening it is instant.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentView {
     pub roster: agents::Load,
     pub work: agents::Work,
@@ -887,6 +897,7 @@ impl Default for SearchView {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ContextView {
     pub open: bool,
     pub channel: Uuid,
@@ -929,6 +940,7 @@ impl ContextView {
     }
 }
 
+#[derive(Debug, Clone)]
 struct SearchJourney {
     channel: Uuid,
     focused: Option<String>,
@@ -939,9 +951,15 @@ struct SearchJourney {
     composing: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct App {
     pub me: String,
+    /// Saved-profile identity shown beside every channel context.
+    pub community_id: Option<String>,
+    pub community_name: String,
     pub relay_label: String,
+    pub communities: Vec<CommunityChoice>,
+    community_last_channels: HashMap<String, Uuid>,
     pub channels: Vec<ChannelEntry>,
     pub selected: usize,
     /// The focused row of the selected channel. It is also the scroll
@@ -962,9 +980,6 @@ pub struct App {
     pub filter: Filter,
     /// The order each filtered view shows conversations in.
     views: HashMap<Filter, Sections>,
-    /// The conversations the numeric shortcuts point at, in the order they
-    /// were first assigned. A slot is never reused: a number keeps its
-    /// conversation for the session, whatever a filter hides.
     shortcuts: Vec<Uuid>,
     /// The channel switcher's local name query. It never changes Inbox state.
     pub switcher_query: String,
@@ -976,6 +991,8 @@ pub struct App {
     /// The command palette's cursor while it is open: an index into
     /// [`Command::ALL`]. Every layout opens it with `Ctrl+P`.
     pub palette: Option<usize>,
+    /// The saved-community selector's focused profile index. `C` opens it.
+    pub community_picker: Option<usize>,
     /// Whether the relay described every roster row. False means the list is a
     /// floor, not the whole answer.
     pub roster_complete: bool,
@@ -1004,6 +1021,7 @@ pub struct App {
     pub conn: ConnState,
     pub status: String,
     pub composer: Composer,
+    community_drafts: HashMap<String, Composer>,
     /// The owned Agents and what the observer feed says about their work.
     pub agents: AgentView,
     /// Search and context are inspection surfaces; the normal timeline stays
@@ -1039,6 +1057,8 @@ pub struct App {
     my_reaction: HashMap<(String, String), String>,
     pending: HashMap<String, PendingOp>,
     opened_once: bool,
+    community_switching: bool,
+    transport_generation: u64,
     outbox: Vec<SessionCommand>,
 }
 
@@ -1046,7 +1066,11 @@ impl App {
     pub fn new(keys: &Keys, relay_label: &str) -> Self {
         Self {
             me: keys.public_key().to_hex(),
+            community_id: None,
+            community_name: "default".to_owned(),
             relay_label: relay_label.to_owned(),
+            communities: Vec::new(),
+            community_last_channels: HashMap::new(),
             channels: Vec::new(),
             selected: 0,
             focus: 0,
@@ -1062,6 +1086,7 @@ impl App {
             switcher: None,
             palette: None,
             newest_fallback: false,
+            community_picker: None,
             roster_complete: false,
             inbox_failed: HashSet::new(),
             history_failed: HashSet::new(),
@@ -1073,6 +1098,7 @@ impl App {
             conn: ConnState::Connecting,
             status: "connecting".to_owned(),
             composer: Composer::new(),
+            community_drafts: HashMap::new(),
             agents: AgentView::default(),
             search: SearchView::default(),
             context: ContextView::default(),
@@ -1095,16 +1121,91 @@ impl App {
             my_reaction: HashMap::new(),
             pending: HashMap::new(),
             opened_once: false,
+            community_switching: false,
+            transport_generation: 0,
             outbox: Vec::new(),
         }
+    }
+
+    /// Set the local community context without changing relay state.
+    pub fn set_community(&mut self, id: Option<&str>, name: Option<&str>) {
+        self.community_id = id.map(str::to_owned);
+        self.community_name = name.unwrap_or("default").to_owned();
+    }
+
+    pub fn set_communities(&mut self, communities: Vec<CommunityChoice>) {
+        self.community_last_channels = communities
+            .iter()
+            .filter_map(|community| {
+                community
+                    .last_channel
+                    .map(|channel| (community.id.clone(), channel))
+            })
+            .collect();
+        self.communities = communities;
+        self.community_picker = None;
     }
 
     pub fn take_outbox(&mut self) -> Vec<SessionCommand> {
         std::mem::take(&mut self.outbox)
     }
+    /// Select a conversation by its stable identity for the browser surface.
+    /// The same switch path as the picker preserves draft and pending-write
+    /// guards instead of letting a request retarget a composer directly.
+    pub fn web_select_channel(&mut self, id: Uuid) -> Result<(), String> {
+        self.refresh_views();
+        let Some(index) = self.index_of(id) else {
+            return Err("conversation is not listed".to_owned());
+        };
+        self.switch_channel(index);
+        Ok(())
+    }
+
+    /// Fork relay knowledge into a browser view without copying another tab's
+    /// navigation, draft, or pending write state.
+    pub fn web_fork(&self) -> Self {
+        let mut view = self.clone();
+        view.mode = Mode::Navigation;
+        view.help = false;
+        view.help_scroll = 0;
+        view.switcher_query.clear();
+        view.switcher_saved_query.clear();
+        view.switcher_editing = false;
+        view.switcher = None;
+        view.palette = None;
+        view.community_picker = None;
+        view.composer.clear();
+        view.search = SearchView::default();
+        view.context = ContextView::default();
+        view.reader = ReaderView::default();
+        view.thread = ThreadView::default();
+        view.thread_request = 0;
+        view.thread_return_context = false;
+        view.journey = None;
+        view.context_draft = false;
+        view.draft_blocked = false;
+        view.pending.clear();
+        view.outbox.clear();
+        for entry in &mut view.channels {
+            entry.draft.clear();
+            entry.rows.retain(|row| !row.pending);
+        }
+        view.selected = view.selected.min(view.channels.len().saturating_sub(1));
+        view.focus = view.channels.get(view.selected).map_or(0, |entry| {
+            view.focus.min(entry.rows.len().saturating_sub(1))
+        });
+        view
+    }
     /// Update the reader's body viewport after the current frame is laid out.
     pub fn set_reader_page_rows(&mut self, body_rows: usize) {
         self.reader_page_rows = body_rows.max(1);
+    }
+
+    /// Whether this browser view has a write whose relay outcome is not
+    /// settled yet. The browser uses this only to keep its local draft
+    /// read-only; write classification remains owned by the session.
+    pub fn web_write_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// Report one outcome to the reader. The thread view draws its own status
@@ -1121,10 +1222,11 @@ impl App {
         self.status = message;
     }
 
-    /// Which overlay is on screen, for the key map.
     pub fn overlay(&self) -> keys::Overlay {
         if self.help {
             keys::Overlay::Help
+        } else if self.community_picker.is_some() {
+            keys::Overlay::CommunityPicker
         } else if self.palette.is_some() {
             keys::Overlay::Palette
         } else if self.switcher_editing {
@@ -1449,11 +1551,76 @@ impl App {
 
     /// Apply one transport event. `now` is only used to order rows.
     pub fn apply(&mut self, event: ChatEvent, now: u64) {
+        if let ChatEvent::Generation { generation, event } = event {
+            if generation < self.transport_generation {
+                return;
+            }
+            self.transport_generation = generation;
+            self.apply(*event, now);
+            return;
+        }
         match event {
+            ChatEvent::CommunitySwitching {
+                generation,
+                id,
+                name,
+                relay_url,
+            } => {
+                self.transport_generation = generation;
+                if let Some(current) = &self.community_id {
+                    if let Some(channel) = self.selected_entry().map(|entry| entry.id) {
+                        self.community_last_channels
+                            .insert(current.clone(), channel);
+                    }
+                    self.community_drafts
+                        .insert(current.clone(), self.composer.clone());
+                }
+                self.community_id = id;
+                self.community_name = name.clone();
+                self.relay_label = relay_url;
+                self.channels.clear();
+                self.views.clear();
+                self.shortcuts.clear();
+                self.selected = 0;
+                self.focus = 0;
+                self.close_switcher();
+                self.palette = None;
+                self.community_picker = None;
+                self.typing.clear();
+                self.profiles.clear();
+                self.aux_seen.clear();
+                self.seen_aux.clear();
+                self.deleted_rows.clear();
+                self.reaction_of.clear();
+                self.my_reaction.clear();
+                self.pending.clear();
+                self.inbox_failed.clear();
+                self.history_failed.clear();
+                self.marker_complete = false;
+                self.marker_read = false;
+                self.read_failed = None;
+                self.catch_up_pending.clear();
+                self.search = SearchView::default();
+                self.context = ContextView::default();
+                self.reader = ReaderView::default();
+                self.thread = ThreadView::default();
+                self.journey = None;
+                self.composer = self
+                    .community_id
+                    .as_ref()
+                    .and_then(|id| self.community_drafts.get(id).cloned())
+                    .unwrap_or_default();
+                self.opened_once = false;
+                self.community_switching = true;
+                self.conn = ConnState::Connecting;
+                self.status = format!("switching to {name}");
+                self.agents = AgentView::default();
+                self.outbox.clear();
+            }
             ChatEvent::Connected => {
+                self.community_switching = false;
                 self.inbox_failed.clear();
                 self.conn = ConnState::Connected;
-                // The observer feed has to be established on this connection
                 // before a quiet Agent means anything: until then this client
                 // has not been told the relay is listening, and work seen on
                 // the previous connection went with it.
@@ -1489,6 +1656,7 @@ impl App {
                 }
             }
             ChatEvent::Disconnected(reason) => {
+                let switching = self.community_switching;
                 self.conn = ConnState::Reconnecting;
                 // Typing and Inbox feeds both belonged to the connection that
                 // ended. Until catch-up completes again, a quiet row is not a
@@ -1509,7 +1677,16 @@ impl App {
                     self.thread.notice = None;
                     self.thread.stale = true;
                 }
-                self.status = format!("reconnecting: {reason}");
+                if switching {
+                    self.community_picker = self.community_id.as_deref().and_then(|id| {
+                        self.communities
+                            .iter()
+                            .position(|community| community.id == id)
+                    });
+                    self.status = format!("community switch failed: {reason}");
+                } else {
+                    self.status = format!("reconnecting: {reason}");
+                }
             }
             ChatEvent::Channels(channels) => {
                 self.merge_channels(channels);
@@ -1812,6 +1989,7 @@ impl App {
             ChatEvent::WriteOk { local, event_id } => self.complete_write(local, event_id),
             ChatEvent::WriteFailed { local, reason } => self.fail_write(local, reason),
             ChatEvent::WriteUncertain { local, reason } => self.uncertain_write(local, reason),
+            ChatEvent::Generation { .. } => unreachable!("generation events are unwrapped above"),
         }
     }
 
@@ -2284,7 +2462,12 @@ impl App {
         // The selection is a conversation, not a row: the list can be rebuilt
         // under it, and a conversation that is gone hands its place to its
         // next surviving neighbor, or to the previous one at the end.
-        match selection.and_then(|id| self.index_of(id)) {
+        let preferred = selection.or_else(|| {
+            self.community_id
+                .as_ref()
+                .and_then(|id| self.community_last_channels.get(id).copied())
+        });
+        match preferred.and_then(|id| self.index_of(id)) {
             Some(found) => {
                 self.selected = found;
                 if !thread_was_open && !thread_lost {
@@ -5284,7 +5467,7 @@ impl App {
                 if self.help {
                     self.help = false;
                     self.note_presented();
-                } else if self.palette.take().is_some() {
+                } else if self.community_picker.take().is_some() || self.palette.take().is_some() {
                     self.note_presented();
                 } else if self.switcher_editing {
                     self.switcher_query = self.switcher_saved_query.clone();
@@ -5309,6 +5492,7 @@ impl App {
             }
             Action::FilterNext => self.set_filter(self.filter.next()),
             Action::ToggleAgents => self.toggle_agents(),
+            Action::ToggleCommunityPicker => self.toggle_community_picker(),
             Action::ToggleSwitcher => self.toggle_switcher(),
             Action::TogglePalette => self.toggle_palette(),
             Action::PaletteNext => self.move_palette(1),
@@ -5355,6 +5539,9 @@ impl App {
             }
             Action::SwitcherNext => self.step_switcher(1),
             Action::SwitcherPrev => self.step_switcher(-1),
+            Action::CommunityNext => self.step_community(1),
+            Action::CommunityPrev => self.step_community(-1),
+            Action::CommunityConfirm => self.confirm_community(),
             Action::Top => self.set_focus(0),
             Action::Bottom => {
                 if !self.request_newest_window(HistorySurface::Channel)
@@ -5738,6 +5925,67 @@ impl App {
         self.agents.cursor.move_by(step, len);
     }
 
+    fn toggle_community_picker(&mut self) {
+        if self.community_picker.take().is_some() {
+            self.note_presented();
+            return;
+        }
+        if self.communities.is_empty() {
+            self.note("no saved communities");
+            return;
+        }
+        self.help = false;
+        self.close_switcher();
+        self.palette = None;
+        self.agents.open = false;
+        let current = self
+            .community_id
+            .as_deref()
+            .and_then(|id| {
+                self.communities
+                    .iter()
+                    .position(|community| community.id == id)
+            })
+            .unwrap_or(0);
+        self.community_picker = Some(current);
+    }
+
+    fn step_community(&mut self, step: isize) {
+        let Some(current) = self.community_picker else {
+            return;
+        };
+        let Some(last) = self.communities.len().checked_sub(1) else {
+            return;
+        };
+        self.community_picker = Some(current.saturating_add_signed(step).min(last));
+    }
+
+    fn confirm_community(&mut self) {
+        let Some(index) = self.community_picker else {
+            return;
+        };
+        let Some(choice) = self.communities.get(index).cloned() else {
+            self.community_picker = None;
+            return;
+        };
+        if self.community_id.as_deref() == Some(choice.id.as_str()) && !self.community_switching {
+            self.community_picker = None;
+            return;
+        }
+        if self.web_write_pending() {
+            self.note("a pending or uncertain write blocks community switching");
+            return;
+        }
+        match config::resolve(None, None, None, Some(&choice.id)) {
+            Ok(resolved) => {
+                self.community_picker = None;
+                self.status = format!("switching to {}", choice.name);
+                self.outbox.push(SessionCommand::SwitchCommunity(resolved));
+            }
+            Err(error) => self.note(error.message),
+        }
+    }
+
     /// Enter inside the Agents overlay: the list opens the selected Agent's
     /// detail, and the detail opens the selected working conversation. An
     /// Agent that cannot be read, or a context this identity is not in, opens
@@ -5759,6 +6007,7 @@ impl App {
             self.help = false;
             self.agents.open = false;
             self.palette = None;
+            self.community_picker = None;
             self.switcher_query.clear();
             self.switcher_saved_query.clear();
             self.channels.get(self.selected).map(|entry| {
@@ -5788,10 +6037,8 @@ impl App {
         }
         self.help = false;
         self.agents.open = false;
-        self.switcher = None;
-        self.switcher_editing = false;
-        self.switcher_query.clear();
-        self.switcher_saved_query.clear();
+        self.community_picker = None;
+        self.close_switcher();
         self.palette = Some(0);
     }
 
@@ -10919,5 +11166,67 @@ mod tests {
         assert!(!app.context.open);
         assert!(app.context.rows.is_empty());
         assert!(!app.search.open);
+    }
+    #[test]
+    fn community_switch_keeps_drafts_separate_and_rejects_stale_events() {
+        let mut app = app();
+        app.set_community(Some("work"), Some("Work"));
+        app.set_communities(vec![
+            CommunityChoice {
+                id: "work".into(),
+                name: "Work".into(),
+                relay_url: "https://work.example".into(),
+                last_channel: None,
+            },
+            CommunityChoice {
+                id: "home".into(),
+                name: "Home".into(),
+                relay_url: "https://home.example".into(),
+                last_channel: None,
+            },
+        ]);
+        app.handle(Action::ToggleCommunityPicker, 0);
+        assert_eq!(app.community_picker, Some(0));
+        app.handle(Action::CommunityNext, 0);
+        assert_eq!(app.community_picker, Some(1));
+        app.handle(Action::Dismiss, 0);
+        app.composer.set_text("work draft");
+        app.apply(
+            ChatEvent::CommunitySwitching {
+                generation: 1,
+                id: Some("home".into()),
+                name: "Home".into(),
+                relay_url: "https://home.example".into(),
+            },
+            1,
+        );
+        assert!(app.composer.text().is_empty());
+        app.apply(
+            ChatEvent::Generation {
+                generation: 0,
+                event: Box::new(ChatEvent::Status("stale".into())),
+            },
+            2,
+        );
+        assert_ne!(app.status, "stale");
+        app.apply(
+            ChatEvent::CommunitySwitching {
+                generation: 2,
+                id: Some("work".into()),
+                name: "Work".into(),
+                relay_url: "https://work.example".into(),
+            },
+            3,
+        );
+        assert_eq!(app.composer.text(), "work draft");
+        app.apply(
+            ChatEvent::Generation {
+                generation: 2,
+                event: Box::new(ChatEvent::Disconnected("authentication failed".into())),
+            },
+            4,
+        );
+        assert_eq!(app.community_picker, Some(0));
+        assert_eq!(app.status, "community switch failed: authentication failed");
     }
 }

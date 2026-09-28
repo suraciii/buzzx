@@ -440,6 +440,9 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     if app.palette.is_some() {
         draw_palette(frame, app, area);
     }
+    if app.community_picker.is_some() {
+        draw_community_picker(frame, app, area);
+    }
     if app.help {
         draw_help(frame, app, area, mode);
     }
@@ -1158,12 +1161,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
     right.push(app.inbox_summary());
     let right = right.join(" · ");
     let right_width = right.width() as u16;
-    // The conversation keeps its name: below this the summary is dropped
-    // rather than cutting the conversation in half.
+    // With more than one saved community the header says which one is
+    // active; with one it would only repeat the profile name. The
+    // conversation keeps its name either way: below this the summary is
+    // dropped rather than cutting the conversation in half.
+    let context = if app.communities.len() > 1 {
+        format!("{} / {}", app.community_name, channel)
+    } else {
+        channel
+    };
     if area.width < 36 || right_width + 12 > area.width {
         frame.render_widget(
             Paragraph::new(Line::styled(
-                clip_with_ellipsis(&channel, area.width as usize),
+                clip_with_ellipsis(&context, area.width as usize),
                 author_style(),
             )),
             area,
@@ -1178,7 +1188,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
     .split(area);
     frame.render_widget(
         Paragraph::new(Line::styled(
-            clip_with_ellipsis(&channel, left_width as usize),
+            clip_with_ellipsis(&context, left_width as usize),
             author_style(),
         )),
         columns[0],
@@ -1682,6 +1692,27 @@ fn draw_palette(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+fn draw_community_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let items = app
+        .communities
+        .iter()
+        .map(|community| ListItem::new(format!("{} · {}", community.name, community.relay_url)))
+        .collect::<Vec<_>>();
+    let title = format!("Community: {}", app.community_name);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(Line::raw("enter switch · esc close"));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style())
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(app.community_picker);
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 /// The Agents overlay: the owned roster on the list level, one Agent's
 /// observed work on the detail level. Both take the whole terminal at every
 /// size: a squeezed second column would clip the status words, and those words
@@ -2078,6 +2109,8 @@ fn help_text(app: &App, mode: LayoutMode) -> String {
         } else {
             READER_COMPACT_HELP.to_owned()
         }
+    } else if app.community_picker.is_some() {
+        COMMUNITY_HELP.to_owned()
     } else if app.palette.is_some() {
         PALETTE_HELP.to_owned()
     } else if app.switcher.is_some() {
@@ -2143,6 +2176,7 @@ const WIDE_HELP: &str = "\
 navigation
   j k up down    move the focused row   1-9 jump
   c              switch conversation   Esc close
+  C              community picker      Enter switch
   Ctrl+P         commands
   a              Agents: owned roster, working now
   f              Inbox filter
@@ -2160,12 +2194,16 @@ commands
 agents
   j k select  enter detail  enter open channel
   esc back    ? help        a close
+community
+  j k select  enter switch  esc back
+  ? help      q quit
 signals
   ● unread   @ unread mention   ? unknown   … typing";
 
 const COMPACT_HELP: &str = "\
 i compose  Enter send
-j k move row  c switch  Ctrl+P commands
+j k move row  c switch  C communities
+Ctrl+P commands
 a agents  f filter
 Enter reply  v read message  r react
 e edit  d delete
@@ -2193,6 +2231,15 @@ const SWITCHER_COMPACT_HELP: &str = "\
 switch: j k move  enter open  esc back
 type name filter  / edit  f filter
 ? help  q quit";
+
+const COMMUNITY_HELP: &str = "\
+switch community
+  j k up down    move the cursor      enter switch
+  esc back       close
+  ?              help                 q quit
+  the list holds the identity's saved profiles. switching
+  changes the relay the session reads and writes; the draft
+  and any pending write come along.";
 
 const PALETTE_HELP: &str = "\
 commands

@@ -68,6 +68,7 @@ pub struct LoginCli {
     pub flag_key: Option<String>,
     pub flag_relay: Option<String>,
     pub flag_auth_tag: Option<String>,
+    pub flag_community: Option<String>,
     pub key_file: Option<PathBuf>,
     pub key_stdin: bool,
 }
@@ -287,13 +288,55 @@ fn login(cli: LoginCli) -> Result<i32, StartupError> {
     let keys = validate_key(&key_text)?;
     let short = config::npub_short(&keys);
 
-    // Relay precedence for login matches the runtime contract: flag, env,
-    // existing file, default. The wizard may still change it.
+    let env_relay = std::env::var("BUZZ_RELAY_URL").ok();
+    let selected_profile = if let Some(id) = cli.flag_community.as_deref() {
+        let Some(file) = existing.as_ref() else {
+            return Err(StartupError::usage(format!(
+                "community {id:?} is not saved; run buzzx community list"
+            )));
+        };
+        Some(
+            file.profile(id)
+                .ok_or_else(|| {
+                    StartupError::usage(format!(
+                        "community {id:?} is not saved; run buzzx community list"
+                    ))
+                })?
+                .clone(),
+        )
+    } else {
+        existing.as_ref().and_then(|file| {
+            file.active_community
+                .as_deref()
+                .and_then(|id| file.profile(id))
+                .cloned()
+        })
+    };
+    if cli.flag_community.is_some() && (cli.flag_relay.is_some() || env_relay.is_some()) {
+        return Err(StartupError::usage(
+            "--community cannot be combined with --relay or BUZZ_RELAY_URL",
+        ));
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|file| !file.communities.is_empty())
+        && cli.flag_community.is_none()
+        && (cli.flag_relay.is_some() || env_relay.is_some())
+    {
+        return Err(StartupError::usage(
+            "login relay selection is ambiguous with saved communities; pass --community or use buzzx community add",
+        ));
+    }
     let mut relay = cli
         .flag_relay
         .clone()
-        .or_else(|| std::env::var("BUZZ_RELAY_URL").ok())
-        .or_else(|| existing.as_ref().and_then(|f| f.relay_url.clone()))
+        .or(env_relay)
+        .or_else(|| {
+            selected_profile
+                .as_ref()
+                .map(|profile| profile.relay_url.clone())
+        })
+        .or_else(|| existing.as_ref().and_then(|file| file.relay_url.clone()))
         .unwrap_or_else(|| "http://localhost:3000".to_owned());
     if from_wizard {
         let answer = read_line_visible(&format!("? Relay [{relay}] "))?;
@@ -303,13 +346,18 @@ fn login(cli: LoginCli) -> Result<i32, StartupError> {
     }
     let (http_url, _) = config::split_relay_url(&relay)?;
 
-    // A login that keeps an auth tag must verify against the new identity;
-    // refusing here is fail-fast, the same contract resolve() applies.
+    // An explicit tag wins; otherwise use the selected profile's tag. Legacy
+    // top-level auth_tag remains a read-only compatibility fallback.
     let auth_tag = cli
         .flag_auth_tag
         .clone()
         .or_else(|| std::env::var("BUZZ_AUTH_TAG").ok())
-        .or_else(|| existing.as_ref().and_then(|f| f.auth_tag.clone()));
+        .or_else(|| {
+            selected_profile
+                .as_ref()
+                .and_then(|profile| profile.auth_tag.clone())
+        })
+        .or_else(|| existing.as_ref().and_then(|file| file.auth_tag.clone()));
     if let Some(tag) = &auth_tag {
         buzz_sdk::nip_oa::verify_auth_tag(tag, &keys.public_key()).map_err(|e| {
             StartupError::auth(format!("auth tag does not verify for {short}: {e}"))
@@ -338,6 +386,14 @@ fn login(cli: LoginCli) -> Result<i32, StartupError> {
 /// An existing config is never replaced silently. On a terminal the user sees
 /// both identities and answers; without one, there is no way to confirm, so
 /// the login is refused.
+fn saved_relay(file: &ConfigFile) -> Option<&str> {
+    file.active_community
+        .as_deref()
+        .and_then(|id| file.profile(id))
+        .map(|profile| profile.relay_url.as_str())
+        .or(file.relay_url.as_deref())
+}
+
 fn confirm_overwrite(
     old: &ConfigFile,
     new_relay: &str,
@@ -354,7 +410,7 @@ fn confirm_overwrite(
     };
     println!(
         "current login: {old_key} on {}",
-        old.relay_url.as_deref().unwrap_or("<default>")
+        saved_relay(old).unwrap_or("<default>")
     );
     println!("new login:     {new_short} on {new_relay}");
     if !tty {
@@ -456,8 +512,11 @@ mod tests {
     fn key_file_reads_a_file_the_platform_reports_as_the_users_alone() {
         let dir = temp_dir("file");
         let path = dir.join("work.nsec");
-        fs::write(&path, fixed_key()).expect("write");
-        crate::platform::restrict_file(&path).expect("restrict");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        crate::platform::secret_create(&mut options);
+        let mut file = options.open(&path).expect("create key file");
+        std::io::Write::write_all(&mut file, fixed_key().as_bytes()).expect("write");
 
         assert_eq!(read_key_file(&path).unwrap(), fixed_key());
         let _ = fs::remove_dir_all(&dir);

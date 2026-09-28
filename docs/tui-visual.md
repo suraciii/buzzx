@@ -57,6 +57,13 @@ permanent column. The current [keys and behavior](tui-use.md) remain authoritati
 | Agent detail | My agents / name | State, evidence age, accessible contexts | Selected accessible channel |
 | Help | Help / current context | Full labels, reasons and available keys | Return to previous view |
 
+The timeline header keeps the conversation name on the left and the connection
+and Inbox answer on the right. With two or more saved community profiles it
+prefixes the active community as `community / conversation`, so switching
+relays is never a guess; with one profile the prefix would only repeat a name
+the config file already carries. The prefix yields before the conversation
+name does.
+
 The conversation switcher is the Inbox list at every width: it is an overlay
 over the timeline, never a permanent column, so the timeline keeps the whole
 terminal at 80 columns and up. Agent detail uses the same selection row for
@@ -173,7 +180,7 @@ item. This keeps boundaries consistent with the type of content.
 ## Region budgets
 
 Reserve from the bottom before laying out the timeline. Every supported view
-has a one-row context header, one keys row and one state row. In minimal mode
+
 the state word can replace a redundant mode word. The remaining rows are
 content; reading mode has no reserved empty composer.
 

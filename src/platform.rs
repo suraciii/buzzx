@@ -27,11 +27,6 @@ pub(crate) fn restrict_dir(path: &Path) -> io::Result<()> {
     imp::restrict_dir(path)
 }
 
-/// Restrict a file this process created to its owner.
-pub(crate) fn restrict_file(path: &Path) -> io::Result<()> {
-    imp::restrict_file(path)
-}
-
 /// Set the creation mode on options for a file that holds a private key.
 pub(crate) fn secret_create(options: &mut OpenOptions) {
     imp::secret_create(options)
@@ -68,10 +63,6 @@ mod imp {
 
     pub(super) fn restrict_dir(path: &Path) -> io::Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-    }
-
-    pub(super) fn restrict_file(path: &Path) -> io::Result<()> {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
     }
 
     pub(super) fn secret_create(options: &mut OpenOptions) {
@@ -124,10 +115,6 @@ mod imp {
     }
 
     pub(super) fn restrict_dir(_path: &Path) -> io::Result<()> {
-        Ok(())
-    }
-
-    pub(super) fn restrict_file(_path: &Path) -> io::Result<()> {
         Ok(())
     }
 
@@ -228,7 +215,7 @@ mod tests {
         assert!(err.contains("chmod 600"), "{err}");
         assert_eq!(mode_note(&path).as_deref(), Some("644"));
 
-        restrict_file(&path).expect("restrict the file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
         assert!(check_secret(&path, "config").is_ok());
         assert_eq!(mode_note(&path).as_deref(), Some("600"));
 

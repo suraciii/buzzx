@@ -12,6 +12,10 @@ an implementation must preserve.
   bridge, the WebSocket, NIP-98, the ephemeral kinds, and failure handling.
 - [render-contract.md](render-contract.md) is the row contract: which kinds
   become rows, which are overlays, and how a row is shaped.
+- [web.md](web.md) proposes the local browser boundary, shared behavior,
+  credential isolation and implementation sequence for the Web surface.
+- [client-reference.md](client-reference.md) records the current Desktop/Mobile
+  source comparison and the choices applied to both buzzx interactive surfaces.
 - [decisions/0003-owner-plane-out-of-scope.md](decisions/0003-owner-plane-out-of-scope.md)
   is why the owner's agent observation plane is excluded, with the facts that
   settled it.

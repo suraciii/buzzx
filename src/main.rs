@@ -19,6 +19,7 @@ mod read_state;
 mod session;
 mod sub;
 mod ui;
+mod web;
 
 use std::future::Future;
 use std::io;
@@ -43,11 +44,16 @@ struct Cli {
     /// Relay base URL. Overrides BUZZ_RELAY_URL and the config file.
     #[arg(long, global = true)]
     relay: Option<String>,
+    /// Saved community to run against, by id. Conflicts with --relay and
+    /// BUZZ_RELAY_URL; without it the active profile is used.
+    #[arg(long, global = true)]
+    community: Option<String>,
     /// Identity key, hex or nsec. Overrides BUZZ_PRIVATE_KEY and the config
     /// file.
     #[arg(long, global = true)]
     private_key: Option<String>,
-    /// NIP-OA auth tag JSON. Overrides BUZZ_AUTH_TAG and the config file.
+    /// NIP-OA auth tag JSON. Overrides BUZZ_AUTH_TAG and the selected
+    /// community's saved tag.
     #[arg(long, global = true)]
     auth_tag: Option<String>,
     #[command(subcommand)]
@@ -58,6 +64,13 @@ struct Cli {
 enum Command {
     /// Open the interactive terminal chat session.
     Tui,
+    /// Open the local browser chat session.
+    Web,
+    /// Manage the saved community profiles.
+    Community {
+        #[command(subcommand)]
+        action: cli::CommunityCommand,
+    },
     /// Discover and read channels.
     Channels {
         #[command(subcommand)]
@@ -85,7 +98,8 @@ enum Command {
         #[arg(long)]
         private_key_stdin: bool,
     },
-    /// Write the identity and relay to the config file.
+    /// Write the identity and the first community profile to the config
+    /// file. Offline: it does not verify the relay.
     Init {
         /// Relay base URL.
         #[arg(long)]
@@ -96,12 +110,15 @@ enum Command {
         /// NIP-OA auth tag JSON.
         #[arg(long)]
         auth_tag: Option<String>,
+        /// Profile name; the relay host when omitted.
+        #[arg(long)]
+        name: Option<String>,
     },
-    /// Show the effective identity and relay and where each came from.
-    /// Local only: no relay connection, no secrets.
+    /// Show the effective identity, community, and relay and where each
+    /// came from. Local only: no relay connection, no secrets.
     Whoami,
-    /// Remove the saved private key and auth tag from the config file.
-    /// The relay preference is kept.
+    /// Remove the saved private key and every saved auth tag from the
+    /// config file. The community profiles are kept.
     Logout {
         /// Confirm without a prompt. Required when stdin is not a terminal.
         #[arg(long)]
@@ -127,12 +144,14 @@ fn main() {
             std::process::exit(if help { 0 } else { config::EXIT_USAGE });
         }
     };
+    let flags = (
+        cli.relay.as_deref(),
+        cli.private_key.as_deref(),
+        cli.auth_tag.as_deref(),
+        cli.community.as_deref(),
+    );
     let code: i32 = match cli.command {
-        Command::Channels { action } => match resolve_identity(
-            cli.relay.as_deref(),
-            cli.private_key.as_deref(),
-            cli.auth_tag.as_deref(),
-        ) {
+        Command::Channels { action } => match resolve_identity(flags) {
             Ok(resolved) => match block_on(cli::run_channels(&resolved, action)) {
                 Ok(code) => code,
                 Err(error) => cli::fail_startup(config::EXIT_OTHER, &error),
@@ -144,11 +163,7 @@ fn main() {
             // arguments: a write answers with `status`, a read with its
             // error object.
             let shape = cli::failure_shape(&action);
-            match resolve_identity(
-                cli.relay.as_deref(),
-                cli.private_key.as_deref(),
-                cli.auth_tag.as_deref(),
-            ) {
+            match resolve_identity(flags) {
                 Ok(resolved) => match block_on(cli::run_messages(&resolved, action)) {
                     Ok(code) => code,
                     Err(error) => cli::fail_message_startup(&shape, config::EXIT_OTHER, &error),
@@ -156,6 +171,13 @@ fn main() {
                 Err(error) => cli::fail_message_startup(&shape, error.code, &error.message),
             }
         }
+        Command::Community { action } => cli::run_community(
+            action,
+            cli.relay.as_deref(),
+            cli.private_key.as_deref(),
+            cli.auth_tag.as_deref(),
+            cli.community.as_deref(),
+        ),
         Command::Login {
             private_key_file,
             private_key_stdin,
@@ -163,6 +185,7 @@ fn main() {
             flag_key: cli.private_key.clone(),
             flag_relay: cli.relay.clone(),
             flag_auth_tag: cli.auth_tag.clone(),
+            flag_community: cli.community.clone(),
             key_file: private_key_file,
             key_stdin: private_key_stdin,
         }),
@@ -170,7 +193,8 @@ fn main() {
             relay,
             private_key,
             auth_tag,
-        } => match config::init(&relay, &private_key, auth_tag.as_deref()) {
+            name,
+        } => match config::init(&relay, &private_key, auth_tag.as_deref(), name.as_deref()) {
             Ok(path) => {
                 println!("wrote {}", path.display());
                 0
@@ -184,6 +208,7 @@ fn main() {
             cli.private_key.as_deref(),
             cli.relay.as_deref(),
             cli.auth_tag.as_deref(),
+            cli.community.as_deref(),
         ),
         Command::Logout { yes } => account::run_logout(account::LogoutCli {
             yes,
@@ -195,11 +220,7 @@ fn main() {
                 eprintln!("buzzx: {failure}");
                 config::EXIT_USAGE
             }
-            Ok(channel) => match resolve_identity(
-                cli.relay.as_deref(),
-                cli.private_key.as_deref(),
-                cli.auth_tag.as_deref(),
-            ) {
+            Ok(channel) => match resolve_identity(flags) {
                 Ok(resolved) => match block_on(session::run_watch(&resolved, channel)) {
                     Ok(code) => code,
                     Err(error) => {
@@ -214,18 +235,32 @@ fn main() {
             },
         },
         Command::Tui => run_tui(&cli),
+        Command::Web => match resolve_identity(flags) {
+            Ok(resolved) => {
+                if let Some(community) = &resolved.community
+                    && let Err(error) = config::mark_profile_used(&community.id)
+                {
+                    eprintln!("buzzx: cannot record community use: {error}");
+                }
+                match block_on(web::run(resolved)) {
+                    Ok(code) => code,
+                    Err(error) => cli::fail_startup(config::EXIT_OTHER, &error),
+                }
+            }
+            Err(error) => cli::fail_startup(error.code, &error.message),
+        },
     };
     std::process::exit(code);
 }
 
-/// The effective identity and relay, or the failure and the code it carries.
-/// The three flags are read from the parsed tree before a command consumes it.
+/// The effective identity, relay, and community, or the failure and the
+/// code it carries. The flags are read from the parsed tree before a
+/// command consumes it.
 fn resolve_identity(
-    relay: Option<&str>,
-    private_key: Option<&str>,
-    auth_tag: Option<&str>,
+    flags: (Option<&str>, Option<&str>, Option<&str>, Option<&str>),
 ) -> Result<Resolved, config::StartupError> {
-    config::resolve(private_key, relay, auth_tag)
+    let (relay, private_key, auth_tag, community) = flags;
+    config::resolve(private_key, relay, auth_tag, community)
 }
 
 /// One multi-threaded runtime per process, for the commands that reach the
@@ -243,17 +278,23 @@ fn run_tui(cli: &Cli) -> i32 {
         eprintln!("buzzx: TERM=dumb cannot run the TUI");
         return config::EXIT_USAGE;
     }
-    let resolved = match resolve_identity(
+    let resolved = match resolve_identity((
         cli.relay.as_deref(),
         cli.private_key.as_deref(),
         cli.auth_tag.as_deref(),
-    ) {
+        cli.community.as_deref(),
+    )) {
         Ok(resolved) => resolved,
         Err(error) => {
             eprintln!("buzzx: {error}");
             return error.code;
         }
     };
+    if let Some(community) = &resolved.community
+        && let Err(error) = config::mark_profile_used(&community.id)
+    {
+        eprintln!("buzzx: cannot record community use: {error}");
+    }
     match run_tui_session(resolved) {
         Ok(code) => code,
         Err(error) => {
@@ -319,6 +360,26 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
         let session = session;
 
         let mut app = App::new(&resolved.keys, &resolved.http_url);
+        if let Some(community) = &resolved.community {
+            app.set_community(Some(&community.id), Some(&community.name));
+        }
+        if config::config_path().is_file()
+            && let Ok(file) = config::read_config_file(&config::config_path())
+        {
+            app.set_communities(
+                file.communities
+                    .into_iter()
+                    .map(|community| app::CommunityChoice {
+                        id: community.id,
+                        name: community.name,
+                        relay_url: community.relay_url,
+                        last_channel: community
+                            .last_channel
+                            .and_then(|channel| uuid::Uuid::parse_str(&channel).ok()),
+                    })
+                    .collect(),
+            );
+        }
         let mut started = Some(session.started);
 
         loop {

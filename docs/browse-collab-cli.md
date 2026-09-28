@@ -93,8 +93,10 @@ before signing an event. It must not silently truncate content.
 ## JSON contract
 
 The default output is JSON. Collection commands return an array; a single
-event returns an object. Each event object includes these fields when they are
-known:
+event returns an object. Every returned channel, event, and write result also
+has a `community` object with `id`, `name`, and normalized `relay_url`. An
+ephemeral `--relay` result uses `id: null` and `name: "default"`. This keeps
+the relay destination explicit without exposing credentials.
 
 | Field | Meaning |
 | --- | --- |

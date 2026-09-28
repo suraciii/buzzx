@@ -25,6 +25,11 @@ pub enum Action {
     SwitcherConfirm,
     SwitcherInput(char),
     SwitcherBackspace,
+    /// `C`: open the saved-community selector, or close it when it is open.
+    ToggleCommunityPicker,
+    CommunityNext,
+    CommunityPrev,
+    CommunityConfirm,
     /// `Ctrl+P`: open the command palette, or close it when it is open.
     TogglePalette,
     PaletteNext,
@@ -137,6 +142,8 @@ pub enum Overlay {
     SwitcherSearch,
     /// The command palette: an action directory over the timeline.
     Palette,
+    /// The saved-community selector: the profiles the identity may switch to.
+    CommunityPicker,
     Help,
     Agents,
 }
@@ -311,6 +318,17 @@ pub fn map_navigation(
             _ => Action::Ignored,
         };
     }
+    if overlay == Overlay::CommunityPicker {
+        return match key.code {
+            KeyCode::Char('j') | KeyCode::Down => Action::CommunityNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::CommunityPrev,
+            KeyCode::Enter => Action::CommunityConfirm,
+            KeyCode::Esc | KeyCode::Char('C') => Action::Dismiss,
+            KeyCode::Char('?') => Action::ToggleHelp,
+            KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
     if overlay == Overlay::SwitcherSearch {
         return match key.code {
             KeyCode::Esc => Action::Dismiss,
@@ -381,6 +399,7 @@ pub fn map_navigation(
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('/') => Action::OpenSearch,
         KeyCode::Char('c') => Action::ToggleSwitcher,
+        KeyCode::Char('C') => Action::ToggleCommunityPicker,
         KeyCode::Char('v') => Action::OpenReader,
         KeyCode::Char('t') => Action::OpenThread,
         KeyCode::Char('i') => Action::ComposeNew,
@@ -822,6 +841,7 @@ mod tests {
         for overlay in [
             Overlay::Switcher,
             Overlay::SwitcherSearch,
+            Overlay::CommunityPicker,
             Overlay::Help,
             Overlay::Agents,
         ] {

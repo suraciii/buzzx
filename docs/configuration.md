@@ -1,7 +1,14 @@
 # Configuration
 
-`buzzx` needs two things to start: an identity and a relay. Both come from the
-environment, flags, or a config file, in that order.
+Status: identity, relay, auth tag, community profiles, selection precedence,
+migration, and profile usage metadata are implemented at the current
+baseline. Login profile-selection behavior and interactive switching are
+covered by the acceptance checks in this document; they must not be inferred
+from config parsing alone.
+
+`buzzx` needs two things to start: an identity and a relay. The relay belongs
+to the selected community profile. Both come from the environment, flags, or
+a config file, in that order.
 
 ## Identity
 
@@ -48,7 +55,7 @@ the key out of the filesystem.
 The relay URL comes from one of three sources. First, the `BUZZ_RELAY_URL`
 environment variable, for example `export BUZZ_RELAY_URL=https://relay.example`.
 Second, the `--relay` flag, for example `buzzx tui --relay relay.example`.
-Third, the `relay_url` field of the config file.
+Third, the `relay_url` of the selected community profile in the config file.
 
 The default is `http://localhost:3000`. The value may be any of:
 
@@ -62,7 +69,59 @@ because guessing the wrong scheme produces a confusing refusal from the relay.
 
 The community boundary comes from the relay host. One identity on two relay
 hosts is two communities. `buzzx` connects to exactly one relay per run; it
-does not aggregate.
+does not aggregate. Switching communities inside a session replaces that one
+connection; it never opens a second.
+
+## Community profiles
+
+The config file saves one or more community profiles and names the active
+community. Each profile holds:
+
+- `id` - the stable local reference used by `--community` and the
+  interactive pickers.
+- `name` - the user-chosen display name.
+- `relay_url` - the normalized relay URL. One profile per normalized URL; a
+  duplicate is rejected as `already_exists`.
+- `auth_tag` - the optional NIP-OA tag scoped to this community, so
+  delegations for different communities never overwrite each other.
+- usage state: `last_channel`, `last_used_at`, `last_status` and
+  `last_checked_at`. A status is the last observed result with its time,
+  never a live connection claim.
+
+The private key stays global: one identity for every profile. A key per
+community is a separate identity design and stays out of scope.
+
+### Selection
+
+| Decision | Precedence |
+|---|---|
+| Saved community | `--community <id>` > active community |
+| One-shot relay | `--relay <url>`; never combined with `--community` |
+| Environment relay | without a selector, `BUZZ_RELAY_URL` overrides the active community; output marks it as an env override |
+| Profile auth tag | `--auth-tag` > `BUZZ_AUTH_TAG` > the selected profile's `auth_tag` |
+
+`--community` combined with `--relay`, or with `BUZZ_RELAY_URL` in effect,
+is rejected as `conflicting_relay_selector` before any network call, so a
+command cannot appear to use a profile while talking to another host.
+`--relay` stays an unsaved one-shot choice: it is not added to the profile
+list and borrows no profile auth tag; an authorization must be passed
+explicitly.
+
+With no saved profile and no explicit relay, `buzzx` does not start an empty
+session that looks connected. For local development the
+`http://localhost:3000` default is used as an unsaved ephemeral profile and
+`whoami` reports it as `default`. Once a profile is saved, the active
+community is the default entry.
+
+### Migration
+
+A config file that still carries a bare `relay_url` is migrated on the first
+successful read: that URL becomes one profile named after its host, a global
+`auth_tag` moves into that profile so it is never reused for another
+community, and `active_community` points at it. The private key, the file
+permission rule and the atomic-replace rule are unchanged. A failed
+migration write keeps the old file and creates no half-written config; after
+a successful migration the old fields are no longer a second runtime source.
 
 ## NIP-OA auth tag
 
@@ -70,7 +129,9 @@ An agent identity that acts on behalf of an owner carries a NIP-OA `auth` tag.
 `buzzx` supports it with the same contract the `buzz` CLI uses. The tag comes
 from one of three sources. First, the `BUZZ_AUTH_TAG` environment variable, for
 example `["auth","<owner>","<conditions>","<sig>"]`. Second, the `--auth-tag`
-flag with the same JSON. Third, the `auth_tag` field of the config file.
+flag with the same JSON. Third, the `auth_tag` of the selected community
+profile in the config file; a config-wide tag no longer exists after
+migration.
 
 When set, the tag is attached to every signed event and sent as an
 `x-auth-tag` header on HTTP requests. The event tag is authoritative: the relay
@@ -93,19 +154,33 @@ The file lives in the platform's user configuration directory, under `buzzx`:
 every platform. All fields are optional.
 
 ```toml
-relay_url = "https://relay.example"
 private_key = "nsec1..."
+active_community = "<profile-id>"
+
+[[communities]]
+id = "<profile-id>"
+name = "work"
+relay_url = "https://relay.example"
 auth_tag = "[\"auth\",\"<owner>\",\"<conditions>\",\"<sig>\"]"
+last_channel = "<uuid>"
+last_used_at = 1790000000
+last_status = "connected"
+last_checked_at = 1790000000
 ```
 
-There is no `default_channel` and no keybinding configuration in the first
-phase. Both are settings that a single-user tool does not need, and a
-config file that carries them invites a second source of truth for behavior
-that the keys already define.
+There is no `default_channel` and no keybinding configuration. Both are
+settings that a single-user tool does not need, and a config file that
+carries them invites a second source of truth for behavior that the keys
+already define. A profile's `last_channel` is observed usage state restored
+on return, not a behavior setting.
 
-`buzzx init --relay <url> --private-key <nsec>` writes the file, creating the
-directory and the file with the user-only protection
-[above](#file-permissions). It refuses to replace a file that already exists.
+`buzzx init --relay <url> --private-key <nsec> [--name <name>]` writes the
+file with the identity and the first community profile, named by `--name` or
+after the relay's host, and makes it active. The directory and the file are
+created with the user-only protection [above](#file-permissions), and an
+existing file is never replaced. It is offline: it does not verify the relay.
+Use `buzzx community add` or `buzzx community verify` for a verified
+connection.
 
 ## Login
 
@@ -138,9 +213,16 @@ The key comes from one of five places, in this order:
 Without a terminal and without any key source, `buzzx login` exits with
 code 1 and names the sources it accepts.
 
-The relay written by login follows the same precedence the session uses:
-`--relay`, then `BUZZ_RELAY_URL`, then the existing file, then the default.
-The wizard prompts for it with that default.
+The relay written by login follows the same precedence as the session when no
+saved profile selector is supplied: `--relay`, then `BUZZ_RELAY_URL`, then the
+active profile, then the local default. `--community <id>` selects that saved
+profile and uses its relay and auth tag. When saved profiles exist, an explicit
+`--relay` or `BUZZ_RELAY_URL` without `--community` is rejected as ambiguous;
+use `buzzx community add` for a new profile instead.
+
+Login manages the identity, not the profile list. It never silently creates or
+replaces a profile when a saved profile set makes an explicit relay ambiguous.
+With no saved profile, login establishes the first one from the resolved relay.
 
 An existing config file is never replaced silently. Login shows the current
 identity and relay next to the new ones and asks before overwriting; an
@@ -164,10 +246,11 @@ form, the first 8 and last 4 characters.
 
 ## Whoami
 
-`buzzx whoami` answers one question: what identity would a session use
-right now? It resolves locally, with the same precedence every subcommand
-uses, and prints the identity, the relay, and the source each won from:
-`flag`, `env`, `file`, or, for the relay, `default`. When no identity
+`buzzx whoami` answers one question: what identity and active community
+would a session use right now? It resolves locally, with the same precedence
+every subcommand uses, and prints the identity, the active community's id,
+name and relay URL, and the source each won from: `flag`, `env`, `file`,
+`active`, or, for an unsaved default relay, `default`. When no identity
 resolves, it exits with code 3 and names the sources it checked.
 
 It never contacts the relay, so it works offline, over SSH, and in
@@ -176,12 +259,14 @@ even on the failure paths.
 
 ## Logout
 
-`buzzx logout` removes the `private_key` and `auth_tag` fields from the
-config file and leaves the `relay_url` preference in place. It is entirely
-local: it sends nothing to the relay, and it has no Mobile authorization to
-revoke, because no remote-signing session exists yet.
+`buzzx logout` removes the `private_key` field and every profile `auth_tag`
+from the config file and leaves the profile names and relay URLs in place.
+It is entirely local: it sends nothing to the relay, and it has no Mobile
+authorization to revoke, because no remote-signing session exists yet.
+Re-login requires restoring each profile's authorization.
 
-Before writing, logout shows the identity and relay it is about to clear.
+Before writing, logout shows the identity and the community profiles it is
+about to strip credentials from.
 On a terminal it asks; any answer but `y` or `yes` cancels with code 1 and
 the file is untouched. Without a terminal it must be passed `--yes`, or it
 exits code 1 without touching the file. The write is the same atomic
@@ -201,7 +286,8 @@ is idempotent: running it twice changes nothing the second time.
 belongs in flags, so a running session's behavior is visible in its command
 line.
 
-- `BUZZ_RELAY_URL` sets the relay base URL.
+- `BUZZ_RELAY_URL` sets the relay base URL, overriding the active community
+  when no selector is given; command output marks it as an env override.
 - `BUZZ_PRIVATE_KEY` sets the identity key, hex or nsec.
 - `BUZZ_AUTH_TAG` sets the NIP-OA auth tag JSON.
 - `BUZZX_CONFIG` overrides the config file path.

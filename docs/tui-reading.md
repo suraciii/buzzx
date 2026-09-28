@@ -4,6 +4,11 @@ Status: M1–M4 are implemented in the TUI worktree. This spec is the contract f
 the reader and safe return; release acceptance is tracked in
 `WORK_LOGS/BUZZX_CONTEXT_ACCEPTANCE_LOG.md`.
 
+Complete reading, event-bound replies and safe return apply to both interactive
+surfaces through [interactive.md](interactive.md). Keys, terminal wrapping and
+cell budgets below are TUI presentation; [web.md](web.md#search-inspect-and-resume)
+owns the browser controls.
+
 ## Problem and priority
 
 A message can be taller than the timeline. The current renderer shows its
