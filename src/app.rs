@@ -7868,14 +7868,43 @@ mod tests {
 
     #[test]
     fn an_older_page_leaves_a_following_view_on_the_row_it_was_reading() {
-        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        // Two replies share one second, and the channel holds the one whose
+        // id sorts first: the page below carries the other, so the older page
+        // really lands a row after the focused one instead of above it.
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        let id = channel(1).id;
+        let author = keys();
+        let root_event = message_event(&author, id, "the root", 10);
+        let root = root_event.id.to_hex();
+        let mut same_second: Vec<nostr::Event> = (0..2)
+            .map(|n| reply_event(&author, id, &root, &root, &format!("burst {n}"), 20))
+            .collect();
+        same_second.sort_by_key(|event| event.id.to_hex());
+        let focused_event = same_second.remove(0);
+        let below_event = same_second.remove(0);
+        let focused = focused_event.id.to_hex();
+        let below = below_event.id.to_hex();
+        app.apply(
+            ChatEvent::History {
+                channel: id,
+                events: vec![root_event, focused_event.clone()],
+            },
+            30,
+        );
+        app.take_outbox();
         app.set_focus(1);
         app.handle(Action::OpenThread, 40);
         let read_root = message_event(&author, id, "the root", 10);
-        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
         // A saturated read: older rows exist beyond the loaded window, so the
         // key below really asks the relay for them instead of walking.
-        thread_read(&mut app, id, &root, vec![read_root, read_reply], true);
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![read_root, focused_event.clone()],
+            true,
+        );
         assert!(
             app.thread.following(),
             "the entry row is the newest loaded one"
@@ -7883,14 +7912,6 @@ mod tests {
         // `k` on the first reply asks for older rows instead of moving.
         app.handle(Action::PrevRow, 41);
         assert_eq!(app.thread.focus, 1, "the request does not move the focus");
-        // The page answers at the cursor's own second, so one of its rows
-        // sorts after the focused reply: the tail moves below the reader.
-        let later = (0..64u32)
-            .map(|n| reply_event(&author, id, &root, &root, &format!("burst {n}"), 20))
-            .find(|event| event.id.to_hex() > reply)
-            .expect("a later id at the same second");
-        let later_id = later.id.to_hex();
-        let older = reply_event(&author, id, &root, &root, "older", 15);
         app.apply(
             ChatEvent::HistoryPage {
                 surface: HistorySurface::Thread,
@@ -7899,18 +7920,18 @@ mod tests {
                 request: app.thread.request,
                 direction: HistoryDirection::Older,
                 saturated: false,
-                events: vec![older, later],
+                events: vec![below_event],
             },
             42,
         );
         assert_eq!(
             app.thread.rows.last().map(|row| row.event_id.as_str()),
-            Some(later_id.as_str()),
+            Some(below.as_str()),
             "the page carries a row below the focused one"
         );
         assert_eq!(
             app.thread.focused().map(|row| row.event_id.as_str()),
-            Some(reply.as_str()),
+            Some(focused.as_str()),
             "a reader who asked for older rows is not dragged to the newest one"
         );
         assert!(
