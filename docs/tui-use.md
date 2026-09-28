@@ -167,7 +167,8 @@ Keys have two modes. The timeline starts in navigation mode.
 In navigation mode:
 - `j` or the down arrow moves to the next timeline row.
 - `k` or the up arrow moves to the previous timeline row.
-- `1` through `9` jump to the conversation with that session shortcut.
+- `1` through `9` jump to the conversation with that session shortcut. Inside
+  the switcher the digits are filter text instead.
 - `f` cycles `All`, `Unread`, and `For you`. In the switcher, `f` or Tab cycles
   the same filters.
 - `c` opens the conversation switcher at every layout size. The section
@@ -224,8 +225,9 @@ j/k move  type to filter  enter open  esc back  ? help
   closes the list.
 - `f` or `Tab` cycles the filter; the cursor moves to the first conversation
   the new filter shows when the row it was on is hidden by it.
-- `1`–`9` open the numbered conversation directly, exactly as they do on the
-  timeline.
+- The digits are filter text here, not session shortcuts: every printable key
+  belongs to the query, so a name that starts with a digit (a hex id) is
+  reachable like any other. The `1`–`9` shortcuts apply on the timeline.
 - A conversation whose state is unknown shows `?`, and one retained after it
   stops matching the active filter shows `Read`; the header summary says
   `Inbox ?` while any answer is still missing. The list is not a placement
