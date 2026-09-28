@@ -598,10 +598,6 @@ pub struct ThreadView {
     /// The root first, then the loaded replies, oldest first.
     pub rows: Vec<Row>,
     pub focus: usize,
-    /// The view sits on the newest row: a live reply keeps the tail in view.
-    /// Away from the tail the reply is cached and counted instead of moving
-    /// the reader.
-    pub follow: bool,
     /// Matching live replies this client saw since the view last sat on the
     /// newest row. A count of what was observed, never a claim about the
     /// thread's total replies.
@@ -650,6 +646,15 @@ impl ThreadView {
     /// The focused row of the loaded thread.
     pub fn focused(&self) -> Option<&Row> {
         self.rows.get(self.focus)
+    }
+
+    /// The view sits on the newest row: a live reply keeps the tail in view,
+    /// and any other position caches it and counts it instead. Following is a
+    /// position, not a mode, so it is derived from the focus rather than kept
+    /// in step by hand: every page merge and every row that leaves the view
+    /// moves the focus and the follow together.
+    pub fn following(&self) -> bool {
+        !self.rows.is_empty() && self.focus + 1 == self.rows.len()
     }
 
     /// Whether a read has answered for this thread at least once.
@@ -2988,6 +2993,7 @@ impl App {
         let root_deleted = self.thread.root_deleted || global_deleted.contains(&self.thread.root);
         let live_ids = self.thread.live_ids.clone();
         let was_loaded = self.thread.loaded;
+        let was_following = self.thread.following();
         let previous_focus = self.thread.focused().map(|row| row.event_id.clone());
         let mut previous: HashMap<String, Row> = std::mem::take(&mut self.thread.rows)
             .into_iter()
@@ -3070,16 +3076,13 @@ impl App {
                 }
             }
         }
-        if was_loaded {
+        if was_loaded && was_following {
             // A re-read keeps the reader's own position rule: a view that was
             // following the tail follows it through the new window.
-            if self.thread.follow {
-                self.thread.focus = self.thread.rows.len().saturating_sub(1);
-            }
-        } else {
-            // Entering: the view follows only when the entry row is the
-            // newest loaded one.
-            self.thread.follow = self.thread.focus + 1 == self.thread.rows.len();
+            self.thread.focus = self.thread.rows.len().saturating_sub(1);
+        } else if !was_loaded {
+            // Entering: the view follows only when the entry row is the newest
+            // loaded one, which is where the focus above already put it.
             self.thread.observed_new = 0;
         }
         let buffered = std::mem::take(&mut self.thread.buffered_overlays);
@@ -3143,6 +3146,7 @@ impl App {
         };
         // The arriving row becomes the tail only when nothing loaded is newer.
         let newest = at == self.thread.rows.len() && !self.thread.rows.is_empty();
+        let was_following = self.thread.following();
         if at <= self.thread.focus && !self.thread.rows.is_empty() {
             self.thread.focus += 1;
         }
@@ -3150,7 +3154,7 @@ impl App {
         // including one this identity sent from another client.
         let counted = !row.pending;
         self.thread.rows.insert(at, row);
-        if self.thread.follow {
+        if was_following {
             // At the tail: keep the newest row visible.
             self.thread.focus = self.thread.rows.len() - 1;
         } else if newest && counted {
@@ -3166,9 +3170,6 @@ impl App {
             return;
         }
         self.thread.focus = index.min(self.thread.rows.len() - 1);
-        // Following is a position, not a separate mode: the view follows the
-        // tail exactly while its focused row is the newest one.
-        self.thread.follow = self.thread.focus + 1 == self.thread.rows.len();
     }
 
     fn begin_search_journey(&mut self, from_composer: bool) {
@@ -3619,7 +3620,6 @@ impl App {
             entered: row.event_id,
             rows: Vec::new(),
             focus: 0,
-            follow: false,
             observed_new: 0,
             loading: true,
             failed: None,
@@ -4244,7 +4244,6 @@ impl App {
             entered: saved_row.clone(),
             rows: Vec::new(),
             focus: 0,
-            follow: false,
             observed_new: 0,
             loading: true,
             failed: None,
@@ -4841,9 +4840,9 @@ impl App {
                 }
                 self.load_thread(channel, root, request, events, saturated, now);
                 // `G` asks for the newest window: the view lands on the newest
-                // valid row, follows the tail and drops the observed count.
+                // valid row, which is the position that follows the tail, and
+                // drops the observed count.
                 self.thread.focus = self.thread.rows.len().saturating_sub(1);
-                self.thread.follow = !self.thread.rows.is_empty();
                 self.thread.observed_new = 0;
             }
         }
@@ -4976,6 +4975,7 @@ impl App {
                     && self.thread.request == request
                 {
                     let focus_id = self.thread.focused().map(|row| row.event_id.clone());
+                    let was_following = self.thread.following();
                     let pinned = self.thread.root.clone();
                     no_progress = !Self::merge_rows(
                         &mut self.thread.rows,
@@ -4995,9 +4995,11 @@ impl App {
                     self.thread.focus = focus_id
                         .and_then(|id| self.thread.rows.iter().position(|row| row.event_id == id))
                         .unwrap_or(self.thread.focus);
-                    if self.thread.follow {
-                        // A page under a following view keeps the newest row
-                        // in sight; a detached view keeps its own row.
+                    if was_following && direction == HistoryDirection::Newer {
+                        // A following view asked for rows below the tail, so
+                        // the newest row is still the row it wants. A detached
+                        // view keeps its own row, and an older page never moves
+                        // a reader who asked to go back.
                         self.thread.focus = self.thread.rows.len().saturating_sub(1);
                     }
                     match direction {
@@ -7413,7 +7415,7 @@ mod tests {
         thread_read(&mut app, id, &root, vec![read_root, read_reply], false);
         assert_eq!(app.thread.focus, 0);
         assert!(
-            !app.thread.follow,
+            !app.thread.following(),
             "a thread entered at the root is detached"
         );
         // An older reply arrives late: it is inserted above the loaded reply,
@@ -7444,7 +7446,7 @@ mod tests {
         let read_root = message_event(&author, id, "the root", 10);
         thread_read(&mut app, id, &root, vec![read_root], false);
         assert!(
-            app.thread.follow,
+            app.thread.following(),
             "entering at the only loaded row follows the tail"
         );
         let live = reply_event(&author, id, &root, &root, "live", 25);
@@ -7475,7 +7477,7 @@ mod tests {
             vec![read_root, read_reply, later],
             false,
         );
-        assert!(!app.thread.follow, "entering mid-thread is detached");
+        assert!(!app.thread.following(), "entering mid-thread is detached");
         let live = reply_event(&author, id, &root, &root, "live", 30);
         let live_id = live.id.to_hex();
         app.apply(
@@ -7513,14 +7515,20 @@ mod tests {
             false,
         );
         app.handle(Action::PrevRow, 42);
-        assert!(!app.thread.follow, "moving off the newest row detaches");
+        assert!(
+            !app.thread.following(),
+            "moving off the newest row detaches"
+        );
         app.handle(Action::NextRow, 43);
         assert!(
-            !app.thread.follow,
+            !app.thread.following(),
             "a row short of the newest one is still detached"
         );
         app.handle(Action::NextRow, 44);
-        assert!(app.thread.follow, "ending on the newest row follows again");
+        assert!(
+            app.thread.following(),
+            "ending on the newest row follows again"
+        );
     }
 
     #[test]
@@ -7569,7 +7577,7 @@ mod tests {
             app.thread.observed_new, 0,
             "the newest window clears the count"
         );
-        assert!(app.thread.follow);
+        assert!(app.thread.following());
         assert_eq!(app.thread.rows[app.thread.focus].event_id, live_id);
         let _ = reply;
     }
@@ -7590,13 +7598,13 @@ mod tests {
             false,
         );
         assert_eq!(app.thread.focus, 1, "the entry row is focused");
-        assert!(!app.thread.follow);
+        assert!(!app.thread.following());
         app.thread.observed_new = 2;
         app.handle(Action::ThreadReplyFocused, 41);
         app.composer.set_text("tail");
         app.handle(Action::ComposerSend, 42);
         assert!(
-            app.thread.follow,
+            app.thread.following(),
             "a user's own reply returns the view to the tail"
         );
         assert_eq!(app.thread.focus, app.thread.rows.len() - 1);
@@ -7807,7 +7815,10 @@ mod tests {
         let read_root = message_event(&author, id, "the root", 10);
         let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
         thread_read(&mut app, id, &root, vec![read_root, read_reply], false);
-        assert!(app.thread.follow, "the entry row is the newest loaded one");
+        assert!(
+            app.thread.following(),
+            "the entry row is the newest loaded one"
+        );
         let newer = reply_event(&author, id, &root, &root, "newer", 30);
         let newer_id = newer.id.to_hex();
         app.apply(
@@ -7832,7 +7843,7 @@ mod tests {
         app.handle(Action::ThreadReplyFocused, 43);
         app.handle(Action::ComposerEscape, 44);
         app.handle(Action::PrevRow, 45);
-        assert!(!app.thread.follow);
+        assert!(!app.thread.following());
         let focused = app.thread.focused().map(|row| row.event_id.clone());
         let later = reply_event(&author, id, &root, &root, "later", 40);
         app.apply(
@@ -7853,6 +7864,98 @@ mod tests {
             "a detached view keeps its row through a newer page"
         );
         let _ = reply;
+    }
+
+    #[test]
+    fn an_older_page_leaves_a_following_view_on_the_row_it_was_reading() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenThread, 40);
+        let read_root = message_event(&author, id, "the root", 10);
+        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
+        // A saturated read: older rows exist beyond the loaded window, so the
+        // key below really asks the relay for them instead of walking.
+        thread_read(&mut app, id, &root, vec![read_root, read_reply], true);
+        assert!(
+            app.thread.following(),
+            "the entry row is the newest loaded one"
+        );
+        // `k` on the first reply asks for older rows instead of moving.
+        app.handle(Action::PrevRow, 41);
+        assert_eq!(app.thread.focus, 1, "the request does not move the focus");
+        // The page answers at the cursor's own second, so one of its rows
+        // sorts after the focused reply: the tail moves below the reader.
+        let later = (0..64u32)
+            .map(|n| reply_event(&author, id, &root, &root, &format!("burst {n}"), 20))
+            .find(|event| event.id.to_hex() > reply)
+            .expect("a later id at the same second");
+        let later_id = later.id.to_hex();
+        let older = reply_event(&author, id, &root, &root, "older", 15);
+        app.apply(
+            ChatEvent::HistoryPage {
+                surface: HistorySurface::Thread,
+                channel: id,
+                root: Some(root.clone()),
+                request: app.thread.request,
+                direction: HistoryDirection::Older,
+                saturated: false,
+                events: vec![older, later],
+            },
+            42,
+        );
+        assert_eq!(
+            app.thread.rows.last().map(|row| row.event_id.as_str()),
+            Some(later_id.as_str()),
+            "the page carries a row below the focused one"
+        );
+        assert_eq!(
+            app.thread.focused().map(|row| row.event_id.as_str()),
+            Some(reply.as_str()),
+            "a reader who asked for older rows is not dragged to the newest one"
+        );
+        assert!(
+            !app.thread.following(),
+            "the focus is no longer the newest row, so the view is detached"
+        );
+    }
+
+    #[test]
+    fn a_live_reply_follows_when_a_deletion_makes_the_focus_the_newest() {
+        let (mut app, id, root, reply, author) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::OpenThread, 40);
+        let read_root = message_event(&author, id, "the root", 10);
+        let read_reply = reply_event(&author, id, &root, &root, "a reply", 20);
+        let read_later = reply_event(&author, id, &root, &root, "later", 25);
+        let later_id = read_later.id.to_hex();
+        thread_read(
+            &mut app,
+            id,
+            &root,
+            vec![read_root, read_reply, read_later],
+            false,
+        );
+        assert_eq!(app.thread.focus, 1, "the entry row is focused");
+        assert!(!app.thread.following(), "a middle row is detached");
+        // The newest reply is deleted: the reader's row is now the newest.
+        app.remove_row(&later_id);
+        assert_eq!(app.thread.rows[app.thread.focus].event_id, reply);
+        assert!(
+            app.thread.following(),
+            "the focused row is the newest one after the deletion"
+        );
+        // A live reply now moves the reader: the view is on the tail.
+        let live = reply_event(&author, id, &root, &root, "live", 30);
+        let live_id = live.id.to_hex();
+        app.apply(
+            ChatEvent::Timeline {
+                channel: id,
+                event: live,
+            },
+            43,
+        );
+        assert_eq!(app.thread.rows[app.thread.focus].event_id, live_id);
+        assert_eq!(app.thread.observed_new, 0);
     }
 
     #[test]

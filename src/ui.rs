@@ -2732,8 +2732,9 @@ mod tests {
         wide.parent_id = Some(root_row.event_id.clone());
         wide.author = "字宽".to_owned();
         app.thread.rows = vec![root_row, wide];
+        // The focus on the last row is the follow: no flag to keep in step.
         app.thread.focus = 1;
-        app.thread.follow = true;
+        assert!(app.thread.following());
         for (width, height) in [(80u16, 12u16), (40, 10), (24, 6)] {
             let text = frame_text(&app, width, height);
             // A wide glyph owns two cells, so the buffer carries a blank
