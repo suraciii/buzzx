@@ -4,12 +4,13 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use nostr::Keys;
 use nostr::nips::nip19::ToBech32;
 use serde::Deserialize;
+
+use crate::platform;
 
 /// Exit code for a bad input, before any network call.
 pub const EXIT_USAGE: i32 = 1;
@@ -150,14 +151,9 @@ pub(crate) fn config_path() -> PathBuf {
     base.join("buzzx").join("config.toml")
 }
 pub(crate) fn read_config_file(path: &Path) -> Result<ConfigFile, StartupError> {
-    let meta = fs::metadata(path)
+    fs::metadata(path)
         .map_err(|e| StartupError::usage(format!("cannot read config {}: {e}", path.display())))?;
-    if meta.permissions().mode() & 0o077 != 0 {
-        return Err(StartupError::auth(format!(
-            "config {} is readable by other users; run chmod 600 on it",
-            path.display()
-        )));
-    }
+    platform::check_secret(path, "config").map_err(StartupError::auth)?;
     let text = fs::read_to_string(path)
         .map_err(|e| StartupError::usage(format!("cannot read config {}: {e}", path.display())))?;
     toml::from_str(&text)
@@ -272,13 +268,15 @@ fn render_body(http_url: &str, private_key: &str, auth_tag: Option<&str>) -> Str
 
 fn ensure_parent(path: &Path) -> Result<(), StartupError> {
     if let Some(parent) = path.parent() {
-        // Only a directory buzzx just created is chmodded; an existing
+        // Only a directory buzzx just created is restricted; an existing
         // ~/.config belongs to the user, not to this tool.
         let created = !parent.exists();
         fs::create_dir_all(parent)
             .map_err(|e| StartupError::other(format!("cannot create {}: {e}", parent.display())))?;
         if created {
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            // Only a platform with mode bits can fail here, which is where
+            // this message is read.
+            platform::restrict_dir(parent).map_err(|e| {
                 StartupError::other(format!("cannot chmod {}: {e}", parent.display()))
             })?;
         }
@@ -319,15 +317,18 @@ pub fn init_at(
     ensure_parent(path)?;
     fs::write(path, render_body(&http_url, private_key, auth_tag))
         .map_err(|e| StartupError::other(format!("cannot write {}: {e}", path.display())))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    platform::restrict_file(path)
         .map_err(|e| StartupError::other(format!("cannot chmod {}: {e}", path.display())))?;
+    // A write is a placement decision too, so a platform that cannot promise
+    // owner-only access reports the path here as well as on the next read.
+    platform::check_secret(path, "config").map_err(StartupError::auth)?;
     Ok(path.to_path_buf())
 }
 
 /// Write the config file for `buzzx login`. Unlike `init_at` this replaces
-/// an existing file, so the write is atomic: the new file is created 0600
-/// next to the target and renamed over it. A failure at any step leaves the
-/// previous file untouched.
+/// an existing file, so the write is atomic: the new file is created
+/// user-only next to the target and renamed over it. A failure at any step
+/// leaves the previous file untouched.
 pub fn replace_at(
     path: &Path,
     relay: &str,
@@ -351,17 +352,16 @@ pub fn clear_login_at(path: &Path, relay_url: Option<&str>) -> Result<PathBuf, S
     write_atomic(path, &body)
 }
 
-/// Create the replacement 0600 beside the target and rename it over. A
+/// Create the replacement user-only beside the target and rename it over. A
 /// failure at any step leaves the previous file untouched.
 fn write_atomic(path: &Path, body: &str) -> Result<PathBuf, StartupError> {
     ensure_parent(path)?;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let write = || -> Result<(), StartupError> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        platform::secret_create(&mut options);
+        let mut file = options
             .open(&tmp)
             .map_err(|e| StartupError::other(format!("cannot write {}: {e}", tmp.display())))?;
         file.write_all(body.as_bytes())
@@ -381,6 +381,7 @@ fn write_atomic(path: &Path, body: &str) -> Result<PathBuf, StartupError> {
             path.display()
         )));
     }
+    platform::check_secret(path, "config").map_err(StartupError::auth)?;
     Ok(path.to_path_buf())
 }
 
@@ -483,8 +484,10 @@ mod tests {
         let key = fixed_key();
         let written = init_at(&path, "https://relay.example/", &key, None).expect("init writes");
         assert_eq!(written, path);
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "config is not group or world accessible");
+        assert!(
+            platform::check_secret(&path, "config").is_ok(),
+            "a config this tool wrote is not readable by other users"
+        );
         assert!(
             init_at(&path, "http://other", &key, None).is_err(),
             "second init must not clobber"
@@ -539,8 +542,10 @@ mod tests {
         assert_eq!(after.private_key, None);
         assert_eq!(after.auth_tag, None);
         assert_eq!(after.relay_url.as_deref(), Some("https://relay.example"));
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "config stays user-only");
+        assert!(
+            platform::check_secret(&path, "config").is_ok(),
+            "config stays user-only"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

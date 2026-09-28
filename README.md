@@ -55,6 +55,9 @@ The desktop app makes the same split. `buzzx` mirrors it rather than
 inventing a new contract.
 
 ## Documents
+- [docs/installation.md](docs/installation.md) - how to install a release on
+  Linux, macOS, or Windows, and what the unsigned-binary warnings mean.
+
 - [design/decisions/0006-read-state.md](design/decisions/0006-read-state.md) -
   why the TUI uses encrypted per-client read-state markers and their limits.
 

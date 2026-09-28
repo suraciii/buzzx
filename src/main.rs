@@ -14,6 +14,7 @@ mod keys;
 mod layout;
 mod login;
 mod mentions;
+mod platform;
 mod read_state;
 mod session;
 mod sub;
@@ -76,7 +77,8 @@ enum Command {
     /// config file. Interactive when no key source is given.
     Login {
         /// Read the key from this file. The file must be readable by the
-        /// current user alone (0600).
+        /// current user alone: mode 0600 on Unix, and inside the user profile
+        /// on Windows.
         #[arg(long)]
         private_key_file: Option<PathBuf>,
         /// Read the key from stdin. Hidden when stdin is a terminal.
