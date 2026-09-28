@@ -356,17 +356,19 @@ pub enum Command {
     SearchMessages,
     MyAgents,
     CreateChannel,
+    About,
     Help,
     Quit,
 }
 
 impl Command {
     /// The list, in the order the palette shows it.
-    pub const ALL: [Command; 6] = [
+    pub const ALL: [Command; 7] = [
         Command::SwitchConversation,
         Command::SearchMessages,
         Command::MyAgents,
         Command::CreateChannel,
+        Command::About,
         Command::Help,
         Command::Quit,
     ];
@@ -376,6 +378,7 @@ impl Command {
             Command::SearchMessages => "Search messages",
             Command::MyAgents => "My agents",
             Command::CreateChannel => "Create channel",
+            Command::About => "About",
             Command::Help => "Help",
             Command::Quit => "Quit",
         }
@@ -388,6 +391,7 @@ impl Command {
             Command::SearchMessages => "/",
             Command::MyAgents => "a",
             Command::CreateChannel => "—",
+            Command::About => "—",
             Command::Help => "?",
             Command::Quit => "q",
         }
@@ -1219,6 +1223,7 @@ pub struct App {
     newest_fallback: bool,
     pub mode: Mode,
     pub help: bool,
+    pub about: bool,
     /// How far the help text is scrolled: at the minimum size the text is
     /// taller than the screen, and the whole of it must stay reachable.
     pub help_scroll: u16,
@@ -1344,6 +1349,7 @@ impl App {
             focus: 0,
             mode: Mode::Navigation,
             help: false,
+            about: false,
             help_scroll: 0,
             filter: Filter::All,
             views: HashMap::new(),
@@ -1443,6 +1449,7 @@ impl App {
         let mut view = self.clone();
         view.mode = Mode::Navigation;
         view.help = false;
+        view.about = false;
         view.help_scroll = 0;
         view.switcher_query.clear();
         view.switcher_saved_query.clear();
@@ -2029,7 +2036,7 @@ impl App {
         self.status = message;
     }
     pub fn overlay(&self) -> keys::Overlay {
-        if self.help {
+        if self.about || self.help {
             keys::Overlay::Help
         } else if self.create_channel.is_some() {
             keys::Overlay::CreateChannel
@@ -6393,6 +6400,7 @@ impl App {
                 self.refresh_create_channel()
             }
             Action::ToggleHelp => {
+                self.about = false;
                 self.help = !self.help;
                 if self.help {
                     // Help draws over whatever surface is under it and leaves
@@ -6403,7 +6411,10 @@ impl App {
                 }
             }
             Action::Dismiss => {
-                if self.help {
+                if self.about {
+                    self.about = false;
+                    self.note_presented();
+                } else if self.help {
                     self.help = false;
                     self.note_presented();
                 } else if self.community_picker.take().is_some() || self.palette.take().is_some() {
@@ -7032,6 +7043,7 @@ impl App {
             return;
         }
         self.help = false;
+        self.about = false;
         self.agents.open = false;
         self.community_picker = None;
         self.close_switcher();
@@ -7071,6 +7083,11 @@ impl App {
             Command::SearchMessages => self.open_search(false, now),
             Command::MyAgents => self.toggle_agents(),
             Command::CreateChannel => self.open_create_channel(),
+            Command::About => {
+                self.about = true;
+                self.help = false;
+                self.help_scroll = 0;
+            }
             Command::Help => {
                 self.help = true;
                 self.help_scroll = 0;
@@ -11312,6 +11329,15 @@ mod tests {
         app.handle(Action::Dismiss, 0);
         assert!(app.create_channel.is_none(), "Esc closes the form");
         assert!(take_commands(&mut app).is_empty(), "no channel was created");
+        // About is a diagnostic surface, not a relay action, and closes with
+        // the same overlay dismissal path as help.
+        app.handle(Action::TogglePalette, 0);
+        walk_palette(&mut app, Command::About);
+        app.handle(Action::PaletteConfirm, 0);
+        assert!(app.about);
+        assert_eq!(app.overlay(), keys::Overlay::Help);
+        app.handle(Action::Dismiss, 0);
+        assert!(!app.about);
         // Quit is the last command and sets the same flag `q` does.
         app.handle(Action::TogglePalette, 0);
         for _ in 0..Command::ALL.len() {

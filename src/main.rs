@@ -19,6 +19,8 @@ mod read_state;
 mod session;
 mod sub;
 mod ui;
+mod update;
+mod version;
 mod web;
 
 use std::future::Future;
@@ -39,7 +41,11 @@ use config::Resolved;
 const TICK: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
-#[command(name = "buzzx", about = "Terminal client for Buzz channel chat")]
+#[command(
+    name = "buzzx",
+    about = "Terminal client for Buzz channel chat",
+    version = version::version()
+)]
 struct Cli {
     /// Relay base URL. Overrides BUZZ_RELAY_URL and the config file.
     #[arg(long, global = true)]
@@ -86,6 +92,11 @@ enum Command {
         /// Channel UUID to watch.
         channel: String,
     },
+    /// Check the canonical GitHub Releases metadata without installing.
+    Update {
+        #[command(subcommand)]
+        action: cli::UpdateCommand,
+    },
     /// Log in: verify an identity against the relay and save it as the
     /// config file. Interactive when no key source is given.
     Login {
@@ -117,8 +128,8 @@ enum Command {
     /// Show the effective identity, community, and relay and where each
     /// came from. Local only: no relay connection, no secrets.
     Whoami,
-    /// Remove the saved private key and every saved auth tag from the
-    /// config file. The community profiles are kept.
+    /// Remove the saved private key and every saved auth tag from the config
+    /// file. The community profiles are kept.
     Logout {
         /// Confirm without a prompt. Required when stdin is not a terminal.
         #[arg(long)]
@@ -233,6 +244,10 @@ fn main() {
                     error.code
                 }
             },
+        },
+        Command::Update { action } => match block_on(cli::run_update(action)) {
+            Ok(code) => code,
+            Err(error) => cli::fail_startup(config::EXIT_OTHER, &error),
         },
         Command::Tui => run_tui(&cli),
         Command::Web => match resolve_identity(flags) {
@@ -427,6 +442,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             let show_cursor = app.mode == app::Mode::Composer
                 && layout != layout::LayoutMode::TooSmall
                 && !app.help
+                && !app.about
                 && app.switcher.is_none()
                 && app.palette.is_none()
                 && !app.agents.open;
