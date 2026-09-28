@@ -11,10 +11,11 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::agents;
 use crate::app::{
-    AgentStatus, App, Command, ConnState, Context, Filter, Marker, Mode, ReaderOrigin, Sections,
+    AgentStatus, App, ConnState, Context, Filter, Marker, Mode, ReaderOrigin, Sections,
 };
 use crate::content::{Row, short_pubkey};
 use crate::layout::{self, LayoutMode};
+use crate::slash::Command;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
@@ -757,9 +758,13 @@ fn draw_context(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let roomy = area.width >= 40 && area.height >= 16;
     let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
     let target_rows = u16::from(composing);
+    let suggestions = slash_suggestions(app);
+    // Title, keys, and status are the fixed rows; the rows keep one.
+    let slash_rows = slash_rows(&suggestions, area, 3 + target_rows + input_rows, true);
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(slash_rows),
         Constraint::Length(target_rows),
         Constraint::Length(input_rows),
         Constraint::Length(1),
@@ -787,8 +792,9 @@ fn draw_context(frame: &mut Frame, app: &App, now: u64, area: Rect) {
         },
     );
     if composing {
-        draw_composer_target(frame, app, column[2]);
-        draw_composer(frame, app, column[3]);
+        draw_slash_suggestions(frame, app, &suggestions, column[2]);
+        draw_composer_target(frame, app, column[3]);
+        draw_composer(frame, app, column[4]);
     }
     let keys = if composing {
         "Enter: send · Esc: cancel compose"
@@ -798,8 +804,8 @@ fn draw_context(frame: &mut Frame, app: &App, now: u64, area: Rect) {
         "j/k move · Enter reply · t thread · v read · [/] older/newer · Esc back"
     };
     frame.render_widget(
-        Paragraph::new(clip_with_ellipsis(keys, column[4].width as usize)),
-        column[4],
+        Paragraph::new(clip_with_ellipsis(keys, column[5].width as usize)),
+        column[5],
     );
     let status = if let Some(notice) = &app.context.notice {
         notice.clone()
@@ -816,10 +822,10 @@ fn draw_context(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(Line::styled(
-            clip_with_ellipsis(&status, column[5].width as usize),
+            clip_with_ellipsis(&status, column[6].width as usize),
             status_style(&status),
         )),
-        column[5],
+        column[6],
     );
 }
 
@@ -894,10 +900,20 @@ fn draw_column(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutM
     let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
     let target_rows = u16::from(composing);
     let gap_rows = u16::from(composing && roomy);
+    let typing_rows = u16::from(!typing.is_empty());
+    let suggestions = slash_suggestions(app);
+    // Header, keys, and status are the fixed rows; the timeline keeps one.
+    let slash_rows = slash_rows(
+        &suggestions,
+        area,
+        3 + typing_rows + target_rows + gap_rows + input_rows,
+        true,
+    );
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(u16::from(!typing.is_empty())),
+        Constraint::Length(typing_rows),
+        Constraint::Length(slash_rows),
         Constraint::Length(target_rows),
         Constraint::Length(gap_rows),
         Constraint::Length(input_rows),
@@ -909,11 +925,12 @@ fn draw_column(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutM
     draw_timeline(frame, app, column[1], now, false, roomy);
     draw_typing(frame, &typing, column[2]);
     if composing {
-        draw_composer_target(frame, app, column[3]);
-        draw_composer(frame, app, column[5]);
+        draw_slash_suggestions(frame, app, &suggestions, column[3]);
+        draw_composer_target(frame, app, column[4]);
+        draw_composer(frame, app, column[6]);
     }
-    draw_channel_keys(frame, area.width, column[6], composing);
-    draw_status(frame, app, column[7], wide);
+    draw_channel_keys(frame, area.width, column[7], composing);
+    draw_status(frame, app, column[8], wide);
 }
 
 /// The focused thread: one full-screen timeline at every size, with the
@@ -928,9 +945,18 @@ fn draw_thread(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutM
     let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
     let target_rows = u16::from(composing);
     let gap_rows = u16::from(composing && roomy);
+    let suggestions = slash_suggestions(app);
+    // Header, keys, and status are the fixed rows; the timeline keeps one.
+    let slash_rows = slash_rows(
+        &suggestions,
+        area,
+        3 + target_rows + gap_rows + input_rows,
+        true,
+    );
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(slash_rows),
         Constraint::Length(target_rows),
         Constraint::Length(gap_rows),
         Constraint::Length(input_rows),
@@ -941,11 +967,12 @@ fn draw_thread(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutM
     draw_thread_header(frame, app, column[0], compact);
     draw_thread_timeline(frame, app, column[1], now, compact, roomy);
     if composing {
-        draw_composer_target(frame, app, column[2]);
-        draw_composer(frame, app, column[4]);
+        draw_slash_suggestions(frame, app, &suggestions, column[2]);
+        draw_composer_target(frame, app, column[3]);
+        draw_composer(frame, app, column[5]);
     }
-    draw_thread_keys(frame, app, column[5], compact);
-    draw_thread_status(frame, app, column[6], compact);
+    draw_thread_keys(frame, app, column[6], compact);
+    draw_thread_status(frame, app, column[7], compact);
 }
 
 /// `Thread / #channel` and the way back. The back hint is reserved before the
@@ -1112,12 +1139,25 @@ fn draw_minimal(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     } else {
         String::new()
     };
+    let typing_rows = u16::from(!typing.is_empty());
+    let target_rows = u16::from(composing);
+    let input_rows = u16::from(composing);
+    let suggestions = slash_suggestions(app);
+    // Header, keys, and status are the fixed rows. At the floor the timeline
+    // gives its row to the one suggestion line rather than dropping it.
+    let slash_rows = slash_rows(
+        &suggestions,
+        area,
+        3 + typing_rows + target_rows + input_rows,
+        false,
+    );
     let column = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(if composing { 1 } else { 3 }),
-        Constraint::Length(u16::from(!typing.is_empty())),
-        Constraint::Length(u16::from(composing)),
-        Constraint::Length(u16::from(composing)),
+        Constraint::Length(typing_rows),
+        Constraint::Length(slash_rows),
+        Constraint::Length(target_rows),
+        Constraint::Length(input_rows),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -1126,11 +1166,12 @@ fn draw_minimal(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     draw_timeline(frame, app, column[1], now, true, false);
     draw_typing(frame, &typing, column[2]);
     if composing {
-        draw_composer_target(frame, app, column[3]);
-        draw_composer_line(frame, app, column[4]);
+        draw_slash_suggestions(frame, app, &suggestions, column[3]);
+        draw_composer_target(frame, app, column[4]);
+        draw_composer_line(frame, app, column[5]);
     }
-    draw_channel_keys(frame, area.width, column[5], composing);
-    draw_status(frame, app, column[6], false);
+    draw_channel_keys(frame, area.width, column[6], composing);
+    draw_status(frame, app, column[7], false);
 }
 
 fn draw_channel_keys(frame: &mut Frame, width: u16, area: Rect, composing: bool) {
@@ -1481,6 +1522,89 @@ fn cursor_offset(line: &str, cursor: usize, width: usize) -> usize {
     line[start..cursor].width()
 }
 
+/// The slash-command candidates the composer asks for. The list answers only
+/// while the composer holds a first-line command word and the cursor is still
+/// inside that word; past the word the draft is a command being filled in,
+/// not one being picked. The candidates are the ones this surface can run:
+/// offering a command that `Enter` would refuse is not a suggestion.
+fn slash_suggestions(app: &App) -> Vec<Command> {
+    if app.mode != Mode::Composer || !app.slash_open {
+        return Vec::new();
+    }
+    let Some(line) = app.composer.lines.first() else {
+        return Vec::new();
+    };
+    let word_end = line
+        .split_once(' ')
+        .map_or(line.len(), |(word, _)| word.len());
+    if app.composer.cursor.0 != 0 || app.composer.cursor.1 > word_end {
+        return Vec::new();
+    }
+    app.slash_candidates()
+}
+
+/// The most rows the list may take at this width: one on the tiny view, two
+/// in a narrow column, and all five once a summary fits beside the usage.
+fn slash_row_cap(width: u16) -> u16 {
+    if width >= 79 {
+        5
+    } else if width >= 40 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The rows the list takes from the timeline: the candidates, the width's
+/// cap, and what the frame spares once its `fixed` rows are paid. A surface
+/// that keeps the timeline reserves one row for it; the floor trades the
+/// timeline away for its single suggestion row instead.
+fn slash_rows(suggestions: &[Command], area: Rect, fixed: u16, keep_timeline: bool) -> u16 {
+    let spare = area.height.saturating_sub(fixed + u16::from(keep_timeline));
+    (suggestions.len() as u16)
+        .min(slash_row_cap(area.width))
+        .min(spare)
+}
+
+/// The suggestion list above the composer: the usage and, cells permitting,
+/// the summary of each candidate, the picked row reversed, every row clipped
+/// to the cells on hand.
+fn draw_slash_suggestions(frame: &mut Frame, app: &App, suggestions: &[Command], area: Rect) {
+    if area.is_empty() || suggestions.is_empty() {
+        return;
+    }
+    let width = area.width as usize;
+    let selected = app.slash_selected.min(suggestions.len().saturating_sub(1));
+    let window = scroll_window(suggestions.len(), area.height as usize, selected);
+    let usage_cells = suggestions[window.clone()]
+        .iter()
+        .map(|command| command.usage().width())
+        .max()
+        .unwrap_or(0);
+    let lines = window
+        .map(|at| {
+            let command = suggestions[at];
+            let mut line = if width > usage_cells + 2 {
+                Line::from(vec![
+                    Span::styled(format!("{:<usage_cells$}", command.usage()), action_style()),
+                    Span::raw("  "),
+                    Span::styled(
+                        clip_with_ellipsis(command.summary(), width - usage_cells - 2),
+                        pending_style(),
+                    ),
+                ])
+            } else {
+                Line::styled(clip_with_ellipsis(command.usage(), width), action_style())
+            };
+            if at == selected {
+                line = line.patch_style(highlight_style());
+            }
+            line
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
     if area.is_empty() {
         return;
@@ -1676,11 +1800,11 @@ fn draw_switcher_tabs(frame: &mut Frame, app: &App, area: Rect) {
 /// that runs each one. It takes the whole terminal, and it holds no state of
 /// its own beyond the cursor.
 fn draw_palette(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = Command::ALL
+    let items: Vec<ListItem> = Command::PALETTE
         .iter()
         .map(|command| {
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{:<20}", command.name())),
+                Span::raw(format!("{:<20}", command.label())),
                 Span::styled(command.key().to_owned(), pending_style()),
             ]))
         })
@@ -2115,6 +2239,9 @@ fn scroll_window(len: usize, rows: usize, focus: usize) -> std::ops::Range<usize
 /// terminal width is not the whole name, and the help text may wrap and
 /// scroll to show it.
 fn help_text(app: &App, mode: LayoutMode) -> String {
+    if let Some(detail) = &app.command_detail {
+        return detail.clone();
+    }
     let mut text = if app.reader.open {
         if mode == LayoutMode::Wide {
             READER_WIDE_HELP.to_owned()
@@ -2173,6 +2300,16 @@ fn help_text(app: &App, mode: LayoutMode) -> String {
             text.push_str(&format!("  {detail}\n"));
         }
     }
+    text.push_str("\nslash commands (composer):\n");
+    for command in Command::ALL {
+        text.push_str(&format!(
+            "  {:<21} {}\n",
+            command.usage(),
+            command.summary()
+        ));
+    }
+    text.push_str("  //text sends /text · Tab completes · Esc closes suggestions\n");
+
     text.push_str(
         "read state is shared with other terminals through the relay.\n\
          if a publish fails this terminal keeps its place and shows\n\
@@ -2406,8 +2543,13 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect, mode: LayoutMode) {
     let scroll = (app.help_scroll as usize).min(lines.len().saturating_sub(content_rows));
     let mut visible = Vec::with_capacity(area.height as usize);
     visible.push(Line::raw(format!(
-        "Help / {}",
-        clip_with_ellipsis(&help_context(app), width.saturating_sub(7)),
+        "{} / {}",
+        if app.command_detail.is_some() {
+            "Command"
+        } else {
+            "Help"
+        },
+        clip_with_ellipsis(&help_context(app), width.saturating_sub(10)),
     )));
     visible.extend(
         lines
@@ -2529,6 +2671,182 @@ mod tests {
             !text.contains("┌"),
             "the composer is not a full box: {text}"
         );
+    }
+
+    /// A composer holding a slash draft with the suggestion list open and the
+    /// cursor at the end of the command word.
+    fn slash_app(input: &str) -> App {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.mode = Mode::Composer;
+        app.composer.set_text(input);
+        app.composer.cursor = (0, input.len());
+        app.slash_open = true;
+        app
+    }
+
+    /// The rows the suggestion list claims: frame lines that start with the
+    /// `/` of a usage.
+    fn suggestion_rows(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|line| line.trim_start().starts_with('/'))
+            .collect()
+    }
+
+    #[test]
+    fn slash_suggestions_fit_every_frame_size() {
+        for (width, height, rows) in [(24u16, 6u16, 1usize), (40, 10, 2), (79, 12, 5), (80, 12, 5)]
+        {
+            let app = slash_app("/");
+            let text = frame_text(&app, width, height);
+            let suggestions = suggestion_rows(&text);
+            assert_eq!(
+                suggestions.len(),
+                rows,
+                "{width}x{height} gives the list {rows} row(s): {text}"
+            );
+            assert!(
+                text.contains("/help [command]"),
+                "{width}x{height} names the first candidate: {text}"
+            );
+            assert!(
+                text.contains("New message"),
+                "{width}x{height} keeps the target: {text}"
+            );
+            assert!(
+                text.contains("connected"),
+                "{width}x{height} keeps the status: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_suggestions_follow_the_typed_word() {
+        let app = slash_app("/se");
+        let text = frame_text(&app, 80, 12);
+        let rows = suggestion_rows(&text);
+        assert_eq!(rows.len(), 1, "only search matches: {text}");
+        assert!(rows[0].contains("/search [query]"), "{text}");
+    }
+
+    #[test]
+    fn a_named_command_suggests_itself_with_its_summary() {
+        let app = slash_app("/help");
+        let text = frame_text(&app, 80, 12);
+        let rows = suggestion_rows(&text);
+        assert_eq!(rows.len(), 1, "{text}");
+        assert!(rows[0].contains("/help [command]"), "{text}");
+        assert!(rows[0].contains("Show help"), "{text}");
+    }
+
+    #[test]
+    fn slash_suggestions_only_answer_a_first_word_cursor() {
+        // Past the command word the draft is arguments: the list is gone.
+        let app = slash_app("/help search");
+        let text = frame_text(&app, 80, 12);
+        assert!(suggestion_rows(&text).is_empty(), "arguments: {text}");
+        assert!(text.contains("hello"), "the timeline stays: {text}");
+        // The `//` escape is plain text.
+        let app = slash_app("//help");
+        let text = frame_text(&app, 80, 12);
+        assert!(suggestion_rows(&text).is_empty(), "escaped: {text}");
+        // Esc dismissed the list.
+        let mut app = slash_app("/");
+        app.slash_open = false;
+        let text = frame_text(&app, 80, 12);
+        assert!(suggestion_rows(&text).is_empty(), "dismissed: {text}");
+        // A second line ends the candidate.
+        let mut app = slash_app("/help");
+        app.composer.set_text("/help\nmore");
+        app.composer.cursor = (1, 1);
+        let text = frame_text(&app, 80, 12);
+        assert!(suggestion_rows(&text).is_empty(), "multi-line: {text}");
+        // Inside the word, even mid-word, the list still answers.
+        let mut app = slash_app("/help");
+        app.composer.cursor = (0, 2);
+        let text = frame_text(&app, 80, 12);
+        assert_eq!(
+            suggestion_rows(&text).len(),
+            1,
+            "cursor inside the word: {text}"
+        );
+    }
+
+    #[test]
+    fn the_picked_suggestion_is_reversed_and_the_window_follows_it() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = slash_app("/");
+        app.slash_selected = 1;
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app, 130))
+            .expect("test frame");
+        let buffer = terminal.backend().buffer().clone();
+        let row_y = |needle: &str| -> Option<u16> {
+            (0..12).find(|&y| {
+                let row: String = (0..80).map(|x| buffer[(x, y)].symbol()).collect();
+                row.contains(needle)
+            })
+        };
+        let picked = row_y("/search [query]").expect("the picked row is on screen");
+        let plain = row_y("/help [command]").expect("the first row is on screen");
+        assert!(
+            buffer[(0, picked)].modifier.contains(Modifier::REVERSED),
+            "the picked row is reversed"
+        );
+        assert!(
+            !buffer[(0, plain)].modifier.contains(Modifier::REVERSED),
+            "the other rows are plain"
+        );
+        // Two visible rows and the pick at the end: the window scrolls to it.
+        let mut app = slash_app("/");
+        app.slash_selected = 4;
+        let text = frame_text(&app, 40, 10);
+        let rows = suggestion_rows(&text);
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(
+            rows[1].contains("/agents"),
+            "the pick stays visible: {text}"
+        );
+        assert!(!text.contains("/help [command]"), "scrolled off: {text}");
+    }
+
+    #[test]
+    fn the_thread_composer_shows_suggestions_above_it() {
+        let (mut app, _keys) = thread_app(false);
+        app.mode = Mode::Composer;
+        app.composer.set_text("/");
+        app.composer.cursor = (0, 1);
+        app.slash_open = true;
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("Thread / #general"), "{text}");
+        assert!(!suggestion_rows(&text).is_empty(), "{text}");
+        assert!(text.contains("connected"), "the status stays: {text}");
+    }
+
+    #[test]
+    fn the_thread_surface_offers_only_the_commands_it_can_run() {
+        let (mut app, _keys) = thread_app(false);
+        app.mode = Mode::Composer;
+        app.composer.set_text("/");
+        app.composer.cursor = (0, 1);
+        app.slash_open = true;
+        let text = frame_text(&app, 80, 12);
+        let rows = suggestion_rows(&text);
+        assert!(
+            rows.iter().any(|row| row.contains("/status")),
+            "the commands the thread runs stay: {text}"
+        );
+        assert!(rows.iter().any(|row| row.contains("/search")), "{text}");
+        assert!(
+            !text.contains("/switch") && !text.contains("/agents") && !text.contains("/thread"),
+            "a command the surface refuses is not offered: {text}"
+        );
+
+        // The same draft in the channel offers the whole registry.
+        let app = slash_app("/");
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("/switch"), "{text}");
     }
 
     #[test]
@@ -3270,7 +3588,7 @@ mod tests {
         // Every row of the help text is reachable by scrolling, at the
         // smallest size, including the label and the read-state limit.
         let mut seen = first.clone();
-        for _ in 0..24 {
+        for _ in 0..120 {
             app.handle(crate::keys::Action::HelpScroll(1), 0);
             seen.push_str(&frame_text(&app, 24, 6));
         }

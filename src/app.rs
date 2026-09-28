@@ -13,6 +13,7 @@ use crate::config;
 use crate::content::{self, Row};
 use crate::keys::{self, Action, PAGE_ROWS};
 use crate::session::{ChatEvent, HistorySurface, SessionCommand};
+use crate::slash::{self, Command as SlashCommand, Parse};
 
 /// One answered history page, grouped the way the view that asked reads it.
 struct HistoryPageRead {
@@ -319,49 +320,7 @@ impl Filter {
     }
 }
 
-/// One command the palette offers. The palette is a directory of actions the
-/// timeline already has: every entry routes to the same handler its own key
-/// reaches, and the palette owns no state of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Command {
-    SwitchConversation,
-    SearchMessages,
-    MyAgents,
-    Help,
-    Quit,
-}
-
-impl Command {
-    /// The list, in the order the palette shows it.
-    pub const ALL: [Command; 5] = [
-        Command::SwitchConversation,
-        Command::SearchMessages,
-        Command::MyAgents,
-        Command::Help,
-        Command::Quit,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Command::SwitchConversation => "Switch conversation",
-            Command::SearchMessages => "Search messages",
-            Command::MyAgents => "My agents",
-            Command::Help => "Help",
-            Command::Quit => "Quit",
-        }
-    }
-
-    /// The key that runs the same command without the palette.
-    pub fn key(self) -> &'static str {
-        match self {
-            Command::SwitchConversation => "c",
-            Command::SearchMessages => "/",
-            Command::MyAgents => "a",
-            Command::Help => "?",
-            Command::Quit => "q",
-        }
-    }
-}
+// Command metadata and parsing live in slash.rs; palette and composer use it.
 
 /// The switcher's own state: a cursor tied to a conversation, so a filter change
 /// or a removal cannot move it onto a different conversation.
@@ -640,6 +599,12 @@ pub struct ThreadView {
     /// opened, and its index, for a row that was deleted meanwhile.
     saved_row: Option<String>,
     saved_index: usize,
+    /// The composer's targets on the surface the thread was opened from.
+    /// Leaving the thread puts them back: a thread visit is navigation, and
+    /// it must not silently turn a prepared reply into a new message. `None`
+    /// means the surface owns its targets itself and the thread leaves them
+    /// alone, which is the case for a thread opened inside the context view.
+    saved_targets: Option<(Option<ReplyTarget>, Option<EditTarget>)>,
 }
 
 impl ThreadView {
@@ -989,6 +954,7 @@ pub struct App {
     /// How far the help text is scrolled: at the minimum size the text is
     /// taller than the screen, and the whole of it must stay reachable.
     pub help_scroll: u16,
+    pub command_detail: Option<String>,
     /// The Inbox filter in effect. The sidebar and the switcher both show it.
     pub filter: Filter,
     /// The order each filtered view shows conversations in.
@@ -1001,9 +967,10 @@ pub struct App {
     /// The switcher's state while it is open. Every layout opens it with `c`;
     /// it is the only conversation list the client draws.
     pub switcher: Option<Switcher>,
-    /// The command palette's cursor while it is open: an index into
-    /// [`Command::ALL`]. Every layout opens it with `Ctrl+P`.
+    /// Cursor into the shared palette command directory.
     pub palette: Option<usize>,
+    pub slash_open: bool,
+    pub slash_selected: usize,
     /// The saved-community selector's focused profile index. `C` opens it.
     pub community_picker: Option<usize>,
     /// Whether the relay described every roster row. False means the list is a
@@ -1090,6 +1057,7 @@ impl App {
             mode: Mode::Navigation,
             help: false,
             help_scroll: 0,
+            command_detail: None,
             filter: Filter::All,
             views: HashMap::new(),
             shortcuts: Vec::new(),
@@ -1098,6 +1066,8 @@ impl App {
             switcher_editing: false,
             switcher: None,
             palette: None,
+            slash_open: false,
+            slash_selected: 0,
             newest_fallback: false,
             community_picker: None,
             roster_complete: false,
@@ -3636,6 +3606,9 @@ impl App {
             buffered_overlays: Vec::new(),
             saved_row: None,
             saved_index: self.context.focus,
+            // The context view keeps its own composer target while the
+            // thread is open, exactly as its own Esc does.
+            saved_targets: None,
         };
         self.outbox.push(SessionCommand::OpenThread {
             channel: self.thread.channel,
@@ -4230,6 +4203,9 @@ impl App {
         let root = row.root_id.clone().unwrap_or_else(|| row.event_id.clone());
         let saved_row = row.event_id.clone();
         let saved_index = self.focus;
+        // A composer aimed at a channel row keeps that target across the
+        // thread visit: the thread is opened from here, not instead of here.
+        let saved_targets = (self.composer.reply.clone(), self.composer.edit.clone());
         self.thread_request = self.thread_request.wrapping_add(1);
         let request = self.thread_request;
         // Only one view is on screen at a time.
@@ -4260,6 +4236,7 @@ impl App {
             pending_writes: HashSet::new(),
             saved_row: Some(saved_row),
             saved_index,
+            saved_targets: Some(saved_targets),
         };
         self.outbox.push(SessionCommand::OpenThread {
             channel,
@@ -4286,16 +4263,21 @@ impl App {
             self.note("Wait for send result");
             return;
         }
+        // The thread's reply target dies with the thread; the target the
+        // composer held on the way in is still the reader's aim, and leaving
+        // the thread is navigation, not a reason to drop it. A thread opened
+        // inside the context view saved nothing, so the context keeps its
+        // own target untouched.
+        if let Some((reply, edit)) = self.thread.saved_targets.take() {
+            self.composer.reply = reply;
+            self.composer.edit = edit;
+        }
         if self.thread_return_context {
             self.thread_return_context = false;
             self.thread.open = false;
             self.context.open = true;
             return;
         }
-        // An empty buffer leaves no thread-only target behind: the next
-        // channel composition cannot inherit a thread reply or edit.
-        self.composer.reply = None;
-        self.composer.edit = None;
         let return_context = self.thread_return_context;
         self.thread_return_context = false;
         self.thread.open = false;
@@ -5479,6 +5461,9 @@ impl App {
             Mode::Navigation => self.handle_navigation(action, now),
             Mode::Composer => self.handle_composer(action, now),
         }
+        if !self.help {
+            self.command_detail = None;
+        }
     }
 
     fn handle_navigation(&mut self, action: Action, now: u64) {
@@ -5828,30 +5813,40 @@ impl App {
         match action {
             Action::OpenSearch => self.open_search(true, now),
             Action::Quit => self.quit = true,
-            Action::ComposerInput(c) => self.composer.input(c),
-            Action::ComposerBackspace => self.composer.backspace(),
-            Action::ComposerNewline => self.composer.newline(),
+            Action::ComposerInput(c) => {
+                self.composer.input(c);
+                self.slash_open = self.slash_eligible();
+                self.slash_selected = 0;
+            }
+            Action::ComposerBackspace => {
+                self.composer.backspace();
+                self.slash_open = self.slash_eligible();
+                self.slash_selected = 0;
+            }
+            Action::ComposerNewline => {
+                self.composer.newline();
+                self.slash_open = false;
+            }
+            Action::ComposerCursorUp if self.slash_open && self.slash_eligible() => {
+                self.slash_selected = self.slash_selected.saturating_sub(1);
+            }
+            Action::ComposerCursorDown if self.slash_open && self.slash_eligible() => {
+                let count = self.slash_candidates().len();
+                self.slash_selected = (self.slash_selected + 1).min(count.saturating_sub(1));
+            }
+            Action::SlashComplete => self.complete_slash(),
+            Action::ComposerEscape if self.slash_open && self.slash_eligible() => {
+                self.slash_open = false;
+            }
+            Action::ComposerEscape => self.escape_composer(),
             Action::ComposerCursorUp => self.composer.up(),
             Action::ComposerCursorDown => self.composer.down(),
             Action::ComposerCursorLeft => self.composer.left(),
             Action::ComposerCursorRight => self.composer.right(),
             Action::ComposerHome => self.composer.home(),
             Action::ComposerEnd => self.composer.end(),
-            Action::ComposerEscape => {
-                if self.thread.open || self.context.open {
-                    // The thread composer leaves in one press and keeps its
-                    // reply or edit destination: a cancelled thread reply must
-                    // never become a top-level channel send.
-                    self.mode = Mode::Navigation;
-                } else if self.composer.reply.take().is_none()
-                    && self.composer.edit.take().is_none()
-                {
-                    // First Esc clears the target; the second leaves the
-                    // composer with the text kept.
-                    self.mode = Mode::Navigation;
-                }
-            }
-            Action::ComposerSend => self.send_composer(now),
+            Action::ComposerSend => self.submit_composer(now),
+            Action::ComposerSendLiteral => self.send_composer(now),
             Action::Ignored => {}
             _ => {}
         }
@@ -6118,30 +6113,276 @@ impl App {
         let Some(at) = self.palette else {
             return;
         };
-        let last = Command::ALL.len().saturating_sub(1) as isize;
+        let last = SlashCommand::PALETTE.len().saturating_sub(1) as isize;
         self.palette = Some((at as isize + step).clamp(0, last) as usize);
     }
 
-    /// Enter inside the palette: run the selected command through the same
-    /// handler its own key reaches.
     fn run_palette(&mut self, now: u64) {
         let Some(command) = self
             .palette
             .take()
-            .and_then(|at| Command::ALL.get(at).copied())
+            .and_then(|at| SlashCommand::PALETTE.get(at).copied())
         else {
             return;
         };
+        self.run_command(command, "", false, now);
+    }
+
+    fn run_command(
+        &mut self,
+        command: SlashCommand,
+        args: &str,
+        from_composer: bool,
+        now: u64,
+    ) -> bool {
         match command {
-            Command::SwitchConversation => self.toggle_switcher(),
-            Command::SearchMessages => self.open_search(false, now),
-            Command::MyAgents => self.toggle_agents(),
-            Command::Help => {
+            SlashCommand::Help => {
+                self.command_detail = SlashCommand::ALL
+                    .iter()
+                    .find(|entry| entry.name() == args)
+                    .map(|entry| self.command_help(*entry));
                 self.help = true;
                 self.help_scroll = 0;
             }
-            Command::Quit => self.quit = true,
+            SlashCommand::Search => {
+                if self.thread.open && self.thread_return_context {
+                    // This thread was opened from a context, and that context
+                    // came from a search: leave the thread, then leave the
+                    // context, and land back on the search.
+                    self.leave_thread();
+                    if self.thread.open {
+                        return false;
+                    }
+                }
+                if self.context.open {
+                    // Back to the search this conversation was opened from.
+                    // Its results and filters stay, the context keeps its own
+                    // draft and target exactly as its own Esc does, and the
+                    // arguments, if any, become the pending query.
+                    self.context.open = false;
+                    self.search.open = true;
+                    self.search.editing = true;
+                    self.search.query = args.to_owned();
+                    self.mode = Mode::Navigation;
+                } else {
+                    self.open_search(from_composer, now);
+                    if !self.search.open {
+                        return false;
+                    }
+                    self.search.query = args.to_owned();
+                }
+            }
+            SlashCommand::Switch => {
+                self.toggle_switcher();
+                if self.switcher.is_none() {
+                    return false;
+                }
+                self.switcher_query = args.to_owned();
+                self.switcher_editing = !args.is_empty();
+                self.settle_on_query();
+            }
+            SlashCommand::Thread => {
+                if self.context.open {
+                    self.open_context_thread();
+                } else {
+                    self.open_thread();
+                }
+                if !self.thread.open {
+                    return false;
+                }
+            }
+            SlashCommand::Agents => self.toggle_agents(),
+            SlashCommand::Status => {
+                self.command_detail = Some(self.command_status());
+                self.help = true;
+                self.help_scroll = 0;
+            }
+            SlashCommand::Quit => self.quit = true,
         }
+        true
+    }
+
+    fn command_status(&self) -> String {
+        let target = if self.composer.edit.is_some() {
+            "edit"
+        } else if self.composer.reply.is_some() {
+            "reply"
+        } else {
+            "new"
+        };
+        let membership = self
+            .action_channel()
+            .is_some_and(|id| self.channels.iter().any(|entry| entry.id == id));
+        let channel = self
+            .action_channel()
+            .map(|id| self.label_for(id))
+            .unwrap_or_else(|| "none".to_owned());
+        format!(
+            "relay: {}\ncommunity: {}\nchannel: {}\nconnection: {}\nmember: {}\ndraft: {}\ntarget: {}",
+            self.relay_label,
+            self.community_name,
+            channel,
+            self.conn_word(),
+            membership,
+            !self.composer.text().is_empty(),
+            target
+        )
+    }
+
+    fn conn_word(&self) -> &'static str {
+        match self.conn {
+            ConnState::Connecting => "connecting",
+            ConnState::Connected => "connected",
+            ConnState::Reconnecting => "reconnecting",
+        }
+    }
+
+    fn slash_eligible(&self) -> bool {
+        self.composer.cursor.0 == 0
+            && self.composer.lines.len() == 1
+            && self.composer.lines[0].starts_with('/')
+            && !self.composer.lines[0].starts_with("//")
+            && self.composer.cursor.1
+                <= self.composer.lines[0]
+                    .split_once(' ')
+                    .map_or(self.composer.lines[0].len(), |(name, _)| name.len())
+    }
+
+    fn complete_slash(&mut self) {
+        if !self.slash_open || !self.slash_eligible() {
+            return;
+        }
+        let text = self.composer.text();
+        let Some(command) = self.slash_candidates().get(self.slash_selected).copied() else {
+            return;
+        };
+        let suffix = text.split_once(' ').map_or("", |(_, suffix)| suffix);
+        let completed = if suffix.is_empty() {
+            format!("/{} ", command.name())
+        } else {
+            format!("/{} {suffix}", command.name())
+        };
+        self.composer.set_text(&completed);
+        self.composer.cursor = (0, command.name().len() + 1);
+        self.slash_selected = 0;
+    }
+
+    fn escape_composer(&mut self) {
+        if self.thread.open
+            || self.context.open
+            || (self.composer.reply.take().is_none() && self.composer.edit.take().is_none())
+        {
+            self.mode = Mode::Navigation;
+        }
+        self.slash_open = false;
+    }
+
+    fn submit_composer(&mut self, now: u64) {
+        let text = self.composer.text();
+        if self.composer.edit.is_none() {
+            match slash::parse(&text) {
+                Parse::Escaped(content) => {
+                    self.composer.set_text(content);
+                    self.send_composer(now);
+                    if self.mode == Mode::Composer {
+                        self.composer.set_text(&text);
+                    }
+                    return;
+                }
+                Parse::Invalid(command) => {
+                    self.note(format!("usage: {}", command.usage()));
+                    return;
+                }
+                Parse::Known(command, args) => {
+                    if !self.command_allowed(command) {
+                        self.note("command unavailable here; draft kept");
+                        return;
+                    }
+                    if command == SlashCommand::Thread {
+                        let confirmed = if self.context.open {
+                            self.context.focused()
+                        } else {
+                            self.focused_row()
+                        };
+                        if !confirmed.is_some_and(|row| !row.pending && is_event_id(&row.event_id))
+                        {
+                            self.note("no confirmed message to open a thread from");
+                            return;
+                        }
+                    }
+                    // The guards read the composer as the next surface would
+                    // carry it, and the command text is not part of that: it
+                    // is taken out of the way before the command runs and put
+                    // back, with the rest of the draft, if the command is
+                    // refused. A target is not text, so it stays either way:
+                    // navigation never drops the reader's aim, and a command
+                    // that succeeds leaves the line empty.
+                    let saved = self.composer.clone();
+                    self.composer.set_text("");
+                    let ran = self.run_command(command, args, true, now);
+                    if !ran {
+                        self.composer = saved;
+                        return;
+                    }
+                    self.slash_open = false;
+                    // The line was consumed by the command; what it showed
+                    // belongs to the view the command opened or focused.
+                    self.mode = Mode::Navigation;
+                    return;
+                }
+                Parse::Plain | Parse::Unknown => {}
+            }
+        }
+        self.send_composer(now);
+    }
+
+    /// The surface the composer is on, named the way the registry names the
+    /// surfaces a command runs on. The composer is drawn over exactly one of
+    /// these views, and the reader comes first because it owns every key
+    /// while it is open.
+    fn surface_name(&self) -> &'static str {
+        if self.reader.open {
+            "reader"
+        } else if self.context.open {
+            "context"
+        } else if self.thread.open {
+            "thread"
+        } else {
+            "channel"
+        }
+    }
+
+    fn command_allowed(&self, command: SlashCommand) -> bool {
+        let here = self.surface_name();
+        command.surfaces().contains(&here)
+    }
+
+    /// The commands the picker offers: the parser's matches for the current
+    /// draft, minus the ones this surface would refuse, capped last. The
+    /// completion key, the cursor, and the drawn list all read this one list,
+    /// so the picker can never offer what `Enter` rejects.
+    pub fn slash_candidates(&self) -> Vec<SlashCommand> {
+        slash::suggestions(&self.composer.text())
+            .into_iter()
+            .filter(|command| self.command_allowed(*command))
+            .take(slash::MAX_SUGGESTIONS)
+            .collect()
+    }
+
+    /// One command's help: what it does, where it runs, and whether this
+    /// surface is one of them.
+    fn command_help(&self, command: SlashCommand) -> String {
+        let here = if self.command_allowed(command) {
+            "available here"
+        } else {
+            "not available here"
+        };
+        format!(
+            "{}: {}\nsurfaces: {}\n{here}",
+            command.usage(),
+            command.summary(),
+            command.surfaces().join(", ")
+        )
     }
 
     /// Keep the row the reader was on with the conversation it belongs to, so
@@ -6932,6 +7173,322 @@ mod tests {
         );
         app.take_outbox();
         (app, id, root, reply, author)
+    }
+    #[test]
+    fn slash_commands_preserve_message_send_and_invalid_drafts() {
+        let (mut app, _id, _root, _reply, _) = channel_with_a_reply();
+        app.mode = Mode::Composer;
+        app.composer.set_text("/thread extra");
+        app.handle(Action::ComposerSend, 40);
+        assert_eq!(app.composer.text(), "/thread extra");
+        assert!(!app.thread.open);
+        assert!(take_commands(&mut app).is_empty());
+
+        app.composer.set_text("/unlisted x");
+        app.handle(Action::ComposerSend, 40);
+        assert!(take_commands(&mut app).iter().any(|command| matches!(command, SessionCommand::Send { content, .. } if content == "/unlisted x")));
+
+        app.mode = Mode::Composer;
+        app.composer.set_text("//search old decision");
+        app.handle(Action::ComposerSend, 40);
+        assert!(take_commands(&mut app).iter().any(|command| matches!(command, SessionCommand::Send { content, .. } if content == "/search old decision")));
+        assert!(!app.search.open);
+    }
+
+    #[test]
+    fn explicit_web_send_keeps_known_slash_message_literal() {
+        let (mut app, _, _, _, _) = channel_with_a_reply();
+        app.mode = Mode::Composer;
+        app.composer.set_text("/search ordinary prose");
+        app.handle(Action::ComposerSendLiteral, 40);
+        assert!(!app.search.open);
+        assert!(take_commands(&mut app).iter().any(|command| matches!(command, SessionCommand::Send { content, .. } if content == "/search ordinary prose")));
+    }
+
+    #[test]
+    fn slash_search_return_clears_command_but_keeps_target() {
+        let (mut app, _, _, reply, _) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::ComposeReply, 40);
+        assert_eq!(
+            app.composer.reply.as_ref().map(|target| &target.event_id),
+            Some(&reply)
+        );
+        app.composer.set_text("/search old decision");
+        app.handle(Action::ComposerSend, 40);
+        assert!(app.search.open);
+        assert_eq!(app.search.query, "old decision");
+        assert!(take_commands(&mut app).is_empty());
+        app.handle(Action::Dismiss, 40);
+        app.handle(Action::Dismiss, 40);
+        assert!(!app.search.open);
+        assert_eq!(app.composer.text(), "");
+        assert_eq!(
+            app.composer.reply.as_ref().map(|target| &target.event_id),
+            Some(&reply)
+        );
+    }
+
+    #[test]
+    fn slash_status_shows_complete_read_only_snapshot() {
+        let (mut app, _, _, _, _) = channel_with_a_reply();
+        app.mode = Mode::Composer;
+        app.composer.set_text("/status");
+        app.handle(Action::ComposerSend, 40);
+        assert!(app.help);
+        let detail = app.command_detail.as_deref().expect("status detail");
+        assert!(detail.contains("relay: http://relay.test"));
+        assert!(detail.contains("channel: c1"));
+        assert!(detail.contains("connection:"));
+        assert!(detail.contains("member: true"));
+        assert!(detail.contains("target: new"));
+        assert!(take_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn slash_picker_completion_and_escape_keep_draft() {
+        let (mut app, _, _, _, _) = channel_with_a_reply();
+        app.mode = Mode::Composer;
+        app.handle(Action::ComposerInput('/'), 40);
+        assert!(app.slash_open);
+        app.handle(Action::ComposerCursorDown, 40);
+        app.handle(Action::SlashComplete, 40);
+        assert_eq!(app.composer.text(), "/search ");
+        app.handle(Action::ComposerEscape, 40);
+        assert_eq!(app.mode, Mode::Composer);
+        assert_eq!(app.composer.text(), "/search ");
+        assert!(!app.slash_open);
+        assert!(take_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn slash_thread_reuses_focus_and_guards_thread_scope() {
+        let (mut app, _, root, _, _) = channel_with_a_reply();
+        app.handle(Action::ComposeReply, 40);
+        app.composer.set_text("/thread");
+        app.handle(Action::ComposerSend, 40);
+        assert!(app.thread.open);
+        assert_eq!(app.thread.root, root);
+        assert_eq!(app.composer.text(), "");
+        assert!(
+            take_commands(&mut app)
+                .iter()
+                .any(|command| matches!(command, SessionCommand::OpenThread { .. }))
+        );
+
+        app.mode = Mode::Composer;
+        app.composer.set_text("/switch other");
+        app.handle(Action::ComposerSend, 41);
+        assert_eq!(app.composer.text(), "/switch other");
+        assert!(app.switcher.is_none());
+        assert!(take_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn slash_thread_keeps_the_target_it_was_opened_from() {
+        let (mut app, _, root, reply, _) = channel_with_a_reply();
+        app.handle(Action::ComposeReply, 40);
+        app.composer.set_text("/thread");
+        app.handle(Action::ComposerSend, 40);
+        assert!(app.thread.open);
+        assert_eq!(app.thread.root, root);
+        assert_eq!(app.composer.text(), "", "the command line is consumed");
+        assert_eq!(
+            app.composer.reply.as_ref().map(|target| &target.event_id),
+            Some(&reply),
+            "opening a thread does not drop the target the composer held"
+        );
+        take_commands(&mut app);
+
+        app.handle(Action::ThreadLeave, 41);
+        assert!(!app.thread.open);
+        assert_eq!(
+            app.composer.reply.as_ref().map(|target| &target.event_id),
+            Some(&reply),
+            "leaving the thread restores the aim the visit started with"
+        );
+    }
+
+    /// A search with one hit, opened into the context view, with a reply
+    /// draft in that context's composer.
+    fn searching_in_a_context() -> (App, Uuid, String) {
+        let (mut app, id, token) = searching();
+        let author = keys();
+        let hit = message_event(&author, id, "the hit", 20);
+        app.apply(
+            ChatEvent::Search {
+                request: token,
+                events: vec![hit.clone()],
+            },
+            21,
+        );
+        app.handle(Action::SearchSubmit, 22);
+        app.apply(
+            ChatEvent::Context {
+                channel: id,
+                target: hit.id.to_hex(),
+                request: app.context.request,
+                events: vec![hit.clone()],
+                before_complete: true,
+                after_complete: true,
+            },
+            23,
+        );
+        app.handle(Action::ContextReply, 24);
+        assert!(
+            app.context_draft,
+            "the context composer holds a reply draft"
+        );
+        app.take_outbox();
+        (app, id, hit.id.to_hex())
+    }
+
+    #[test]
+    fn slash_search_from_the_context_returns_to_the_search_it_came_from() {
+        let (mut app, _id, target) = searching_in_a_context();
+        app.composer.set_text("/search later");
+        app.handle(Action::ComposerSend, 25);
+        assert!(!app.context.open, "the context layer is left behind");
+        assert!(app.search.open, "the search underneath is the destination");
+        assert!(app.search.editing);
+        assert_eq!(
+            app.search.query, "later",
+            "the arguments are the pending query"
+        );
+        assert_eq!(
+            app.search.applied_query, "decision",
+            "the applied query is the one the results answer"
+        );
+        assert_eq!(app.search.results.len(), 1, "the same read stays on screen");
+        assert_eq!(app.mode, Mode::Navigation);
+        assert!(app.context_draft, "the context keeps its own draft");
+        assert_eq!(
+            app.composer.reply.as_ref().map(|target| &target.event_id),
+            Some(&target),
+            "and its target"
+        );
+        assert!(
+            take_commands(&mut app).is_empty(),
+            "no second search is started"
+        );
+
+        // Esc returns to the results, and Enter on the same one returns to
+        // the same context view.
+        app.handle(Action::Dismiss, 26);
+        assert!(!app.search.editing);
+        assert_eq!(app.search.query, "decision", "the applied query is back");
+        app.handle(Action::SearchSubmit, 26);
+        assert!(app.context.open);
+        assert_eq!(app.context.target, target);
+    }
+
+    #[test]
+    fn slash_search_from_a_context_thread_leaves_both_layers() {
+        let (mut app, _id, target) = searching_in_a_context();
+        app.composer.clear();
+        app.mode = Mode::Navigation;
+        app.handle(Action::ContextOpenThread, 25);
+        assert!(app.thread.open);
+        assert!(app.thread_return_context);
+        app.mode = Mode::Composer;
+        app.composer.set_text("/search later");
+        app.handle(Action::ComposerSend, 26);
+        assert!(!app.thread.open, "the thread is left");
+        assert!(
+            !app.context.open,
+            "and so is the context it was opened from"
+        );
+        assert!(app.search.open, "the search is the destination");
+        assert_eq!(app.search.query, "later");
+        assert_eq!(app.search.results.len(), 1);
+        assert_eq!(app.mode, Mode::Navigation);
+        assert_eq!(
+            app.context.target, target,
+            "the context keeps the result it was opened on"
+        );
+    }
+
+    #[test]
+    fn command_help_from_a_context_is_dismissed_before_the_context_is_left() {
+        let (mut app, _id, _target) = searching_in_a_context();
+        app.composer.set_text("/help");
+        app.handle(Action::ComposerSend, 25);
+        assert!(app.help);
+        assert!(app.context.open);
+        app.handle(Action::Dismiss, 26);
+        assert!(!app.help, "the first Esc closes the help");
+        assert!(app.context.open, "and leaves the context where it was");
+        app.handle(Action::Dismiss, 27);
+        assert!(!app.context.open, "the next one leaves the context");
+        assert!(app.search.open);
+    }
+
+    #[test]
+    fn command_help_names_the_surfaces_a_command_runs_on() {
+        let (mut app, _, _, _, _) = channel_with_a_reply();
+        app.mode = Mode::Composer;
+        app.composer.set_text("/help search");
+        app.handle(Action::ComposerSend, 40);
+        let detail = app.command_detail.as_deref().expect("search help");
+        assert!(
+            detail.contains("surfaces: channel, context, thread"),
+            "{detail}"
+        );
+        assert!(detail.contains("available here"), "{detail}");
+
+        // From the thread, the same command is refused by the guard, and its
+        // help says why.
+        app.handle(Action::Dismiss, 41);
+        app.handle(Action::OpenThread, 41);
+        assert!(app.thread.open);
+        app.mode = Mode::Composer;
+        app.composer.set_text("/help switch");
+        app.handle(Action::ComposerSend, 42);
+        let detail = app.command_detail.as_deref().expect("switch help");
+        assert!(detail.contains("surfaces: channel"), "{detail}");
+        assert!(detail.contains("not available here"), "{detail}");
+
+        // The refused command keeps its line and reports the surface.
+        app.mode = Mode::Composer;
+        app.composer.set_text("/switch other");
+        app.handle(Action::ComposerSend, 43);
+        assert_eq!(app.composer.text(), "/switch other");
+        assert!(app.switcher.is_none());
+    }
+
+    #[test]
+    fn slash_status_reports_the_consumed_line_and_the_live_target() {
+        let (mut app, _, _, reply, _) = channel_with_a_reply();
+        app.set_focus(1);
+        app.handle(Action::ComposeReply, 40);
+        app.composer.set_text("/status");
+        app.handle(Action::ComposerSend, 41);
+        let detail = app.command_detail.as_deref().expect("status detail");
+        assert!(detail.contains("draft: false"), "{detail}");
+        assert!(detail.contains("target: reply"), "{detail}");
+        assert_eq!(
+            app.composer.reply.as_ref().map(|target| &target.event_id),
+            Some(&reply),
+            "reading the status does not touch the target"
+        );
+        assert!(take_commands(&mut app).is_empty());
+    }
+
+    #[test]
+    fn slash_switch_prefills_local_filter_without_opening_conversation() {
+        let mut app = app();
+        app.apply(
+            ChatEvent::Channels(roster(vec![channel_info(1), channel_info(2)])),
+            0,
+        );
+        app.take_outbox();
+        app.mode = Mode::Composer;
+        app.composer.set_text("/switch c2");
+        app.handle(Action::ComposerSend, 40);
+        assert_eq!(app.switcher_query, "c2");
+        assert_eq!(app.selected, 0);
+        assert_eq!(picked(&app), Some(channel(2).id));
+        assert!(take_commands(&mut app).is_empty());
     }
 
     #[test]
@@ -9366,15 +9923,15 @@ mod tests {
         app.stub_roster();
         app.handle(Action::TogglePalette, 0);
         assert_eq!(app.palette, Some(0));
-        for _ in 0..Command::ALL.len() {
+        for _ in 0..SlashCommand::PALETTE.len() {
             app.handle(Action::PaletteNext, 0);
         }
         assert_eq!(
             app.palette,
-            Some(Command::ALL.len() - 1),
+            Some(SlashCommand::PALETTE.len() - 1),
             "the cursor clamps at the end"
         );
-        for _ in 0..Command::ALL.len() {
+        for _ in 0..SlashCommand::PALETTE.len() {
             app.handle(Action::PalettePrev, 0);
         }
         assert_eq!(app.palette, Some(0), "and at the start");
@@ -9406,7 +9963,7 @@ mod tests {
         assert!(!app.search.open);
         // Quit is the last command and sets the same flag `q` does.
         app.handle(Action::TogglePalette, 0);
-        for _ in 0..Command::ALL.len() {
+        for _ in 0..SlashCommand::PALETTE.len() {
             app.handle(Action::PaletteNext, 0);
         }
         app.handle(Action::PaletteConfirm, 0);

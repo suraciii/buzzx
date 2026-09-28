@@ -244,7 +244,9 @@ no state of its own.
 | Switch conversation | `c` | Opens the conversation switcher. |
 | Search messages | `/` | Opens message search. |
 | My agents | `a` | Opens the Agents overlay. |
+| Open thread | `t` | Opens the focused event's thread. |
 | Help | `?` | Opens help. |
+| Status | none | Displays the current relay, connection, membership and draft target. |
 | Quit | `q` | Ends the session. |
 
 `j`/`k` move the cursor, `Enter` runs the highlighted command through the same
@@ -258,6 +260,21 @@ nothing and the overlay keeps its keys; the under-minimum size message answers
 `q` alone; and inside a thread, search, context, or the reader the destination
 is protected until the user returns.
 
+### Slash commands in the composer
+
+Only a draft whose first character is `/` can run a command. Navigation `/` still opens message search, and `/` inside ordinary text stays text. Type `/` for suggestions, use the arrow keys to select one, Tab to complete its name, and Enter to execute a complete name. Esc closes the suggestion list without deleting the draft. A prefix such as `/sea` or an unknown name such as `/foo` still sends as ordinary text; a known command with invalid arguments keeps the draft and shows usage. `//search old decision` sends `/search old decision` literally. Multi-line drafts remain messages.
+
+| Command | Effect |
+| --- | --- |
+| `/help [command]` | Open help, optionally focusing a command's usage and surfaces. |
+| `/search [query]` | Open message search with an optional prefilled query, or return to the search this surface came from. |
+| `/switch [name]` | Open the local conversation switcher, optionally filtering by name. |
+| `/thread` | Open the confirmed focused event's thread; the composer target survives the visit. |
+| `/agents` | Open the Agents overlay. |
+| `/status` | Show relay, community, connection, membership, and composer target. |
+
+Search runs from channel, context, and thread composers, thread from channel and context, and switch and agents only from a channel composer; a surface that cannot run a command keeps the draft and reports it. The suggestion list offers only the commands the current surface can run, and `/help <command>` names the surfaces a command has and whether this one is among them.
+Success consumes the command line and keeps the composer's target: `/thread` puts that target back when the thread is left, and `/search` on a surface that was opened from a search returns to that search with its results, filters, and drafts while the layers above it keep their own. These are navigation and read-only commands: none sends a message or changes a read marker merely by opening a list. The Web send control continues to publish its input literally, including leading `/`; slash parsing belongs only to the TUI composer Enter path, and the one-shot CLI remains explicit subcommands.
 ### Message search and context (M2)
 
 `/` in channel or thread navigation opens full-screen message search, scoped

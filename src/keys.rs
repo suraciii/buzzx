@@ -118,6 +118,7 @@ pub enum Action {
     ComposerInput(char),
     ComposerBackspace,
     ComposerNewline,
+    SlashComplete,
     ComposerCursorUp,
     ComposerCursorDown,
     ComposerCursorLeft,
@@ -128,6 +129,8 @@ pub enum Action {
     /// composer on the second press.
     ComposerEscape,
     ComposerSend,
+    /// The Web send control publishes literal composer text, including slashes.
+    ComposerSendLiteral,
     /// A key the current mode does not define.
     Ignored,
 }
@@ -431,6 +434,7 @@ pub fn map_composer(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Enter if alt => Action::ComposerNewline,
         KeyCode::Enter => Action::ComposerSend,
+        KeyCode::Tab => Action::SlashComplete,
         KeyCode::Esc => Action::ComposerEscape,
         KeyCode::Backspace => Action::ComposerBackspace,
         KeyCode::Up => Action::ComposerCursorUp,
@@ -1057,6 +1061,13 @@ mod tests {
         assert_eq!(
             map_composer(key(KeyCode::End, KeyModifiers::NONE)),
             Action::ComposerEnd
+        );
+    }
+    #[test]
+    fn composer_tab_routes_to_completion() {
+        assert_eq!(
+            map_composer(key(KeyCode::Tab, KeyModifiers::NONE)),
+            Action::SlashComplete
         );
     }
 }

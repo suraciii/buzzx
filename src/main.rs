@@ -17,6 +17,7 @@ mod mentions;
 mod platform;
 mod read_state;
 mod session;
+mod slash;
 mod sub;
 mod ui;
 mod web;
