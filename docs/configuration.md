@@ -86,7 +86,8 @@ on the first write.
 ## Config file
 
 The file lives in the platform's user configuration directory, under `buzzx`:
-`~/.config/buzzx/config.toml` on Linux,
+`$XDG_CONFIG_HOME/buzzx/config.toml` on Linux, which is
+`~/.config/buzzx/config.toml` when that variable is unset,
 `~/Library/Application Support/buzzx/config.toml` on macOS, and
 `%APPDATA%\buzzx\config.toml` on Windows. `BUZZX_CONFIG` overrides the path on
 every platform. All fields are optional.

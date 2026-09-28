@@ -274,8 +274,10 @@ fn ensure_parent(path: &Path) -> Result<(), StartupError> {
         fs::create_dir_all(parent)
             .map_err(|e| StartupError::other(format!("cannot create {}: {e}", parent.display())))?;
         if created {
+            // Only a platform with mode bits can fail here, which is where
+            // this message is read.
             platform::restrict_dir(parent).map_err(|e| {
-                StartupError::other(format!("cannot restrict {}: {e}", parent.display()))
+                StartupError::other(format!("cannot chmod {}: {e}", parent.display()))
             })?;
         }
     }
@@ -316,7 +318,7 @@ pub fn init_at(
     fs::write(path, render_body(&http_url, private_key, auth_tag))
         .map_err(|e| StartupError::other(format!("cannot write {}: {e}", path.display())))?;
     platform::restrict_file(path)
-        .map_err(|e| StartupError::other(format!("cannot restrict {}: {e}", path.display())))?;
+        .map_err(|e| StartupError::other(format!("cannot chmod {}: {e}", path.display())))?;
     // A write is a placement decision too, so a platform that cannot promise
     // owner-only access reports the path here as well as on the next read.
     platform::check_secret(path, "config").map_err(StartupError::auth)?;

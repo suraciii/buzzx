@@ -42,9 +42,10 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/suraciii/buzzx/rel
 
 Both scripts detect the machine they run on, download the matching archive,
 verify its checksum, and install the binary to `$CARGO_HOME/bin`
-(`~/.cargo/bin`, or `%USERPROFILE%\.cargo\bin`). They also add that directory
-to the shell profiles, and skip that step when `BUZZX_NO_MODIFY_PATH=1` is
-set.
+(`~/.cargo/bin`, or `%USERPROFILE%\.cargo\bin`). They also put that directory
+on `PATH`: the shell installer appends a line to the shell profiles, and the
+PowerShell installer writes the user `Path` value in the registry. Both skip
+that step when `BUZZX_NO_MODIFY_PATH=1` is set.
 
 Set `BUZZX_INSTALL_DIR` to install somewhere else:
 
@@ -58,8 +59,11 @@ $env:BUZZX_INSTALL_DIR = "$env:USERPROFILE\.local"
 irm https://github.com/suraciii/buzzx/releases/latest/download/buzzx-installer.ps1 | iex
 ```
 
-A forced directory gets the binary in `<dir>/bin` and an `env` script beside
-it that puts that directory on PATH.
+A forced directory gets the binary in `<dir>/bin`. On Unix the installer also
+writes an `env` helper script to `<dir>/env` - the parent of `bin`, the way
+rustup lays it out - and sources that script from the shell profiles. On
+Windows there is no helper script: the registry `Path` value above is the only
+change.
 
 ## Manual install
 

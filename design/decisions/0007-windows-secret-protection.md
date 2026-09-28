@@ -48,9 +48,10 @@ Concretely:
 - A Windows user who points `BUZZX_CONFIG` or `--private-key-file` outside
   the profile gets a warning on each run. The warning is the whole
   enforcement, so it must not read as a refusal: the run continues.
-- The Windows branch is verified by the `Portability (windows-latest)` CI job
-  and by a cross-compiled `cargo check`. No maintainer machine runs Windows,
-  so a Windows-only regression is caught in CI or not at all.
+- The Windows branch is verified by the `Portability (windows-latest)` CI job,
+  which builds and runs the test suite on a real Windows runner. No maintainer
+  machine runs Windows, so a Windows-only regression is caught in CI or not at
+  all.
 - If the warning turns out to be too weak, the same `platform.rs` boundary
   can carry an explicit DACL without touching a call site.
 

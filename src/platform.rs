@@ -90,6 +90,7 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
+    use std::ffi::OsStr;
     use std::fs::OpenOptions;
     use std::io;
     use std::path::{Component, Path, PathBuf};
@@ -141,6 +142,9 @@ mod imp {
     /// does not depend on how the path was spelled. Components are compared
     /// one at a time and without case, the way NTFS does, so `C:\Users\ann`
     /// does not claim `C:\Users\anna`.
+    ///
+    /// A path this comparison cannot judge answers `false`, which is the
+    /// answer that warns: the caller reports a path it cannot vouch for.
     pub(super) fn is_inside(path: &Path, root: &Path) -> bool {
         let (Some(path), Some(root)) = (normalized(path), normalized(root)) else {
             return false;
@@ -148,16 +152,27 @@ mod imp {
         let mut rest = path.components();
         root.components().all(|part| {
             rest.next()
-                .is_some_and(|step| step.as_os_str().eq_ignore_ascii_case(part.as_os_str()))
+                .is_some_and(|step| same_name(step.as_os_str(), part.as_os_str()))
         })
+    }
+
+    /// Component equality the way NTFS resolves a name: without case, for
+    /// every alphabet rather than only ASCII, so a profile spelled `Änne` is
+    /// still the profile the path `änne` names. Not the upcase table Windows
+    /// itself uses, but a name that differs only in case is compared here
+    /// rather than reported as another location.
+    fn same_name(left: &OsStr, right: &OsStr) -> bool {
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
     }
 
     /// An absolute path with its verbatim prefix removed and its `.` and `..`
     /// components resolved without touching the filesystem. A path that
     /// cannot be spelled as a location - a device path, for example - is not
-    /// a path this comparison can judge.
+    /// a path this comparison can judge, and neither is one whose components
+    /// are not Unicode: replacing such a component with a placeholder would
+    /// let two different names compare equal.
     fn normalized(path: &Path) -> Option<PathBuf> {
-        let text = absolute(path).ok()?.to_string_lossy().into_owned();
+        let text = absolute(path).ok()?.to_str()?.to_owned();
         let stripped = match text.strip_prefix(r"\\?\UNC\") {
             Some(rest) => format!(r"\\{rest}"),
             None => text
@@ -297,6 +312,32 @@ mod tests {
             !is_inside(Path::new(r"C:\Users\ann\..\..\shared\config.toml"), root),
             "climbing past the profile root does not come back inside"
         );
+        assert!(
+            is_inside(
+                Path::new(r"C:\Users\Änne\config.toml"),
+                Path::new(r"C:\Users\änne")
+            ),
+            "a name that differs only in non-ASCII case is the same name"
+        );
+        assert!(
+            !is_inside(&unpaired_surrogate_path(), root),
+            "a path whose components are not Unicode is not claimed"
+        );
+    }
+
+    /// `C:\Users\ann\<unpaired surrogate>\config.toml`: a Windows path with
+    /// a component that is not Unicode, so no comparison can vouch for it. The
+    /// surrogate is its own component: a lossy conversion would fold it into
+    /// the name before it and make two different names compare equal.
+    #[cfg(windows)]
+    fn unpaired_surrogate_path() -> std::path::PathBuf {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let mut wide: Vec<u16> = r"C:\Users\ann\".encode_utf16().collect();
+        wide.push(0xD800);
+        wide.extend(r"\config.toml".encode_utf16());
+        OsString::from_wide(&wide).into()
     }
 
     #[cfg(windows)]
