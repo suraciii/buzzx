@@ -299,6 +299,41 @@ enum WalkStep {
     Done(HistoryPage),
 }
 
+/// The older-side progress rule. An inclusive `until` cursor that answers a
+/// full page sitting entirely at its own second has not moved toward older
+/// rows, and asking the identical query again would return the identical
+/// page. The page grows until it clears the second, and only a second holding
+/// more events than the relay's own bound is reported as a limit.
+struct OlderProgress {
+    limit: u64,
+}
+
+impl OlderProgress {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit: limit.clamp(1, WALK_LIMIT),
+        }
+    }
+
+    fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// One answered page: `Some(limit)` asks again with a bigger page, `None`
+    /// accepts this answer as the reader's page.
+    fn step(&mut self, batch: &[Event], cursor: u64, asked: u64) -> Option<u64> {
+        let saturated = batch.len() as u64 >= asked;
+        let passed = batch
+            .iter()
+            .any(|event| event.created_at.as_secs() < cursor);
+        if !saturated || passed || self.limit >= WALK_LIMIT {
+            return None;
+        }
+        self.limit = (self.limit * 4).min(WALK_LIMIT);
+        Some(self.limit)
+    }
+}
+
 impl Walk {
     fn new(want: u64, since: u64, batch_limit: u64) -> Self {
         Walk {
@@ -726,18 +761,27 @@ impl Client {
         let hex = root.to_hex();
         let (raw, saturated) = match direction {
             HistoryDirection::Older => {
-                let raw = self
-                    .transport
-                    .query(&json!({
-                        "kinds": content::TIMELINE_KINDS,
-                        "#e": [hex],
-                        "#h": [channel.to_string()],
-                        "until": cursor,
-                        "limit": limit,
-                    }))
-                    .await?;
-                let saturated = raw.len() as u64 >= limit;
-                (raw, saturated)
+                let mut progress = OlderProgress::new(limit);
+                loop {
+                    let page = progress.limit();
+                    let raw = self
+                        .transport
+                        .query(&json!({
+                            "kinds": content::TIMELINE_KINDS,
+                            "#e": [hex],
+                            "#h": [channel.to_string()],
+                            "until": cursor,
+                            "limit": page,
+                        }))
+                        .await?;
+                    match progress.step(&raw, cursor, page) {
+                        Some(next) => debug_assert!(next > page),
+                        None => {
+                            let saturated = raw.len() as u64 >= page;
+                            break (raw, saturated);
+                        }
+                    }
+                }
             }
             HistoryDirection::Newer => self.later_rows(channel, Some(root), cursor, limit).await?,
         };
@@ -1487,6 +1531,57 @@ mod tests {
             "the failure names the visible gap: {}",
             failure.detail
         );
+    }
+
+    #[test]
+    fn an_older_page_stuck_inside_one_second_grows_before_it_is_reported() {
+        let keys = keys();
+        // Second 50 holds three events; a page of two never leaves it, so the
+        // identical query would repeat forever at the same size.
+        let batch: Vec<Event> = (0..3)
+            .map(|n| message(&keys, channel(), &format!("burst {n}"), 50))
+            .collect();
+        let mut progress = OlderProgress::new(2);
+        assert_eq!(
+            progress.step(&batch[..2], 50, 2),
+            Some(8),
+            "a full page at the cursor's own second asks again with a bigger page"
+        );
+        assert_eq!(progress.limit(), 8);
+        // Three events pass in one page of eight: the bigger page is the one
+        // the reader gets.
+        assert_eq!(progress.step(&batch, 50, 8), None);
+    }
+
+    #[test]
+    fn an_older_page_that_passes_the_cursor_second_is_the_readers_page() {
+        let keys = keys();
+        let cursor = 50;
+        let batch = vec![
+            message(&keys, channel(), "older", 49),
+            message(&keys, channel(), "at the cursor second", 50),
+        ];
+        let mut progress = OlderProgress::new(2);
+        assert_eq!(
+            progress.step(&batch, cursor, 2),
+            None,
+            "a page carrying an older event has passed the boundary second"
+        );
+    }
+
+    #[test]
+    fn an_older_page_at_the_relay_bound_reports_its_limit() {
+        let keys = keys();
+        let batch: Vec<Event> = (0..4)
+            .map(|n| message(&keys, channel(), &format!("burst {n}"), 50))
+            .collect();
+        // Already at the relay's own bound: growing further would be silently
+        // capped, so this answer is the limit the caller must report.
+        let mut progress = OlderProgress::new(WALK_LIMIT);
+        assert_eq!(progress.step(&batch, 50, 4), None);
+        // One growth step below the bound lands exactly on it.
+        let mut progress = OlderProgress::new(600);
+        assert_eq!(progress.step(&batch, 50, 4), Some(WALK_LIMIT));
     }
 
     #[test]
