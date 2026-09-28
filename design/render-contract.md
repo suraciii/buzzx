@@ -55,7 +55,7 @@ event ids it has sent, so it can tell the two apart.
 
 | Kind | Behavior |
 |---|---|
-| 20002 | Typing indicator. Never a row: it becomes the line above the composer and a `…` marker in the channel list. |
+| 20002 | Typing indicator. Never a row: it becomes the line above the composer and a `…` marker on the conversation's row in the switcher. |
 
 An ephemeral event is never stored and never replayed, so it is subscribed on
 the live connection only and it is state, not history. Its rules are in
@@ -184,9 +184,9 @@ The line renders the entries of the selected channel only, sorted by display
 name so it does not reshuffle between frames. One name is
 `<name> typing…`, two are `<a>, <b> are typing…`, and more add ` +N` after the
 second name. The wide layout writes the display names; the one-column layouts
-prefix each with `@`. The channel list and the channel picker append a single
-`…` to any channel that has an entry, which is the whole reason the state is
-kept for channels that are not on screen. A long channel name is clipped to
+prefix each with `@`. The conversation switcher appends a single `…` to any
+conversation that has an entry, which is the whole reason the state is kept
+for conversations that are not on screen. A long channel name is clipped to
 keep that marker on the row: it is one column of signal and it must not be
 what the terminal cuts off.
 
@@ -229,8 +229,8 @@ events only and never claims it is cross-device.
 
 The first phase's observed-only unread is therefore near-zero on a cold start:
 with no marker read and no events yet observed, the client has nothing to
-count. That is the honest reading, and it is why the first-phase channel list
-carries no unread column at all — a number that is only right for channels
+count. That is the honest reading, and it is why the first-phase list carried
+no unread column at all — a number that is only right for channels
 you happened to watch is worse than no number. When read markers land, the
 column appears.
 
