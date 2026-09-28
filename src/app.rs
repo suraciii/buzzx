@@ -5449,6 +5449,17 @@ impl App {
             self.handle_thread(action, now);
             return;
         }
+        // The switcher's promise is `type to filter`, so while it is open the
+        // query editor owns every printable key: a digit is name text, not a
+        // session shortcut. Jumping from here would open a conversation the
+        // user did not pick and claim its read state, and a name that starts
+        // with a digit (a hex id) would be impossible to query.
+        let action = match (action, self.switcher.is_some()) {
+            (Action::Channel(n @ 1..=9), true) => {
+                Action::SwitcherInput(char::from_digit(n as u32, 10).expect("1..=9"))
+            }
+            (action, _) => action,
+        };
         match action {
             Action::Quit => {
                 self.quit = true;
@@ -8900,13 +8911,27 @@ mod tests {
     }
 
     #[test]
-    fn a_digit_switch_closes_the_list_it_was_picked_from() {
+    fn a_digit_typed_in_the_open_list_filters_instead_of_switching() {
         let mut app = app();
         app.channels = vec![channel(1), channel(2)];
         app.stub_roster();
         app.handle(Action::ToggleSwitcher, 0);
         app.handle(Action::Channel(2), 0);
+        assert_eq!(app.switcher_query, "2", "the digit is the query's text");
+        assert!(app.switcher_editing, "typing starts the query");
+        assert!(app.switcher.is_some(), "the list stays open");
+        assert_eq!(
+            app.channels[app.selected].id,
+            channel(1).id,
+            "no conversation was opened behind the query"
+        );
+        // Closing the list gives the digit back to the timeline, and the
+        // switch it makes ends the query with the list.
+        app.handle(Action::ToggleSwitcher, 0);
+        assert_eq!(app.switcher, None, "c closes the list");
+        app.handle(Action::Channel(2), 0);
         assert_eq!(app.switcher, None);
+        assert_eq!(app.switcher_query, "");
         assert_eq!(app.channels[app.selected].id, channel(2).id);
     }
 
