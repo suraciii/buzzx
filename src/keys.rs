@@ -720,6 +720,25 @@ mod tests {
     }
 
     #[test]
+    fn thread_navigation_rejects_channel_control_shortcuts() {
+        for (code, modifiers) in [
+            (KeyCode::Char('f'), KeyModifiers::CONTROL),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(
+                map_navigation(
+                    key(code, modifiers),
+                    LayoutMode::Wide,
+                    Overlay::None,
+                    Surface::Thread,
+                    SearchMode::Results,
+                ),
+                Action::Ignored
+            );
+        }
+    }
+
+    #[test]
     fn help_still_works_inside_a_thread() {
         assert_eq!(
             map_navigation(

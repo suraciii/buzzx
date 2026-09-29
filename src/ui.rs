@@ -428,7 +428,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
         _ if app.reader.open => draw_reader(frame, app, now, area),
         _ if app.context.open => draw_context(frame, app, now, area),
         _ if app.search.open => draw_search(frame, app, now, area),
-        _ if app.thread.open => draw_thread(frame, app, now, area, mode),
+        _ if app.thread.open => draw_thread_surface(frame, app, now, area, mode),
         LayoutMode::Wide | LayoutMode::Narrow => draw_column(frame, app, now, area, mode),
         LayoutMode::Minimal => draw_minimal(frame, app, now, area),
     }
@@ -933,11 +933,64 @@ fn draw_column(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutM
     draw_status(frame, app, column[7], wide);
 }
 
-/// The focused thread: one full-screen timeline at every size, with the
-/// conversation named in the header and the way back next to it.
-///
-/// Nothing channel-scoped is drawn here. Typing is per channel, so it cannot
-/// say who is replying to this thread, and it is left out.
+/// Threads are modal on the wide surface so the channel remains visible as
+/// context. Narrower terminals keep the existing full-screen thread surface:
+/// there is not enough exterior space for a useful dialog.
+fn draw_thread_surface(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutMode) {
+    if area.width < 80 || area.height < 12 {
+        draw_thread(frame, app, now, area, mode);
+        return;
+    }
+
+    // The channel is context, not a second editor. Draw only its read view:
+    // Thread's composer and target must never appear in the backdrop.
+    let background = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    draw_header(frame, app, background[0], false);
+    draw_timeline(frame, app, background[1], now, false, area.height >= 16);
+    frame.render_widget(Paragraph::new("Thread active · Esc back"), background[2]);
+    draw_status(frame, app, background[3], true);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            let cell = &mut frame.buffer_mut()[(x, y)];
+            let style = cell.style().add_modifier(Modifier::DIM);
+            cell.set_style(style);
+        }
+    }
+
+    let modal_width = area.width.saturating_sub(4).min(96);
+    let modal_height = area.height.saturating_sub(2);
+    let modal = Rect::new(
+        area.x + area.width.saturating_sub(modal_width) / 2,
+        area.y + area.height.saturating_sub(modal_height) / 2,
+        modal_width,
+        modal_height,
+    );
+    let source = format!("from: {}", clip_with_ellipsis(&app.thread.entered, 24));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if no_color() {
+            action_style()
+        } else {
+            action_style().fg(Color::Cyan)
+        })
+        .title(Span::styled(" Thread ", action_style()))
+        .title_bottom(Line::styled(format!(" {source} "), pending_style()));
+    let body = block.inner(modal);
+    frame.render_widget(Clear, modal);
+    frame.render_widget(block, modal);
+    draw_thread(frame, app, now, body, mode);
+}
+
+/// The focused thread surface: a timeline with the conversation named in the
+/// header and the way back next to it. On wide terminals this is placed in a
+/// modal by `draw_thread_surface`; the renderer itself is also used full
+/// screen at compact sizes.
 fn draw_thread(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutMode) {
     let compact = mode != LayoutMode::Wide;
     let composing = app.mode == Mode::Composer;
@@ -3074,6 +3127,55 @@ mod tests {
         assert!(text.contains("the root"), "{text}");
         assert!(text.contains("the reply"), "{text}");
         assert!(text.contains("j/k: move"), "the key row: {text}");
+    }
+
+    #[test]
+    fn modal_keeps_a_read_only_backdrop_and_a_single_composer() {
+        let (mut app, _keys) = thread_app(false);
+        let source = app.thread.entered.clone();
+        app.handle(crate::keys::Action::ThreadReplyFocused, 131);
+        app.handle(crate::keys::Action::ComposerInput('Z'), 131);
+        for (width, height, expected_width) in [(120, 30, 96), (112, 16, 96), (80, 12, 76)] {
+            let frame = frame_text(&app, width, height);
+            let lines: Vec<&str> = frame.lines().collect();
+            let top = lines[1];
+            let left = (width - expected_width) / 2;
+            assert_eq!(
+                top.chars().nth(left as usize),
+                Some('┌'),
+                "{width}x{height}: {frame}"
+            );
+            assert_eq!(
+                top.chars().nth((left + expected_width - 1) as usize),
+                Some('┐'),
+                "{width}x{height}: {frame}"
+            );
+            assert!(
+                frame.contains(&source[..12]),
+                "entry event stays visible: {frame}"
+            );
+            assert_eq!(frame.matches("Reply to ").count(), 1, "one target: {frame}");
+            assert_eq!(frame.matches("r> Z").count(), 1, "one draft: {frame}");
+        }
+        for (width, height) in [(79, 12), (40, 10), (24, 6)] {
+            let frame = frame_text(&app, width, height);
+            assert!(
+                !frame.contains('┌'),
+                "full-screen, no small dialog: {frame}"
+            );
+            assert!(frame.contains("Reply to "), "target survives: {frame}");
+        }
+    }
+
+    #[test]
+    fn modal_status_and_backdrop_remain_legible_without_color() {
+        let (mut app, _keys) = thread_app(false);
+        app.thread.failed = Some("read refused".to_owned());
+        let frame = frame_text(&app, 120, 30);
+        assert!(frame.contains("Thread load failed; t retry"), "{frame}");
+        assert!(frame.contains("Esc: back"), "{frame}");
+        assert!(frame.contains('>'), "focus has a text marker: {frame}");
+        assert!(frame.contains('┌'), "border is not color-only: {frame}");
     }
 
     #[test]
