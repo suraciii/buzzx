@@ -3088,7 +3088,11 @@ mod tests {
     fn about_surface_shows_build_diagnostics() {
         let mut app = chat_app(Vec::new());
         app.handle(crate::keys::Action::TogglePalette, 0);
-        for _ in 0..3 {
+        for _ in 0..crate::app::Command::ALL
+            .iter()
+            .position(|command| *command == crate::app::Command::About)
+            .expect("About in palette")
+        {
             app.handle(crate::keys::Action::PaletteNext, 0);
         }
         app.handle(crate::keys::Action::PaletteConfirm, 0);
