@@ -570,12 +570,29 @@ active turn observed` follows only a feed the relay has answered with `EOSE`.
 
 ## Mentions when sending
 
-A draft that names someone carries that person's identity with it. The composer
-stays plain text: resolution happens on send, and the visible message is stored
-exactly as typed. There is no candidate overlay, identity token, recipient
-panel, or extra confirmation dialog.
+[Mention suggestions and channel creation](mentions-and-channel-creation.md)
+is the product contract this follows.
 
-### Behavior
+`@` at the start of a word opens a draft-local picker over the open
+conversation's members: exact names first, then prefix matches, with the Agent or
+admin role and a short key only on rows that would otherwise read the same.
+Typing filters it, Up/Down and Tab/BackTab move, Enter inserts the name and
+closes it, and Esc closes it and keeps the draft. Rows move by name, not by key:
+a name may contain `j` or `k`, so those letters stay text. Selecting a row binds
+that member's key to that occurrence for this draft; it never sends and never
+inserts an identity into the text.
+
+Every submit re-reads the roster, so the binding is a convenience, not an
+authority: a member who left is resolved as a non-member and the draft is
+blocked. Bindings belong to the draft's conversation and community, and a name
+typed again is resolved again. If the roster read fails the picker says so and
+`Ctrl+R` retries it; the send stays blocked until it answers rather than being
+published against a guess.
+
+At 24 by 6 the picker still shows its rows and its keys stay readable. The
+status line drops the connection word, which the header already carries, so a
+blocked draft keeps as much of its reason as the row holds - `?` keeps the whole
+correction.
 
 On send, the text is resolved against the current conversation's membership and
 member profiles through the SDK's own helpers: code regions are stripped,

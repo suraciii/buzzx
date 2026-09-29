@@ -19,6 +19,9 @@ works with it.
   revision and what it provides.
 - [browse-collab-cli.md](browse-collab-cli.md) specifies the first `buzz ext`
   browse-and-collaborate flow for terminal users and agents.
+- [mentions-and-channel-creation.md](mentions-and-channel-creation.md) specifies
+  the implementation-ready mention suggestion, signed-recipient and channel
+  creation contract for TUI, WebUI and CLI.
 - [web.md](web.md) specifies the proposed local browser surface, its TUI
   equivalent controls, interaction flows and acceptance. It is not implemented.
 

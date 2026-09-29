@@ -27,7 +27,7 @@ and applies that consistency to its two interactive interfaces through the
 | Reading position | [Anchored scroll][desktop-scroll] tracks event identity and latest state | [Thread list][mobile-list] keeps root first and a latest anchor | Keep old reading position during arrivals; expose an explicit latest action |
 | Thread layout | [Panel layout][desktop-layout] supports standalone and split presentation | [Thread detail][mobile-detail] uses a dedicated page | Use one focused content region with Back; a third Web column is unnecessary |
 | Composition | [Draft store][desktop-drafts] binds content, channel and selection | [Draft lifecycle][mobile-drafts] binds draft identity and guards late restoration | Preserve destination and current text across inspection; do not restore into a newer draft |
-| Mention identity | [Draft mention references][desktop-mentions] preserve explicit identities and ambiguity | [Recipient builder][mobile-mentions] combines explicit identities with DM recipients | Reuse buzzx's current explicit-only recipient policy and plain-text correction |
+| Mention identity | [Draft mention references][desktop-mentions] preserve explicit identities and ambiguity | [Recipient builder][mobile-mentions] combines explicit identities with DM recipients | Adopt the candidate picker presentation for current-channel members, while keeping buzzx's send-time resolver and explicit-only recipient policy |
 | Attention and read state | [Inbox grouping][desktop-inbox] distinguishes thread and message read contexts | [Inbox read state][mobile-inbox] keeps unrelated channel activity unread | Reuse buzzx's channel frontier and honest unknown state; do not copy the larger Inbox model |
 | Message content | [Markdown renderer][desktop-content] includes media and code presentation | [Message content][mobile-content] includes markdown, media and attachments | Make every existing text/metadata field readable; media operations require a separate shared capability |
 
@@ -47,9 +47,11 @@ late-result protection are adopted without adding a persistent draft product.
 
 Mobile adds current DM participants to signed recipients automatically.
 buzzx's existing [mention rules](../docs/tui-use.md#mentions-when-sending)
-use explicit recipients. Web must use the buzzx rule too. No automatic
-invitation, new mention editor or edited-message notification promise is
-introduced by copying a richer composer's appearance.
+use explicit recipients. Web must use the buzzx rule too. The planned
+[suggestion and channel contract](../docs/mentions-and-channel-creation.md)
+adds selection help without changing final recipient validation. No automatic
+invitation or edited-message notification promise is introduced by copying a
+richer composer's appearance.
 
 Latest Mobile thread reads send `thread_cursor` and `thread_cursor_id`;
 Desktop receives a cursor-bearing thread response. These are newer contracts

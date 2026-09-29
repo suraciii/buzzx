@@ -339,10 +339,14 @@ row. Pending and uncertain local rows cannot be action targets. Deletion
 has no added confirmation flow; it stays inside the labeled own-message
 menu and follows the existing write contract.
 
-Mention resolution runs on send using the existing rules. When it fails,
-keep the draft and target, name the unresolved fragment next to the composer,
-and expose complete selectable exact references for ambiguous names. There
-is no mention picker, automatic invitation or hidden recipient inference.
+Mention resolution runs on send using the existing rules. The `@` suggestion
+popover is draft-local and lists current-channel members; selection inserts
+readable text and the send-time resolver remains authoritative.
+When resolution fails, keep the draft and target, name the unresolved fragment
+next to the composer, and expose complete selectable exact references for
+ambiguous names. Automatic invitation and hidden recipient inference remain
+out of scope. Channel creation follows the shared form and write states in
+[mentions-and-channel-creation.md](mentions-and-channel-creation.md).
 Editing keeps its existing notification semantics.
 
 On submit, show pending feedback and prevent a second submission of that

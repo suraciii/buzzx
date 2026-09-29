@@ -58,7 +58,8 @@ Web entries define the required browser equivalent.
 | [Focused threads](tui-use.md#focused-thread-reading) | `t`, Enter, `i` | Open thread, Reply, Reply to root |
 | [Safe inspection and return](tui-context.md#c6-resume-work-without-changing-intent) | Esc through visited views | Back through visited views; Return to draft |
 | [New messages and replies](tui-use.md#keys) | Composer, explicit target | Composer and Reply button |
-| [Verified mentions](tui-use.md#mentions-when-sending) | Resolve plain text on send | Same resolution; inline correction detail |
+| [Mention suggestions and verified recipients](mentions-and-channel-creation.md#shared-mention-contract) | `@` picker; Enter inserts, send signs recipients | `@` popover; Enter inserts, send signs recipients |
+| [Create a channel](mentions-and-channel-creation.md#channel-creation) | `Ctrl+P` → Create channel | `+ Create channel` in Inbox/sidebar or menu |
 | [Reaction, own edit and own delete](tui-use.md#keys) | `r`, `e`, `d` | Reaction chip and message action menu |
 | [Read progress and unknown coverage](../design/shared-core.md#inbox-and-read-state) | Presented latest ordinary timeline | Same frontier; visible, focused browser view |
 | [Incoming typing](tui-use.md#typing-indicators) | Channel line/list signal | Channel line/list signal |

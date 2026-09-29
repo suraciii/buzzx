@@ -11,7 +11,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::agents;
 use crate::app::{
-    AgentStatus, App, Command, ConnState, Context, Filter, Marker, Mode, ReaderOrigin, Sections,
+    AgentStatus, App, Command, ConnState, Context, CreateChannelForm, CreateState, Filter, Marker,
+    Mode, ReaderOrigin, Sections,
 };
 use crate::content::{Row, short_pubkey};
 use crate::layout::{self, LayoutMode};
@@ -430,6 +431,14 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
         _ if app.thread.open => draw_thread(frame, app, now, area, mode),
         LayoutMode::Wide | LayoutMode::Narrow => draw_column(frame, app, now, area, mode),
         LayoutMode::Minimal => draw_minimal(frame, app, now, area),
+    }
+    if mode != LayoutMode::TooSmall && app.create_channel.is_some() {
+        draw_create_channel(frame, app, area);
+    } else if mode != LayoutMode::TooSmall
+        && app.mode == Mode::Composer
+        && app.mention_picker.is_some()
+    {
+        draw_mention_picker(frame, app, area);
     }
     if app.agents.open {
         draw_agents(frame, app, now, area);
@@ -1554,15 +1563,22 @@ fn draw_composer_line(frame: &mut Frame, app: &App, area: Rect) {
     ));
 }
 
-fn status_detail(app: &App) -> String {
+/// The status row's content: the connection word plus the transient notice.
+/// The notice is what the reader has to act on, so a row too narrow for both
+/// shows the notice alone - the header already carries the connection state.
+fn status_detail(app: &App, width: usize) -> String {
     let connection = conn_word(app.conn);
     if app.status == connection
         || app.status.starts_with(&format!("{connection} "))
         || app.status.starts_with(&format!("{connection}:"))
     {
-        app.status.clone()
+        return app.status.clone();
+    }
+    let joined = format!("{connection} | {}", app.status);
+    if joined.chars().count() <= width {
+        joined
     } else {
-        format!("{connection} | {}", app.status)
+        app.status.clone()
     }
 }
 
@@ -1572,12 +1588,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, wide: bool) {
         Mode::Composer if wide => "composer",
         Mode::Composer => "compose",
     };
-    let detail = status_detail(app);
     let status = if wide && area.width >= 100 {
+        let detail = status_detail(app, usize::MAX);
         format!("status: {detail} | mode: {mode} | ?=help")
     } else {
         let prefix = format!("{mode} · ");
         let remaining = area.width.saturating_sub(prefix.width() as u16) as usize;
+        let detail = status_detail(app, remaining);
         format!("{prefix}{}", clip_with_ellipsis(&detail, remaining))
     };
     frame.render_widget(
@@ -1675,6 +1692,114 @@ fn draw_switcher_tabs(frame: &mut Frame, app: &App, area: Rect) {
 /// The command palette: the actions the timeline already has, with the key
 /// that runs each one. It takes the whole terminal, and it holds no state of
 /// its own beyond the cursor.
+fn draw_mention_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let narrow = area.width < 80;
+    let height = if narrow {
+        area.height.min(8)
+    } else {
+        area.height.min(7)
+    };
+    let picker_area = if narrow {
+        area
+    } else {
+        Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(height + 2),
+            width: area.width,
+            height,
+        }
+    };
+    let title = if app.mention_loading() {
+        "Members · Loading members…".to_owned()
+    } else if app.mention_failure().is_some() {
+        "Members · Could not load members; retry (Ctrl+R)".to_owned()
+    } else {
+        "Members".to_owned()
+    };
+    let mut lines = Vec::new();
+    if app.mention_loading() {
+        lines.push(ListItem::new("Loading members…"));
+    } else if app.mention_failure().is_some() {
+        lines.push(ListItem::new("Could not load members; retry with Ctrl+R"));
+    } else {
+        let items = app.mention_items();
+        if items.is_empty() {
+            lines.push(ListItem::new("No matching members"));
+        } else {
+            for candidate in &items {
+                let duplicate = items
+                    .iter()
+                    .filter(|other| other.label == candidate.label)
+                    .count()
+                    > 1;
+                let suffix = if duplicate {
+                    format!(" {}", candidate.short_key())
+                } else {
+                    String::new()
+                };
+                let marker = match (candidate.agent, candidate.admin) {
+                    (true, true) => " [Agent] [admin]",
+                    (true, false) => " [Agent]",
+                    (false, true) => " [admin]",
+                    _ => "",
+                };
+                lines.push(ListItem::new(format!(
+                    "{}{}{}",
+                    candidate.label, marker, suffix
+                )));
+            }
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(Line::raw("↑/↓ or tab move · enter select · esc keep draft"));
+    let list = List::new(lines)
+        .block(block)
+        .highlight_style(highlight_style())
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(app.mention_picker.as_ref().map(|picker| picker.cursor));
+    frame.render_widget(Clear, picker_area);
+    frame.render_stateful_widget(list, picker_area, &mut state);
+}
+
+fn draw_create_channel(frame: &mut Frame, app: &App, area: Rect) {
+    let form = app.create_channel.as_ref().expect("create form");
+    let mut lines = Vec::new();
+    for field in CreateChannelForm::FIELDS {
+        let marker = if field == form.field { "> " } else { "  " };
+        lines.push(Line::raw(format!(
+            "{marker}{:<12} {}",
+            CreateChannelForm::label(field),
+            form.value(field)
+        )));
+    }
+    let state = match &form.state {
+        CreateState::Editing => "Editing".to_owned(),
+        CreateState::Creating => "Creating…".to_owned(),
+        CreateState::Failed(reason) => format!("Failed: {reason}"),
+        CreateState::Unknown(reason) => format!(
+            "Unknown: the channel may exist - Ctrl+R refreshes the list to confirm ({reason})"
+        ),
+    };
+    lines.push(Line::raw(format!("State: {state}")));
+    let hint = if matches!(form.state, CreateState::Creating | CreateState::Unknown(_)) {
+        "Tab/↑/↓ fields · ←/→/Space choice · Enter submit · Ctrl+R refresh · Esc close"
+    } else {
+        "Tab/↑/↓ fields · ←/→/Space choice · Enter submit · Esc close"
+    };
+    lines.push(Line::raw(hint));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Create channel · {}", app.community_name));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn draw_palette(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = Command::ALL
         .iter()
@@ -2551,6 +2676,48 @@ mod tests {
         assert!(text.contains("?=help"), "{text}");
     }
 
+    #[test]
+    fn narrow_status_gives_the_row_to_the_notice() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.status = crate::mentions::Block::Unknown {
+            name: "无此成员".to_owned(),
+        }
+        .summary();
+        let text = frame_text(&app, 24, 6);
+        let status = text.lines().last().unwrap_or_default();
+        assert!(status.starts_with("nav · mention \"@"), "{text}");
+        assert!(!status.contains("connected |"), "{text}");
+        // A row with room for both keeps the connection state.
+        app.status = "Draft kept; Esc back".to_owned();
+        let roomy = frame_text(&app, 79, 12);
+        assert!(
+            roomy.contains("connected | Draft kept; Esc back"),
+            "{roomy}"
+        );
+    }
+
+    #[test]
+    fn narrow_status_keeps_the_connection_word_without_a_notice() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.status = "connected".to_owned();
+        let text = frame_text(&app, 24, 6);
+        assert_eq!(
+            text.lines().last().unwrap_or_default().trim_end(),
+            "nav · connected",
+            "{text}"
+        );
+        app.status = "reconnecting: relay closed".to_owned();
+        app.conn = ConnState::Reconnecting;
+        let text = frame_text(&app, 24, 6);
+        assert!(
+            text.lines()
+                .last()
+                .unwrap_or_default()
+                .starts_with("nav · reconnecting"),
+            "{text}"
+        );
+    }
+
     fn chat_app(rows: Vec<crate::content::Row>) -> App {
         let mut app = App::new(&nostr::Keys::generate(), "http://relay.test");
         app.conn = ConnState::Connected;
@@ -3026,6 +3193,10 @@ mod tests {
     fn the_help_overlay_carries_the_blocked_mention_reference() {
         let mut app = chat_app(vec![message_row(0, "hello")]);
         app.mention_block = Some(crate::app::MentionBlock {
+            kind: "ambiguous".into(),
+            channel: uuid::Uuid::nil(),
+            community: Some("work".into()),
+            generation: 1,
             summary: "mention \"@buzzx build\" matches 2 members; replace it with one exact reference (? for identities)".into(),
             details: vec![
                 "@buzzx build -> nostr:npub1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),

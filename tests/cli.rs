@@ -1182,3 +1182,400 @@ fn a_startup_failure_prints_one_json_error() {
         }
     }
 }
+
+/// Seed a channel roster: the kind 39002 event names each member with its
+/// role, and each member's kind 0 event carries the display name the mention
+/// preflight matches on.
+fn seed_roster(relay: &FakeRelay, channel: &str, members: &[(&Keys, &str, &str)]) {
+    let relay_keys = Keys::generate();
+    let mut tags = vec![d_tag(channel)];
+    for (member, role, _) in members {
+        tags.push(
+            Tag::parse(["p", member.public_key().to_hex().as_str(), "", role])
+                .expect("a member tag"),
+        );
+    }
+    relay.seed(&event(&relay_keys, 39002, tags, "", 50));
+    for (member, _, name) in members {
+        relay.seed(&event(
+            member,
+            0,
+            vec![],
+            &format!("{{\"display_name\":\"{name}\"}}"),
+            51,
+        ));
+    }
+}
+
+fn carries_tag(event: &Value, name: &str, value: &str) -> bool {
+    event["tags"].as_array().is_some_and(|tags| {
+        tags.iter().any(|tag| {
+            tag.get(0).and_then(Value::as_str) == Some(name)
+                && tag.get(1).and_then(Value::as_str) == Some(value)
+        })
+    })
+}
+
+#[test]
+fn a_cli_send_signs_the_member_a_visible_name_names() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    let member = keys();
+    seed_roster(&relay, CHANNEL, &[(&member, "member", "Buzzx Build")]);
+
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &[
+            "messages",
+            "send",
+            "--channel",
+            CHANNEL,
+            "--content",
+            "@Buzzx Build please look",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(json["status"], json!("sent_confirmed"));
+    let named = member.public_key().to_hex();
+    assert_eq!(json["mention_pubkeys"], json!([named]));
+
+    let writes = relay.writes();
+    assert_eq!(writes.len(), 1, "one write, one event");
+    let sent = &writes[0];
+    assert_eq!(
+        sent["content"],
+        json!("@Buzzx Build please look"),
+        "the body is stored exactly as typed"
+    );
+    assert!(
+        carries_tag(sent, "p", &named),
+        "the visible name becomes a signed recipient: {sent}"
+    );
+}
+
+#[test]
+fn an_unknown_name_blocks_a_cli_send_without_a_write() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    let member = keys();
+    seed_roster(&relay, CHANNEL, &[(&member, "member", "Buzzx Build")]);
+
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &[
+            "messages",
+            "send",
+            "--channel",
+            CHANNEL,
+            "--content",
+            "@Nobody please look",
+        ],
+        None,
+    );
+    assert_eq!(code, 1, "a blocked draft is bad input: {stderr}");
+    assert_eq!(json["status"], json!("not_sent"));
+    assert_eq!(json["event_id"], Value::Null);
+    assert_eq!(json["channel_id"], json!(CHANNEL));
+    assert_eq!(json["mention_block"]["kind"], json!("unknown"));
+    assert!(
+        json["mention_block"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("@nobody"),
+        "the refusal names the fragment: {json}"
+    );
+    assert!(
+        relay.writes().is_empty(),
+        "a draft that cannot be resolved is never published"
+    );
+}
+
+#[test]
+fn an_ambiguous_name_blocks_with_exact_references() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    let first = keys();
+    let second = keys();
+    seed_roster(
+        &relay,
+        CHANNEL,
+        &[
+            (&first, "member", "Buzzx Build"),
+            (&second, "bot", "Buzzx Build"),
+        ],
+    );
+
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &[
+            "messages",
+            "send",
+            "--channel",
+            CHANNEL,
+            "--content",
+            "@Buzzx Build ping",
+        ],
+        None,
+    );
+    assert_eq!(code, 1, "an ambiguous name is bad input: {stderr}");
+    assert_eq!(json["status"], json!("not_sent"));
+    assert_eq!(json["mention_block"]["kind"], json!("ambiguous"));
+    let details = json["mention_block"]["details"].as_array().unwrap();
+    assert_eq!(details.len(), 2, "both candidates are named: {json}");
+    for detail in details {
+        assert!(
+            detail
+                .as_str()
+                .unwrap()
+                .starts_with("@buzzx build -> nostr:npub1"),
+            "a correction is a complete exact reference: {detail}"
+        );
+    }
+    assert!(relay.writes().is_empty());
+}
+
+#[test]
+fn a_cli_reply_carries_the_recipients_with_the_thread_tags() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    let member = keys();
+    let root = message(&me, "root", 100);
+    relay.seed(&root);
+    seed_roster(&relay, CHANNEL, &[(&member, "member", "Buzzx Product")]);
+
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &[
+            "messages",
+            "reply",
+            "--event",
+            &root.id.to_hex(),
+            "--content",
+            "@Buzzx Product done",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(json["status"], json!("sent_confirmed"));
+    assert_eq!(json["reply_to"], json!(root.id.to_hex()));
+    assert_eq!(
+        json["mention_pubkeys"],
+        json!([member.public_key().to_hex()])
+    );
+
+    let writes = relay.writes();
+    let sent = &writes[0];
+    assert!(
+        carries_tag(sent, "e", &root.id.to_hex()),
+        "the reply keeps its thread context: {sent}"
+    );
+    assert!(
+        carries_tag(sent, "p", &member.public_key().to_hex()),
+        "the reply notifies the member it names: {sent}"
+    );
+}
+
+#[test]
+fn a_failed_member_read_blocks_a_cli_send() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    // Two dropped answers: the read is retried once, and both are lost.
+    relay.drop_reads(2);
+
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &[
+            "messages",
+            "send",
+            "--channel",
+            CHANNEL,
+            "--content",
+            "@Buzzx Build look",
+        ],
+        None,
+    );
+    assert_eq!(
+        code, 2,
+        "an unreadable roster is a network failure: {stderr}"
+    );
+    assert_eq!(json["status"], json!("not_sent"));
+    assert_eq!(json["error"], json!("network"));
+    assert_eq!(json["mention_block"]["kind"], json!("directory_failed"));
+    assert!(
+        relay.writes().is_empty(),
+        "the draft is not published against a guess"
+    );
+}
+
+#[test]
+fn channels_create_reports_the_confirmed_channel_and_its_fields() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &[
+            "channels",
+            "create",
+            "--name",
+            "  项目讨论  ",
+            "--type",
+            "forum",
+            "--visibility",
+            "private",
+            "--description",
+            "可选说明",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(json["status"], json!("created_confirmed"));
+    assert_eq!(json["name"], json!("项目讨论"), "the name is trimmed");
+    assert_eq!(json["type"], json!("forum"));
+    assert_eq!(json["visibility"], json!("private"));
+    assert_eq!(json["description"], json!("可选说明"));
+    let channel = json["channel_id"].as_str().expect("a channel id");
+    assert!(uuid::Uuid::parse_str(channel).is_ok(), "{channel}");
+
+    let writes = relay.writes();
+    assert_eq!(writes.len(), 1, "one write, one channel event");
+    let sent = &writes[0];
+    assert_eq!(sent["kind"], json!(9007), "the create-group event: {sent}");
+    for (name, value) in [
+        ("h", channel),
+        ("name", "项目讨论"),
+        ("channel_type", "forum"),
+        ("visibility", "private"),
+        ("about", "可选说明"),
+    ] {
+        assert!(
+            carries_tag(sent, name, value),
+            "the event carries {name}={value}: {sent}"
+        );
+    }
+}
+
+#[test]
+fn a_lost_channel_creation_is_unconfirmed_and_written_once() {
+    let relay = FakeRelay::start();
+    relay.answer(WriteAnswer::Lost);
+    let me = keys();
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &["channels", "create", "--name", "standup"],
+        None,
+    );
+    assert_eq!(code, 2, "a lost answer is a timeout: {stderr}");
+    assert_eq!(json["status"], json!("created_unconfirmed"));
+    assert_eq!(json["error"], json!("timeout_unknown"));
+    assert!(json["channel_id"].as_str().is_some());
+    assert_eq!(
+        relay.writes().len(),
+        1,
+        "an unconfirmed creation is never submitted twice"
+    );
+}
+
+#[test]
+fn a_refused_channel_creation_is_not_created() {
+    let relay = FakeRelay::start();
+    relay.answer(WriteAnswer::Refused);
+    let me = keys();
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &["channels", "create", "--name", "standup"],
+        None,
+    );
+    assert_eq!(code, 3, "a refusal names the identity: {stderr}");
+    assert_eq!(json["status"], json!("not_created"));
+    assert_eq!(json["error"], json!("forbidden"));
+    assert_eq!(json["channel_id"], Value::Null);
+    assert_eq!(relay.writes().len(), 1, "the refusal was one attempt");
+}
+
+#[test]
+fn channels_create_rejects_invalid_fields_before_the_relay() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    for (args, reason) in [
+        (vec!["channels", "create"], "name is required"),
+        (
+            vec!["channels", "create", "--name", "standup", "--type", "blog"],
+            "channel type",
+        ),
+        (
+            vec!["channels", "create", "--name", "standup", "--type", "dm"],
+            "channel type",
+        ),
+        (
+            vec![
+                "channels", "create", "--name", "standup", "--type", "workflow",
+            ],
+            "channel type",
+        ),
+        (
+            vec![
+                "channels",
+                "create",
+                "--name",
+                "standup",
+                "--visibility",
+                "secret",
+            ],
+            "channel visibility",
+        ),
+        (
+            vec!["channels", "create", "--name", "   "],
+            "name is required",
+        ),
+    ] {
+        let (code, json, stderr) = run(&relay.url, &me, &args, None);
+        assert_eq!(code, 1, "{args:?} is bad input: {stderr}");
+        assert_eq!(json["status"], json!("not_created"), "{args:?}: {json}");
+        assert_eq!(json["error"], json!("invalid_input"), "{args:?}: {json}");
+        assert!(
+            json["message"].as_str().unwrap().contains(reason),
+            "{args:?} explains itself: {json}"
+        );
+        assert_eq!(json["channel_id"], Value::Null);
+        // The refusal echoes what the caller sent, so a script sees the field
+        // the relay-never-saw attempt carried.
+        assert_eq!(
+            json["name"],
+            json!(
+                args.iter()
+                    .position(|arg| *arg == "--name")
+                    .map(|at| args[at + 1])
+            ),
+            "{args:?}: {json}"
+        );
+        assert_eq!(
+            json["type"],
+            json!(
+                args.iter()
+                    .position(|arg| *arg == "--type")
+                    .map(|at| args[at + 1])
+            ),
+            "{args:?}: {json}"
+        );
+        assert_eq!(
+            json["visibility"],
+            json!(
+                args.iter()
+                    .position(|arg| *arg == "--visibility")
+                    .map(|at| args[at + 1])
+            ),
+            "{args:?}: {json}"
+        );
+    }
+    assert!(relay.writes().is_empty(), "nothing reached the relay");
+    assert_eq!(relay.queries(), 0, "no channel event was even prepared");
+}

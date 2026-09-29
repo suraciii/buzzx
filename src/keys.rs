@@ -36,6 +36,12 @@ pub enum Action {
     PalettePrev,
     /// Enter: run the selected command.
     PaletteConfirm,
+    PickerNext,
+    PickerPrev,
+    PickerConfirm,
+    PickerRetry,
+    /// Ask for a fresh channel roster to answer an unresolved creation.
+    CreateChannelRefresh,
     /// `f`: the next Inbox filter.
     FilterNext,
     /// `a`: open the Agents overlay, or close it when it is open.
@@ -144,6 +150,7 @@ pub enum Overlay {
     Palette,
     /// The saved-community selector: the profiles the identity may switch to.
     CommunityPicker,
+    CreateChannel,
     Help,
     Agents,
 }
@@ -200,6 +207,14 @@ pub fn map_navigation(
             && matches!(overlay, Overlay::None | Overlay::Palette);
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
+            // The create form's own refresh: an unresolved creation is settled
+            // by the roster answer the user asks for here.
+            KeyCode::Char('r') if overlay == Overlay::CreateChannel => Action::CreateChannelRefresh,
+            // The same refresh from the timeline: a form may be closed while
+            // its write is still unresolved.
+            KeyCode::Char('r') if overlay == Overlay::None && surface == Surface::Channel => {
+                Action::CreateChannelRefresh
+            }
             KeyCode::Char('f') if timeline_only => Action::OpenSearch,
             KeyCode::Char('p') if timeline_only => Action::TogglePalette,
             _ => Action::Ignored,
@@ -220,6 +235,19 @@ pub fn map_navigation(
             KeyCode::PageUp => Action::HelpScroll(-(PAGE_ROWS as isize)),
             KeyCode::Esc | KeyCode::Char('?') => Action::Dismiss,
             KeyCode::Char('q') => Action::Quit,
+            _ => Action::Ignored,
+        };
+    }
+    if overlay == Overlay::CreateChannel {
+        return match key.code {
+            KeyCode::Esc => Action::Dismiss,
+            KeyCode::Enter => Action::ComposerSend,
+            KeyCode::Tab | KeyCode::Down => Action::ComposerCursorDown,
+            KeyCode::BackTab | KeyCode::Up => Action::ComposerCursorUp,
+            KeyCode::Left => Action::ComposerCursorLeft,
+            KeyCode::Right => Action::ComposerCursorRight,
+            KeyCode::Backspace => Action::ComposerBackspace,
+            KeyCode::Char(c) if key.modifiers.is_empty() => Action::ComposerInput(c),
             _ => Action::Ignored,
         };
     }
@@ -417,17 +445,38 @@ pub fn map_navigation(
     }
 }
 
-/// Map a key press to an action in composer mode. Character input must not
-/// carry Ctrl or Alt: those combinations belong to commands, not text.
-pub fn map_composer(key: KeyEvent) -> Action {
+/// Map a key press in composer mode. Character input must not carry Ctrl or
+/// Alt: those combinations belong to commands, not text. `picker_open` reserves
+/// navigation keys only while the mention list owns the composer.
+pub fn map_composer(key: KeyEvent, picker_open: bool) -> Action {
+    // Shift+Tab arrives as BackTab carrying SHIFT: the picker reads it as the
+    // bare BackTab it is, so the key that moves backwards reaches the list.
+    let key = if key.code == KeyCode::BackTab && key.modifiers == KeyModifiers::SHIFT {
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)
+    } else {
+        key
+    };
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
             KeyCode::Char('f') => Action::OpenSearch,
+            KeyCode::Char('r') if picker_open => Action::PickerRetry,
             _ => Action::Ignored,
         };
     }
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if picker_open && key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Enter => return Action::PickerConfirm,
+            KeyCode::Esc => return Action::Dismiss,
+            // Only keys that cannot be part of a name move the cursor: a name
+            // may contain `j` or `k`, so those stay text.
+            KeyCode::Up | KeyCode::BackTab => return Action::PickerPrev,
+            KeyCode::Down | KeyCode::Tab => return Action::PickerNext,
+            KeyCode::Char('?') => return Action::ToggleHelp,
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Enter if alt => Action::ComposerNewline,
         KeyCode::Enter => Action::ComposerSend,
@@ -960,7 +1009,7 @@ mod tests {
         }
         // The composer keeps its draft: Ctrl+P is not a composer key.
         assert_eq!(
-            map_composer(key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            map_composer(key(KeyCode::Char('p'), KeyModifiers::CONTROL), false),
             Action::Ignored
         );
     }
@@ -1002,7 +1051,7 @@ mod tests {
             Action::Quit
         );
         assert_eq!(
-            map_composer(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            map_composer(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false),
             Action::Quit
         );
     }
@@ -1010,16 +1059,16 @@ mod tests {
     #[test]
     fn composer_text_needs_no_modifiers() {
         assert_eq!(
-            map_composer(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            map_composer(key(KeyCode::Char('x'), KeyModifiers::NONE), false),
             Action::ComposerInput('x')
         );
         assert_eq!(
-            map_composer(key(KeyCode::Char('v'), KeyModifiers::NONE)),
+            map_composer(key(KeyCode::Char('v'), KeyModifiers::NONE), false),
             Action::ComposerInput('v')
         );
         // Alt+x is not text; terminals use it for commands.
         assert_eq!(
-            map_composer(key(KeyCode::Char('x'), KeyModifiers::ALT)),
+            map_composer(key(KeyCode::Char('x'), KeyModifiers::ALT), false),
             Action::Ignored
         );
     }
@@ -1027,11 +1076,11 @@ mod tests {
     #[test]
     fn alt_enter_inserts_a_newline_and_enter_sends() {
         assert_eq!(
-            map_composer(key(KeyCode::Enter, KeyModifiers::ALT)),
+            map_composer(key(KeyCode::Enter, KeyModifiers::ALT), false),
             Action::ComposerNewline
         );
         assert_eq!(
-            map_composer(key(KeyCode::Enter, KeyModifiers::NONE)),
+            map_composer(key(KeyCode::Enter, KeyModifiers::NONE), false),
             Action::ComposerSend
         );
     }
@@ -1039,24 +1088,125 @@ mod tests {
     #[test]
     fn composer_editing_keys_map_to_cursor_actions() {
         assert_eq!(
-            map_composer(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            map_composer(key(KeyCode::Backspace, KeyModifiers::NONE), false),
             Action::ComposerBackspace
         );
         assert_eq!(
-            map_composer(key(KeyCode::Left, KeyModifiers::NONE)),
+            map_composer(key(KeyCode::Left, KeyModifiers::NONE), false),
             Action::ComposerCursorLeft
         );
         assert_eq!(
-            map_composer(key(KeyCode::Right, KeyModifiers::NONE)),
+            map_composer(key(KeyCode::Right, KeyModifiers::NONE), false),
             Action::ComposerCursorRight
         );
         assert_eq!(
-            map_composer(key(KeyCode::Home, KeyModifiers::NONE)),
+            map_composer(key(KeyCode::Home, KeyModifiers::NONE), false),
             Action::ComposerHome
         );
         assert_eq!(
-            map_composer(key(KeyCode::End, KeyModifiers::NONE)),
+            map_composer(key(KeyCode::End, KeyModifiers::NONE), false),
             Action::ComposerEnd
+        );
+    }
+
+    #[test]
+    fn an_open_picker_owns_the_composers_navigation_keys() {
+        let open = |code, modifiers| map_composer(key(code, modifiers), true);
+        assert_eq!(
+            open(KeyCode::Enter, KeyModifiers::NONE),
+            Action::PickerConfirm
+        );
+        assert_eq!(open(KeyCode::Esc, KeyModifiers::NONE), Action::Dismiss);
+        assert_eq!(open(KeyCode::Up, KeyModifiers::NONE), Action::PickerPrev);
+        assert_eq!(open(KeyCode::Down, KeyModifiers::NONE), Action::PickerNext);
+        assert_eq!(open(KeyCode::Tab, KeyModifiers::NONE), Action::PickerNext);
+        assert_eq!(
+            open(KeyCode::BackTab, KeyModifiers::NONE),
+            Action::PickerPrev
+        );
+        // A terminal reports Shift+Tab as BackTab with SHIFT, not as a bare
+        // BackTab: the key that moves backwards must still reach the list.
+        assert_eq!(
+            open(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Action::PickerPrev
+        );
+        assert_eq!(
+            open(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            Action::PickerRetry
+        );
+        // Text keeps its keys, including the two a list would use as movement:
+        // a name may contain `j` or `k`.
+        assert_eq!(
+            open(KeyCode::Char('j'), KeyModifiers::NONE),
+            Action::ComposerInput('j')
+        );
+        assert_eq!(
+            open(KeyCode::Char('k'), KeyModifiers::NONE),
+            Action::ComposerInput('k')
+        );
+        assert_eq!(
+            open(KeyCode::Char('J'), KeyModifiers::NONE),
+            Action::ComposerInput('J')
+        );
+        assert_eq!(
+            open(KeyCode::Enter, KeyModifiers::ALT),
+            Action::ComposerNewline
+        );
+    }
+
+    #[test]
+    fn the_create_form_maps_its_own_keys() {
+        let form = |code| {
+            map_navigation(
+                key(code, KeyModifiers::NONE),
+                LayoutMode::Wide,
+                Overlay::CreateChannel,
+                Surface::Channel,
+                SearchMode::Results,
+            )
+        };
+        assert_eq!(form(KeyCode::Tab), Action::ComposerCursorDown);
+        assert_eq!(form(KeyCode::BackTab), Action::ComposerCursorUp);
+        assert_eq!(form(KeyCode::Left), Action::ComposerCursorLeft);
+        assert_eq!(form(KeyCode::Right), Action::ComposerCursorRight);
+        assert_eq!(form(KeyCode::Char(' ')), Action::ComposerInput(' '));
+        assert_eq!(form(KeyCode::Char('q')), Action::ComposerInput('q'));
+        assert_eq!(form(KeyCode::Char('项')), Action::ComposerInput('项'));
+        assert_eq!(form(KeyCode::Enter), Action::ComposerSend);
+        assert_eq!(form(KeyCode::Esc), Action::Dismiss);
+        // Ctrl+R asks for the roster answer that settles an unresolved
+        // creation, and works from the form or from the timeline the form
+        // left behind when it closed.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                Overlay::CreateChannel,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::CreateChannelRefresh
+        );
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                Overlay::None,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::CreateChannelRefresh
+        );
+        // Other overlays keep their own keys.
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                LayoutMode::Wide,
+                Overlay::Palette,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::Ignored
         );
     }
 }
