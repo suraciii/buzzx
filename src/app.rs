@@ -12,6 +12,7 @@ use crate::client::{CatchUp, ChannelInfo, ChannelKind, HistoryDirection, Roster}
 use crate::config;
 use crate::content::{self, Row};
 use crate::keys::{self, Action, PAGE_ROWS};
+use crate::mentions;
 use crate::session::{ChatEvent, HistorySurface, SessionCommand};
 use crate::slash::{self, Command as SlashCommand, Parse};
 
@@ -186,6 +187,33 @@ impl Composer {
         self.cursor = (0, 0);
         self.reply = None;
         self.edit = None;
+    }
+
+    /// The caret as a byte offset into [`Composer::text`].
+    pub fn offset(&self) -> usize {
+        let (line, col) = self.cursor;
+        self.lines[..line]
+            .iter()
+            .map(|line| line.len() + 1)
+            .sum::<usize>()
+            + col
+    }
+
+    /// Put the caret at a byte offset of [`Composer::text`]. An offset past
+    /// the end lands at the end, which is where an insertion leaves it.
+    pub fn place(&mut self, offset: usize) {
+        let mut remaining = offset;
+        for (index, line) in self.lines.iter().enumerate() {
+            if remaining <= line.len() {
+                self.cursor = (index, remaining);
+                return;
+            }
+            remaining -= line.len() + 1;
+        }
+        self.cursor = (
+            self.lines.len() - 1,
+            self.lines.last().map(String::len).unwrap_or(0),
+        );
     }
 }
 
@@ -448,8 +476,206 @@ impl Filter {
 /// attempt, including the exact reference to paste for each ambiguous name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MentionBlock {
+    /// The refusal's stable kind: `unknown`, `ambiguous`, `not_member`,
+    /// `over_cap` or `directory_failed`.
+    pub kind: String,
     pub summary: String,
     pub details: Vec<String>,
+    /// The conversation the blocked draft was aimed at.
+    pub channel: Uuid,
+    /// The community the refusal happened in. A block never travels: it is
+    /// read with the session that produced it.
+    pub community: Option<String>,
+    /// The transport generation the refusal happened on.
+    pub generation: u64,
+}
+
+/// The `@` picker's draft-local state: the fragment the caret sits in and the
+/// row under the cursor. It never holds an identity: the ranking comes from
+/// the roster the session read, and the send-time preflight resolves again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MentionPicker {
+    /// The conversation the draft belongs to.
+    pub channel: Uuid,
+    /// The `@query` under the caret, and the range an insertion replaces.
+    pub active: mentions::Active,
+    /// The selected row of the current ranking.
+    pub cursor: usize,
+}
+
+/// The candidate roster of one conversation, and the read that produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MentionRoster {
+    pub channel: Uuid,
+    /// The token the read was asked with. A later read supersedes an earlier
+    /// answer, so a stale one is dropped instead of shown.
+    pub request: u64,
+    pub state: MentionRosterState,
+}
+
+/// What a roster read says. A failed read is its own state: an incomplete
+/// member list must never be shown as an empty one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MentionRosterState {
+    Loading,
+    Ready(Vec<mentions::Candidate>),
+    Failed(String),
+}
+
+impl Default for MentionRoster {
+    fn default() -> Self {
+        Self {
+            channel: Uuid::nil(),
+            request: 0,
+            state: MentionRosterState::Loading,
+        }
+    }
+}
+
+/// Which field the create-channel form edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateField {
+    Name,
+    Type,
+    Visibility,
+    Description,
+}
+
+/// The state of the form's one write. `Unknown` is terminal for this form
+/// until the user refreshes: the write may have happened, and a second submit
+/// would create a duplicate channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateState {
+    Editing,
+    Creating,
+    Failed(String),
+    Unknown(String),
+}
+
+/// A creation this session started and the relay has not settled. It outlives
+/// the form: the answer still decides, and while it is open a community switch
+/// would carry the write to another relay. It holds the submitted draft so a
+/// form reopened over it shows the same channel again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsettledCreate {
+    /// The token of the write that is still open.
+    pub request: u64,
+    /// The draft the form submitted.
+    pub draft: crate::client::ChannelDraft,
+    /// The channel id chosen for this write, once the relay reports it.
+    pub channel_id: Option<Uuid>,
+    /// The conversations listed before the write. A refresh may only claim a
+    /// row the write could have added, never one that was already there.
+    pub known: Vec<Uuid>,
+    /// Where the write stands: in flight, or answered without a confirmation.
+    /// A form open over this record shows the same state.
+    pub state: CreateState,
+}
+
+/// The create-channel form: the fields, the field under the cursor, and the
+/// state of its one write. An open write lives in [`UnsettledCreate`], which
+/// outlives this form; while one exists the form is a view of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateChannelForm {
+    pub name: String,
+    /// `stream` or `forum`, per the create contract.
+    pub kind: buzz_core::channel::ChannelType,
+    pub visibility: buzz_core::channel::ChannelVisibility,
+    pub description: String,
+    pub field: CreateField,
+    pub state: CreateState,
+}
+
+impl Default for CreateChannelForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: buzz_core::channel::ChannelType::Stream,
+            visibility: buzz_core::channel::ChannelVisibility::Open,
+            description: String::new(),
+            field: CreateField::Name,
+            state: CreateState::Editing,
+        }
+    }
+}
+
+impl CreateChannelForm {
+    /// The form a reopened create surface shows over an open write: the same
+    /// draft, the same state, the cursor back on the name.
+    pub fn over(open: &UnsettledCreate) -> Self {
+        Self {
+            name: open.draft.name.clone(),
+            kind: open.draft.kind,
+            visibility: open.draft.visibility,
+            description: open.draft.description.clone().unwrap_or_default(),
+            field: CreateField::Name,
+            state: open.state.clone(),
+        }
+    }
+
+    /// The fields in the order the form walks them.
+    pub const FIELDS: [CreateField; 4] = [
+        CreateField::Name,
+        CreateField::Type,
+        CreateField::Visibility,
+        CreateField::Description,
+    ];
+
+    /// Whether this field takes typed text. Type and visibility are choices,
+    /// not text.
+    pub fn is_text(field: CreateField) -> bool {
+        matches!(field, CreateField::Name | CreateField::Description)
+    }
+
+    /// The value a field shows, as one line.
+    pub fn value(&self, field: CreateField) -> String {
+        match field {
+            CreateField::Name => self.name.clone(),
+            CreateField::Type => self.kind.as_str().to_owned(),
+            CreateField::Visibility => self.visibility.as_str().to_owned(),
+            CreateField::Description => self.description.clone(),
+        }
+    }
+
+    /// The label a field shows beside its value.
+    pub fn label(field: CreateField) -> &'static str {
+        match field {
+            CreateField::Name => "Name",
+            CreateField::Type => "Type",
+            CreateField::Visibility => "Visibility",
+            CreateField::Description => "Description",
+        }
+    }
+
+    /// The next choice a picked field cycles to. Text fields have no choice.
+    fn cycle(&mut self, forward: bool) {
+        match self.field {
+            CreateField::Type => {
+                self.kind = match (self.kind, forward) {
+                    (buzz_core::channel::ChannelType::Stream, _) => {
+                        buzz_core::channel::ChannelType::Forum
+                    }
+                    _ => buzz_core::channel::ChannelType::Stream,
+                }
+            }
+            CreateField::Visibility => {
+                self.visibility = match (self.visibility, forward) {
+                    (buzz_core::channel::ChannelVisibility::Open, _) => {
+                        buzz_core::channel::ChannelVisibility::Private
+                    }
+                    _ => buzz_core::channel::ChannelVisibility::Open,
+                }
+            }
+            CreateField::Name | CreateField::Description => {}
+        }
+    }
+
+    /// Whether the form can be submitted: a name is required, and a write is
+    /// neither in flight nor unresolved.
+    pub fn ready(&self) -> bool {
+        !self.name.trim().is_empty()
+            && matches!(self.state, CreateState::Editing | CreateState::Failed(_))
+    }
 }
 
 /// What a local pending id stands for, so a write result can be undone or
@@ -460,6 +686,10 @@ enum PendingOp {
         channel: Uuid,
         draft: String,
         reply: Option<ReplyTarget>,
+        /// The identities the draft's labels stood for, held while the write
+        /// is in flight. A refused send hands the draft back with them: the
+        /// reader's own choice, not a fresh guess at the same name.
+        bindings: Vec<mentions::Binding>,
     },
     Edit {
         row_id: String,
@@ -987,6 +1217,28 @@ pub struct App {
     /// The mention check that stopped the last send attempt, until the next
     /// one. The help surface shows the exact references it carries.
     pub mention_block: Option<MentionBlock>,
+    /// The `@` picker over the composer's draft, when one is open.
+    pub mention_picker: Option<MentionPicker>,
+    /// The last candidate roster read, and the state of the read.
+    pub mention_roster: MentionRoster,
+    /// The identities the draft inserted from the picker, until the draft
+    /// stops mentioning their labels.
+    pub mention_bindings: Vec<mentions::Binding>,
+    /// The create-channel form, when it is open.
+    pub create_channel: Option<CreateChannelForm>,
+    /// The channel a confirmed creation should open once the roster carries
+    /// it. A roster answer that arrives first opens it; the field is cleared
+    /// with that open.
+    pending_open: Option<Uuid>,
+    /// Whether the roster answer now in flight was asked for to resolve an
+    /// unresolved creation. Only that answer may settle it.
+    create_refresh_pending: bool,
+    /// The creation this session started and the relay has not settled. It
+    /// outlives the form, and it is what blocks a community switch.
+    pub create_unsettled: Option<UnsettledCreate>,
+    /// The token the next create write takes. It only climbs, so an answer
+    /// that arrives late can never be read as the answer to a newer write.
+    create_request: u64,
     /// Conversations waiting for a marker answer before their catch-up can be
     /// asked for.
     catch_up_pending: Vec<Uuid>,
@@ -1077,6 +1329,14 @@ impl App {
             marker_read: false,
             read_failed: None,
             mention_block: None,
+            mention_picker: None,
+            mention_roster: MentionRoster::default(),
+            mention_bindings: Vec::new(),
+            create_channel: None,
+            pending_open: None,
+            create_refresh_pending: false,
+            create_unsettled: None,
+            create_request: 0,
             catch_up_pending: Vec::new(),
             conn: ConnState::Connecting,
             status: "connecting".to_owned(),
@@ -1158,6 +1418,14 @@ impl App {
         view.palette = None;
         view.community_picker = None;
         view.composer.clear();
+        view.mention_block = None;
+        view.mention_picker = None;
+        view.mention_roster = MentionRoster::default();
+        view.mention_bindings.clear();
+        view.create_channel = None;
+        view.create_unsettled = None;
+        view.create_refresh_pending = false;
+        view.pending_open = None;
         view.search = SearchView::default();
         view.context = ContextView::default();
         view.reader = ReaderView::default();
@@ -1188,7 +1456,530 @@ impl App {
     /// settled yet. The browser uses this only to keep its local draft
     /// read-only; write classification remains owned by the session.
     pub fn web_write_pending(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || self.create_write_pending()
+    }
+
+    /// Whether a channel creation is in flight or unresolved. An unresolved
+    /// creation is not permission to retry, and it blocks a community switch
+    /// the same way a pending message write does: the write belongs to the
+    /// community it was aimed at.
+    pub fn create_write_pending(&self) -> bool {
+        // The form may be closed; the record of an open write is not.
+        self.create_unsettled.is_some()
+    }
+
+    /// The conversation the composer writes to: the selected channel, or the
+    /// thread's own channel while a thread is open.
+    fn composer_channel(&self) -> Option<Uuid> {
+        if self.thread.open {
+            Some(self.thread.channel)
+        } else {
+            self.selected_entry().map(|entry| entry.id)
+        }
+    }
+
+    /// Follow the draft's caret. The `@query` under it opens, moves or closes
+    /// the picker, and a label the draft no longer carries drops its binding.
+    pub fn sync_mention_picker(&mut self) {
+        self.prune_mention_bindings();
+        let active = self.composer_channel().zip(mentions::active_query(
+            &self.composer.text(),
+            self.composer.offset(),
+        ));
+        match active {
+            Some((channel, active)) => {
+                let opening = self.mention_picker.is_none();
+                let picker = self.mention_picker.get_or_insert(MentionPicker {
+                    channel,
+                    active: active.clone(),
+                    cursor: 0,
+                });
+                if picker.channel != channel || picker.active.query != active.query {
+                    picker.cursor = 0;
+                }
+                picker.channel = channel;
+                picker.active = active;
+                // One read per picker session: the roster is the same for
+                // every query, and a failed read is retried on request.
+                let needs_read = opening
+                    && (self.mention_roster.channel != channel
+                        || !matches!(self.mention_roster.state, MentionRosterState::Ready(_)));
+                if needs_read {
+                    self.load_mention_roster(channel);
+                }
+            }
+            None => self.mention_picker = None,
+        }
+    }
+
+    /// Ask the session for one conversation's candidate identities. Each read
+    /// supersedes the last: the token names the answer the picker wants.
+    pub fn load_mention_roster(&mut self, channel: Uuid) {
+        let request = self.mention_roster.request.saturating_add(1);
+        self.mention_roster = MentionRoster {
+            channel,
+            request,
+            state: MentionRosterState::Loading,
+        };
+        self.outbox
+            .push(SessionCommand::MentionCandidates { channel, request });
+    }
+
+    /// Retry a roster read that failed, or refresh one that succeeded. The
+    /// picker keeps its query and the draft is untouched.
+    pub fn retry_mention_roster(&mut self) {
+        if let Some(picker) = self.mention_picker.as_ref() {
+            let channel = picker.channel;
+            self.load_mention_roster(channel);
+        }
+    }
+
+    /// Put the browser's composer text and caret into the draft, then follow
+    /// the caret's `@` fragment. The browser owns its own text box; this is
+    /// where the session catches up with every keystroke the page sends.
+    pub fn web_mention_sync(&mut self, content: &str, cursor: usize) {
+        let before = self.composer.text();
+        if before != content {
+            self.rebase_mention_bindings(&before, content);
+            self.composer.set_text(content);
+        }
+        self.composer.place(cursor.min(content.len()));
+        self.sync_mention_picker();
+    }
+
+    /// The ranked rows the picker shows. An empty ranking is a real answer:
+    /// the query matches nobody.
+    pub fn mention_items(&self) -> Vec<mentions::Candidate> {
+        let Some(picker) = self.mention_picker.as_ref() else {
+            return Vec::new();
+        };
+        match &self.mention_roster.state {
+            MentionRosterState::Ready(candidates)
+                if self.mention_roster.channel == picker.channel =>
+            {
+                mentions::rank(&picker.active.query, candidates)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether the picker is waiting for its roster read.
+    pub fn mention_loading(&self) -> bool {
+        self.mention_picker.is_some()
+            && matches!(self.mention_roster.state, MentionRosterState::Loading)
+    }
+
+    /// Why the roster read failed, while the picker is open.
+    pub fn mention_failure(&self) -> Option<&str> {
+        match &self.mention_roster.state {
+            MentionRosterState::Failed(reason) if self.mention_picker.is_some() => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// Move the picker's cursor inside the current ranking. It never leaves
+    /// the list: the query decides the rows, and a move past an end stays put.
+    pub fn mention_move(&mut self, delta: isize) {
+        let len = self.mention_items().len();
+        let Some(picker) = self.mention_picker.as_mut() else {
+            return;
+        };
+        if len == 0 {
+            picker.cursor = 0;
+            return;
+        }
+        let last = len as isize - 1;
+        picker.cursor = (picker.cursor as isize + delta).clamp(0, last) as usize;
+    }
+
+    /// Point the picker at one row. A pointer names the row it hit; a move
+    /// cannot, because the row it picks may be anywhere in the ranking.
+    pub fn mention_select(&mut self, index: usize) {
+        let len = self.mention_items().len();
+        let Some(picker) = self.mention_picker.as_mut() else {
+            return;
+        };
+        if len == 0 {
+            picker.cursor = 0;
+            return;
+        }
+        picker.cursor = index.min(len - 1);
+    }
+
+    /// Insert the selected row's label at the active fragment and remember the
+    /// identity it stands for. Selection never sends: the next submit runs the
+    /// preflight again.
+    pub fn mention_confirm(&mut self) -> bool {
+        let Some(picker) = self.mention_picker.clone() else {
+            return false;
+        };
+        let items = self.mention_items();
+        let Some(candidate) = items.get(picker.cursor) else {
+            return false;
+        };
+        let text = self.composer.text();
+        let (start, end) = (picker.active.start, picker.active.end);
+        if start > end || end > text.len() {
+            self.mention_picker = None;
+            return false;
+        }
+        let insertion = format!("@{} ", candidate.label);
+        let updated = format!("{}{}{}", &text[..start], insertion, &text[end..]);
+        // Keep bindings for other occurrences, shifting those after the
+        // replaced fragment. The selected occurrence gets a fresh identity.
+        let removed = end.saturating_sub(start);
+        let delta = insertion.len() as isize - removed as isize;
+        self.mention_bindings.retain_mut(|binding| {
+            if binding.start >= end {
+                binding.start = if delta.is_negative() {
+                    binding.start.saturating_sub(delta.unsigned_abs())
+                } else {
+                    binding.start.saturating_add(delta as usize)
+                };
+                true
+            } else {
+                binding.start < start
+            }
+        });
+        self.composer.set_text(&updated);
+        self.composer.place(start + insertion.len());
+        self.remember_binding(start, &candidate.label, &candidate.pubkey);
+        self.mention_picker = None;
+        true
+    }
+
+    /// Close the picker without touching the draft.
+    pub fn mention_dismiss(&mut self) {
+        self.mention_picker = None;
+    }
+
+    /// Remember the identity a label occurrence stands for.
+    fn remember_binding(&mut self, start: usize, label: &str, pubkey: &str) {
+        self.mention_bindings.push(mentions::Binding {
+            start,
+            label: label.to_owned(),
+            pubkey: pubkey.to_owned(),
+        });
+    }
+
+    /// A text edit preserves selections outside its changed byte range.
+    fn rebase_mention_bindings(&mut self, before: &str, after: &str) {
+        let prefix = before
+            .bytes()
+            .zip(after.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let prefix = (0..=prefix)
+            .rev()
+            .find(|&at| before.is_char_boundary(at) && after.is_char_boundary(at))
+            .unwrap_or(0);
+        let mut old_end = before.len();
+        let mut new_end = after.len();
+        while old_end > prefix && new_end > prefix {
+            let old = before[..old_end].chars().next_back().unwrap();
+            let new = after[..new_end].chars().next_back().unwrap();
+            if old != new {
+                break;
+            }
+            old_end -= old.len_utf8();
+            new_end -= new.len_utf8();
+        }
+        self.mention_bindings.retain_mut(|binding| {
+            let end = binding.start.saturating_add(binding.label.len() + 1);
+            if end <= prefix {
+                true
+            } else if binding.start >= old_end {
+                binding.start = new_end + (binding.start - old_end);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Drop bindings whose exact occurrence no longer carries its label.
+    pub fn prune_mention_bindings(&mut self) {
+        if self.mention_bindings.is_empty() {
+            return;
+        }
+        let draft = self.composer.text();
+        self.mention_bindings.retain(|binding| {
+            let Some(fragment) = draft.get(binding.start..) else {
+                return false;
+            };
+            let Some(rest) = fragment.strip_prefix('@') else {
+                return false;
+            };
+            let Some(label) = rest.get(..binding.label.len()) else {
+                return false;
+            };
+            if !label.eq_ignore_ascii_case(&binding.label) {
+                return false;
+            }
+            rest.get(binding.label.len()..)
+                .and_then(|tail| tail.chars().next())
+                .map(|next| !next.is_alphanumeric() && next != '_' && next != '-')
+                .unwrap_or(true)
+        });
+    }
+
+    /// Open the create-channel form. The palette entry and the browser entry
+    /// both land here.
+    pub fn open_create_channel(&mut self) {
+        // An open write outlives the form, so opening again shows that write
+        // rather than a blank form that could start a second one.
+        self.create_channel = Some(match &self.create_unsettled {
+            Some(open) => CreateChannelForm::over(open),
+            None => CreateChannelForm::default(),
+        });
+    }
+
+    /// Close the form. A write that is still open is not forgotten here: it
+    /// stays with [`App::create_unsettled`], which is what keeps a community
+    /// switch blocked until a refresh answers it.
+    pub fn close_create_channel(&mut self) -> bool {
+        if self.create_write_pending() {
+            self.note("a channel creation is unresolved; Ctrl+R refreshes the list to confirm it");
+        }
+        self.create_channel = None;
+        true
+    }
+
+    /// Type into the form's text field. Type and visibility are choices.
+    pub fn create_channel_input(&mut self, c: char) {
+        let Some(form) = self.create_channel.as_mut() else {
+            return;
+        };
+        match form.field {
+            CreateField::Name => form.name.push(c),
+            CreateField::Description => form.description.push(c),
+            CreateField::Type | CreateField::Visibility => {}
+        }
+    }
+
+    pub fn create_channel_backspace(&mut self) {
+        let Some(form) = self.create_channel.as_mut() else {
+            return;
+        };
+        match form.field {
+            CreateField::Name => {
+                form.name.pop();
+            }
+            CreateField::Description => {
+                form.description.pop();
+            }
+            CreateField::Type | CreateField::Visibility => {}
+        }
+    }
+
+    /// Ask for a fresh channel roster to answer an unresolved creation. The
+    /// request resolves nothing by itself: the answer that follows is what
+    /// tells the form whether the channel exists.
+    pub fn refresh_create_channel(&mut self) {
+        if !self.create_write_pending() {
+            return;
+        }
+        self.create_refresh_pending = true;
+        self.note("refreshing the channel list to confirm the creation");
+        self.outbox.push(SessionCommand::LoadChannels);
+    }
+
+    /// Answer an unresolved creation with the roster the user asked for. The
+    /// name is either in the refreshed list or it is not; either way the write
+    /// stops being open, and nothing is created a second time.
+    fn resolve_create_refresh(&mut self) {
+        if !std::mem::take(&mut self.create_refresh_pending) {
+            return;
+        }
+        let Some(open) = self.create_unsettled.clone() else {
+            return;
+        };
+        let Some(channel_id) = open.channel_id else {
+            self.note("creation has no channel id to confirm; refresh the roster again");
+            return;
+        };
+        // A partial roster cannot prove that the channel is absent. Keep the
+        // operation unknown so a refresh never licenses a duplicate submit.
+        if !self.roster_complete {
+            self.note("channel roster is incomplete; creation remains unknown");
+            return;
+        }
+        let found = self
+            .channels
+            .iter()
+            .any(|entry| entry.id == channel_id && !open.known.contains(&entry.id));
+        if found {
+            self.create_unsettled = None;
+            self.create_channel = None;
+            self.pending_open = Some(channel_id);
+            self.note(format!(
+                "channel #{} is in the roster; opening it",
+                open.draft.name
+            ));
+            self.open_confirmed_channel();
+        } else {
+            // The complete roster is the relay's own answer to the refresh
+            // the reader asked for, and it does not carry the channel: the
+            // write did not land. The record closes so the session can move
+            // on — an unsubmittable form that also wed the reader to this
+            // community would leave no way out — and the next creation is
+            // still the reader's explicit submit, never an automatic retry.
+            self.create_unsettled = None;
+            let name = open.draft.name.clone();
+            if let Some(form) = self.create_channel.as_mut() {
+                form.state = CreateState::Failed(
+                    "the relay's channel list does not carry this creation".to_owned(),
+                );
+            }
+            self.note(format!(
+                "#{name} is not in the relay's list; the creation did not land — submit again"
+            ));
+        }
+    }
+
+    /// Move the form's cursor to the next or previous field.
+    pub fn create_channel_step(&mut self, forward: bool) {
+        let Some(form) = self.create_channel.as_mut() else {
+            return;
+        };
+        let at = CreateChannelForm::FIELDS
+            .iter()
+            .position(|field| *field == form.field)
+            .unwrap_or(0);
+        let last = CreateChannelForm::FIELDS.len() - 1;
+        form.field = if forward {
+            CreateChannelForm::FIELDS[(at + 1).min(last)]
+        } else {
+            CreateChannelForm::FIELDS[at.saturating_sub(1)]
+        };
+    }
+
+    /// Space is a keystroke in the form's text fields and the choice key on
+    /// Type and Visibility: one key, two meanings, chosen by the field.
+    pub fn create_channel_space(&mut self) {
+        match self.create_channel.as_ref().map(|form| form.field) {
+            Some(field) if CreateChannelForm::is_text(field) => self.create_channel_input(' '),
+            Some(_) => self.create_channel_cycle(true),
+            None => {}
+        }
+    }
+
+    /// Cycle the field's value when it is a choice.
+    pub fn create_channel_cycle(&mut self, forward: bool) {
+        if let Some(form) = self.create_channel.as_mut()
+            && !CreateChannelForm::is_text(form.field)
+        {
+            form.cycle(forward);
+        }
+    }
+
+    /// Submit the form. One write per submit: a form already creating, or one
+    /// whose result is unknown, does nothing.
+    pub fn create_channel_submit(&mut self) {
+        let Some(form) = self.create_channel.clone() else {
+            return;
+        };
+        if let Some(open) = &self.create_unsettled {
+            self.note(format!(
+                "a creation of #{} is unresolved; Ctrl+R refreshes the list to confirm it",
+                open.draft.name
+            ));
+            return;
+        }
+        if !form.ready() {
+            self.note("the channel name is required");
+            return;
+        }
+        let draft = match crate::client::ChannelDraft::new(
+            &form.name,
+            form.kind,
+            form.visibility,
+            Some(&form.description),
+        ) {
+            Ok(draft) => draft,
+            Err(failure) => {
+                if let Some(form) = self.create_channel.as_mut() {
+                    form.state = CreateState::Failed(failure.detail.clone());
+                }
+                self.note(failure.detail);
+                return;
+            }
+        };
+        let request = self.create_request.saturating_add(1);
+        self.create_request = request;
+        self.create_unsettled = Some(UnsettledCreate {
+            request,
+            draft: draft.clone(),
+            channel_id: None,
+            known: self.channels.iter().map(|entry| entry.id).collect(),
+            state: CreateState::Creating,
+        });
+        if let Some(form) = self.create_channel.as_mut() {
+            form.state = CreateState::Creating;
+        }
+        self.outbox
+            .push(SessionCommand::CreateChannel { draft, request });
+    }
+
+    /// Fold a creation answer in. The unsettled record is the one that
+    /// answers, so an answer for a write this session no longer has open is
+    /// dropped. A confirmed creation closes the form and opens the channel
+    /// once the roster carries it; an unknown one says so and stays open.
+    fn apply_channel_created(
+        &mut self,
+        request: u64,
+        draft: crate::client::ChannelDraft,
+        outcome: crate::client::CreateOutcome,
+    ) {
+        if self.create_unsettled.as_ref().map(|open| open.request) != Some(request) {
+            return;
+        }
+        match outcome {
+            crate::client::CreateOutcome::Confirmed { channel_id } => {
+                self.create_unsettled = None;
+                self.create_channel = None;
+                self.pending_open = Some(channel_id);
+                self.note(format!("channel #{} created", draft.name));
+                self.outbox.push(SessionCommand::LoadChannels);
+                self.open_confirmed_channel();
+            }
+            crate::client::CreateOutcome::Unconfirmed {
+                channel_id, reason, ..
+            } => {
+                let state = CreateState::Unknown(reason.clone());
+                if let Some(open) = self.create_unsettled.as_mut() {
+                    open.channel_id = Some(channel_id);
+                    open.state = state.clone();
+                }
+                if let Some(form) = self.create_channel.as_mut() {
+                    form.state = state;
+                }
+                self.note(format!(
+                    "the channel may have been created; Ctrl+R refreshes the list to confirm: {reason}"
+                ));
+            }
+            crate::client::CreateOutcome::Refused { reason, .. } => {
+                self.create_unsettled = None;
+                if let Some(form) = self.create_channel.as_mut() {
+                    form.state = CreateState::Failed(reason.clone());
+                }
+                self.note(format!("channel not created: {reason}"));
+            }
+        }
+    }
+
+    /// Open a confirmed channel once the roster knows it. The roster is the
+    /// only source of a channel row, so a confirmation that arrives first
+    /// waits for the refresh instead of inventing a row.
+    fn open_confirmed_channel(&mut self) {
+        let Some(channel) = self.pending_open else {
+            return;
+        };
+        let Some(index) = self.channels.iter().position(|entry| entry.id == channel) else {
+            return;
+        };
+        self.pending_open = None;
+        self.switch_channel(index);
     }
 
     /// Report one outcome to the reader. The thread view draws its own status
@@ -1204,10 +1995,11 @@ impl App {
         }
         self.status = message;
     }
-
     pub fn overlay(&self) -> keys::Overlay {
         if self.help {
             keys::Overlay::Help
+        } else if self.create_channel.is_some() {
+            keys::Overlay::CreateChannel
         } else if self.community_picker.is_some() {
             keys::Overlay::CommunityPicker
         } else if self.palette.is_some() {
@@ -1538,7 +2330,16 @@ impl App {
             if generation < self.transport_generation {
                 return;
             }
-            self.transport_generation = generation;
+            if generation > self.transport_generation {
+                self.transport_generation = generation;
+                // A new relay connection invalidates the candidate roster;
+                // ordinary events on the same connection do not.
+                self.mention_roster.channel = Uuid::nil();
+                self.mention_roster.state = MentionRosterState::Loading;
+                if let Some(channel) = self.mention_picker.as_ref().map(|picker| picker.channel) {
+                    self.load_mention_roster(channel);
+                }
+            }
             self.apply(*event, now);
             return;
         }
@@ -1588,6 +2389,16 @@ impl App {
                 self.reader = ReaderView::default();
                 self.thread = ThreadView::default();
                 self.journey = None;
+                // The picker, its roster, its bindings and the last refusal
+                // belonged to the community that just left. No suggestion,
+                // remembered identity or block crosses the swap.
+                self.mention_picker = None;
+                self.mention_roster = MentionRoster::default();
+                self.mention_bindings.clear();
+                self.mention_block = None;
+                // A channel this session had waiting to be opened belongs to
+                // the community that just left: its row cannot arrive here.
+                self.pending_open = None;
                 self.composer = self
                     .community_id
                     .as_ref()
@@ -1688,6 +2499,14 @@ impl App {
                 // screen before the conversation is ever opened, so the names
                 // are wanted as soon as the roster names the people.
                 self.request_profiles();
+                // A creation the relay confirmed is opened here: the roster is
+                // the only place a channel row comes from. It is decided after
+                // the first-load choice, so a channel this session just made
+                // wins over the list's own first entry.
+                self.open_confirmed_channel();
+                // An unresolved creation checks itself against the same
+                // answer, when this is the refresh the user asked for.
+                self.resolve_create_refresh();
             }
             ChatEvent::ReadState { contexts, complete } => {
                 self.apply_read_state(&contexts, complete);
@@ -1966,9 +2785,29 @@ impl App {
             ChatEvent::Status(message) => self.status = message,
             ChatEvent::MentionBlocked {
                 local,
-                summary,
-                details,
-            } => self.block_send(local, summary, details),
+                channel,
+                block,
+            } => self.block_send(local, channel, block),
+            ChatEvent::MentionCandidates {
+                channel,
+                request,
+                result,
+            } => {
+                // A late answer for a superseded read, or for a conversation
+                // the picker has left, is dropped rather than shown.
+                if self.mention_roster.request == request && self.mention_roster.channel == channel
+                {
+                    self.mention_roster.state = match result {
+                        Ok(candidates) => MentionRosterState::Ready(candidates),
+                        Err(reason) => MentionRosterState::Failed(reason),
+                    };
+                }
+            }
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome,
+            } => self.apply_channel_created(request, draft, outcome),
             ChatEvent::WriteOk { local, event_id } => self.complete_write(local, event_id),
             ChatEvent::WriteFailed { local, reason } => self.fail_write(local, reason),
             ChatEvent::WriteUncertain { local, reason } => self.uncertain_write(local, reason),
@@ -5467,6 +6306,32 @@ impl App {
     }
 
     fn handle_navigation(&mut self, action: Action, now: u64) {
+        if self.create_channel.is_some() {
+            match action {
+                Action::Dismiss => {
+                    self.close_create_channel();
+                }
+                Action::ComposerInput(' ') => self.create_channel_space(),
+                Action::ComposerInput('r')
+                    if self
+                        .create_unsettled
+                        .as_ref()
+                        .is_some_and(|open| matches!(open.state, CreateState::Unknown(_))) =>
+                {
+                    self.refresh_create_channel()
+                }
+                Action::ComposerInput(c) => self.create_channel_input(c),
+                Action::ComposerBackspace => self.create_channel_backspace(),
+                Action::ComposerCursorDown => self.create_channel_step(true),
+                Action::ComposerCursorUp => self.create_channel_step(false),
+                Action::ComposerCursorLeft => self.create_channel_cycle(false),
+                Action::ComposerCursorRight => self.create_channel_cycle(true),
+                Action::ComposerSend => self.create_channel_submit(),
+                Action::CreateChannelRefresh => self.refresh_create_channel(),
+                _ => {}
+            }
+            return;
+        }
         if self.reader.open {
             self.handle_reader(action);
             return;
@@ -5499,6 +6364,15 @@ impl App {
         match action {
             Action::Quit => {
                 self.quit = true;
+            }
+            Action::CreateChannelRefresh => self.refresh_create_channel(),
+            Action::React
+                if self
+                    .create_unsettled
+                    .as_ref()
+                    .is_some_and(|open| matches!(open.state, CreateState::Unknown(_))) =>
+            {
+                self.refresh_create_channel()
             }
             Action::ToggleHelp => {
                 self.help = !self.help;
@@ -5601,11 +6475,15 @@ impl App {
                 let next = self.focus.saturating_sub(PAGE_ROWS);
                 self.set_focus(next);
             }
-            Action::PageDown => self.set_focus(self.focus + PAGE_ROWS),
+            Action::PageDown => {
+                let next = self.focus.saturating_add(PAGE_ROWS);
+                self.set_focus(next);
+            }
             Action::ComposeNew => {
                 self.composer.reply = None;
                 self.composer.edit = None;
                 self.mode = Mode::Composer;
+                self.sync_mention_picker();
             }
             Action::ComposeReply => {
                 let target = self
@@ -5628,6 +6506,7 @@ impl App {
                     None => self.composer.reply = None,
                 }
                 self.mode = Mode::Composer;
+                self.sync_mention_picker();
             }
             Action::React => self.react_focused(),
             Action::EditRow => self.edit_focused(),
@@ -5810,7 +6689,50 @@ impl App {
         }
     }
     fn handle_composer(&mut self, action: Action, now: u64) {
+        let before = self.composer.text();
+        if self.mention_picker.is_some() && !self.help {
+            match action {
+                Action::PickerNext => {
+                    self.mention_move(1);
+                    return;
+                }
+                Action::PickerPrev => {
+                    self.mention_move(-1);
+                    return;
+                }
+                Action::PickerConfirm => {
+                    self.mention_confirm();
+                    return;
+                }
+                Action::PickerRetry => {
+                    self.retry_mention_roster();
+                    return;
+                }
+                Action::Dismiss => {
+                    self.mention_dismiss();
+                    return;
+                }
+                Action::ToggleHelp => {
+                    self.help = true;
+                    self.help_scroll = 0;
+                    return;
+                }
+                _ => {}
+            }
+        }
         match action {
+            Action::HelpScroll(step) if self.help => {
+                self.help_scroll = self.help_scroll.saturating_add_signed(step as i16);
+                return;
+            }
+            Action::ToggleHelp if self.help => {
+                self.help = false;
+                return;
+            }
+            Action::Dismiss if self.help => {
+                self.help = false;
+                return;
+            }
             Action::OpenSearch => self.open_search(true, now),
             Action::Quit => self.quit = true,
             Action::ComposerInput(c) => {
@@ -5850,12 +6772,21 @@ impl App {
             Action::Ignored => {}
             _ => {}
         }
+        if self.composer.text() != before {
+            let after = self.composer.text();
+            self.rebase_mention_bindings(&before, &after);
+        }
+        self.sync_mention_picker();
     }
 
     fn switch_channel(&mut self, index: usize) {
         if self.channels.is_empty() || index >= self.channels.len() || index == self.selected {
             return;
         }
+        self.mention_bindings.clear();
+        self.mention_picker = None;
+        self.mention_roster = MentionRoster::default();
+        self.mention_block = None;
         self.save_draft();
         self.save_position();
         let label = self.label(&self.channels[index]);
@@ -6192,6 +7123,7 @@ impl App {
                 }
             }
             SlashCommand::Agents => self.toggle_agents(),
+            SlashCommand::CreateChannel => self.open_create_channel(),
             SlashCommand::Status => {
                 self.command_detail = Some(self.command_status());
                 self.help = true;
@@ -6596,6 +7528,7 @@ impl App {
             channel: channel_id,
         });
         self.mode = Mode::Composer;
+        self.sync_mention_picker();
     }
 
     fn delete_focused(&mut self) {
@@ -6763,6 +7696,7 @@ impl App {
                 channel: channel_id,
                 draft: draft.clone(),
                 reply,
+                bindings: self.mention_bindings.clone(),
             },
         );
         self.track_thread_write(&local);
@@ -6783,13 +7717,18 @@ impl App {
                 self.set_focus(usize::MAX);
             }
         }
+        self.prune_mention_bindings();
         self.outbox.push(SessionCommand::Send {
             channel: channel_id,
             content: draft.clone(),
             thread,
             local,
+            bindings: self.mention_bindings.clone(),
         });
         self.composer.clear();
+        // The bindings belong to the write in flight now: the composer holds
+        // no draft, and a refusal brings both back together.
+        self.mention_bindings.clear();
         self.mode = Mode::Navigation;
     }
 
@@ -6874,12 +7813,13 @@ impl App {
 
     /// A send the relay never saw: the draft comes back to the composer with
     /// the reason, and the exact references stay for the help surface.
-    fn block_send(&mut self, local: String, summary: String, details: Vec<String>) {
+    fn block_send(&mut self, local: String, channel: Uuid, block: mentions::Block) {
         self.thread.pending_writes.remove(&local);
         if let Some(PendingOp::Send {
             channel,
             draft,
             reply,
+            bindings,
         }) = self.pending.remove(&local)
         {
             if let Some(entry) = self.entry_mut(&channel) {
@@ -6890,10 +7830,21 @@ impl App {
             self.set_focus(self.focus);
             self.composer.set_text(&draft);
             self.composer.reply = reply;
+            // The blocked draft keeps its bindings: the correction is an edit
+            // of the same draft, and a picker row that still answers to its
+            // name is still the identity the reader chose.
+            self.mention_bindings = bindings;
             self.mode = Mode::Composer;
         }
-        self.note(summary.clone());
-        self.mention_block = Some(MentionBlock { summary, details });
+        self.note(block.summary());
+        self.mention_block = Some(MentionBlock {
+            kind: block.kind().to_owned(),
+            summary: block.summary(),
+            details: block.details(),
+            channel,
+            community: self.community_id.clone(),
+            generation: self.transport_generation,
+        });
     }
 
     fn fail_write(&mut self, local: String, reason: String) {
@@ -6903,6 +7854,7 @@ impl App {
                 channel,
                 draft,
                 reply,
+                bindings,
             }) => {
                 if let Some(entry) = self.entry_mut(&channel) {
                     entry.rows.retain(|r| r.event_id != local);
@@ -6912,6 +7864,7 @@ impl App {
                 self.set_focus(self.focus);
                 self.composer.set_text(&draft);
                 self.composer.reply = reply;
+                self.mention_bindings = bindings;
                 self.mode = Mode::Composer;
                 self.note(format!("send failed: {reason}"));
             }
@@ -9376,8 +10329,11 @@ mod tests {
         app.apply(
             ChatEvent::MentionBlocked {
                 local: local.clone(),
-                summary: "mention \"@buzzx build\" matches 2 members".into(),
-                details: vec!["@buzzx build -> nostr:npub1abc".into()],
+                channel: app.channels[0].id,
+                block: crate::mentions::Block::Ambiguous {
+                    name: "buzzx build".into(),
+                    candidates: vec!["11".repeat(32), "22".repeat(32)],
+                },
             },
             0,
         );
@@ -9387,12 +10343,11 @@ mod tests {
         );
         assert_eq!(app.composer.text(), "@Buzzx Build look");
         assert_eq!(app.mode, Mode::Composer);
-        assert!(app.status.contains("matches 2 members"));
+        assert!(app.status.contains("matches 2 members"), "{}", app.status);
         let block = app.mention_block.clone().expect("the block is kept");
-        assert_eq!(
-            block.details,
-            vec!["@buzzx build -> nostr:npub1abc".to_owned()]
-        );
+        assert_eq!(block.kind, "ambiguous");
+        assert_eq!(block.channel, app.channels[0].id);
+        assert_eq!(block.details.len(), 2);
         assert!(
             take_commands(&mut app).is_empty(),
             "a blocked send is never retried"
@@ -9403,9 +10358,14 @@ mod tests {
     fn the_next_send_attempt_clears_the_previous_block() {
         let mut app = app();
         app.channels = vec![channel(1)];
+        let channel = app.channels[0].id;
         app.mention_block = Some(MentionBlock {
+            kind: "unknown".into(),
             summary: "stale".into(),
             details: vec!["old".into()],
+            channel,
+            community: Some("work".into()),
+            generation: 1,
         });
         app.handle(Action::ComposeNew, 0);
         app.composer.set_text("plain");
@@ -9940,6 +10900,943 @@ mod tests {
         assert!(!app.help && app.switcher.is_none());
     }
 
+    /// Walk the palette by action, independent of inserted palette entries.
+    fn walk_palette(app: &mut App, command: SlashCommand) {
+        let mut steps = 0;
+        while SlashCommand::PALETTE[app.palette.expect("the palette is open")] != command {
+            app.handle(Action::PaletteNext, 0);
+            steps += 1;
+            assert!(
+                steps <= SlashCommand::PALETTE.len(),
+                "the palette holds {command:?}"
+            );
+        }
+    }
+
+    fn candidate(pubkey: &str, label: &str) -> mentions::Candidate {
+        mentions::Candidate {
+            pubkey: pubkey.to_owned(),
+            label: label.to_owned(),
+            picture: None,
+            agent: false,
+            admin: false,
+        }
+    }
+
+    /// The picker read a channel's candidates, as the session answers it.
+    fn candidates(channel: Uuid, request: u64, items: Vec<mentions::Candidate>) -> ChatEvent {
+        ChatEvent::MentionCandidates {
+            channel,
+            request,
+            result: Ok(items),
+        }
+    }
+
+    /// The token of the one roster read in the outbox, so an answer can name it.
+    fn roster_request(app: &mut App) -> (Uuid, u64) {
+        let reads: Vec<(Uuid, u64)> = take_commands(app)
+            .into_iter()
+            .filter_map(|command| match command {
+                SessionCommand::MentionCandidates { channel, request } => Some((channel, request)),
+                _ => None,
+            })
+            .collect();
+        let [(channel, request)] = reads.as_slice() else {
+            panic!("expected one candidate read, got {reads:?}");
+        };
+        (*channel, *request)
+    }
+
+    /// A composer with a draft, typed one character at a time so every key
+    /// the picker follows is the key a reader presses.
+    fn typing(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle(Action::ComposerInput(c), 0);
+        }
+    }
+
+    #[test]
+    fn typing_at_opens_the_picker_and_asks_for_one_roster_read() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        app.handle(Action::ComposeNew, 0);
+        let channel = app.channels[0].id;
+        typing(&mut app, "@");
+        let picker = app.mention_picker.clone().expect("the picker is open");
+        assert_eq!(picker.channel, channel);
+        assert_eq!(picker.active.query, "");
+        assert!(app.mention_loading(), "the read is in flight");
+        assert_eq!(roster_request(&mut app), (channel, 1));
+        // The query follows the caret, and the read is not repeated: one
+        // roster serves every query of the picker session.
+        typing(&mut app, "bu");
+        assert_eq!(app.mention_picker.as_ref().unwrap().active.query, "bu");
+        assert!(take_commands(&mut app).is_empty(), "one read per session");
+    }
+
+    #[test]
+    fn a_picker_selection_inserts_a_label_and_remembers_its_identity() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@buzzx");
+        let (channel, request) = roster_request(&mut app);
+        assert_eq!(channel, app.channels[0].id);
+        app.apply(
+            candidates(
+                channel,
+                request,
+                vec![
+                    candidate("aa", "Buzzx Build"),
+                    candidate("bb", "Buzzx Product"),
+                ],
+            ),
+            5,
+        );
+        assert_eq!(app.mention_items().len(), 2, "both names answer the query");
+        app.handle(Action::PickerNext, 6);
+        assert!(app.mention_confirm());
+        assert_eq!(app.composer.text(), "@Buzzx Product ");
+        assert_eq!(
+            app.mention_bindings,
+            vec![mentions::Binding {
+                start: 0,
+                label: "Buzzx Product".into(),
+                pubkey: "bb".into(),
+            }]
+        );
+        assert!(app.mention_picker.is_none(), "a selection closes it");
+        assert!(
+            take_commands(&mut app).is_empty(),
+            "selecting a person writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_pointer_selection_lands_on_the_row_it_names() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@buzzx");
+        let (channel, request) = roster_request(&mut app);
+        app.apply(
+            candidates(
+                channel,
+                request,
+                vec![
+                    candidate("aa", "Buzzx Build"),
+                    candidate("bb", "Buzzx Product"),
+                    candidate("cc", "Buzzx Test"),
+                ],
+            ),
+            5,
+        );
+        // The cursor starts on the first row; the pointer is on the last.
+        app.mention_select(2);
+        assert!(app.mention_confirm());
+        assert_eq!(app.composer.text(), "@Buzzx Test ");
+        assert_eq!(
+            app.mention_bindings,
+            vec![mentions::Binding {
+                start: 0,
+                label: "Buzzx Test".into(),
+                pubkey: "cc".into(),
+            }]
+        );
+        // A row past the end is the last row, never an empty cursor.
+        typing(&mut app, "@");
+        app.mention_select(9);
+        assert!(app.mention_confirm());
+        assert_eq!(app.composer.text(), "@Buzzx Test @Buzzx Test ");
+    }
+
+    #[test]
+    fn a_late_roster_answer_for_another_channel_is_dropped() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2)];
+        app.stub_roster();
+        app.handle(Action::ComposeNew, 0);
+        let channel = app.channels[0].id;
+        typing(&mut app, "@a");
+        let (_, request) = roster_request(&mut app);
+        app.apply(
+            candidates(channel, request + 1, vec![candidate("aa", "Ap")]),
+            5,
+        );
+        assert!(
+            app.mention_items().is_empty(),
+            "a superseded read is ignored"
+        );
+        app.apply(candidates(channel, request, vec![candidate("aa", "Ap")]), 6);
+        assert_eq!(app.mention_items().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_roster_read_stays_visible_and_retries_on_request() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@a");
+        let (channel, request) = roster_request(&mut app);
+        app.apply(
+            ChatEvent::MentionCandidates {
+                channel,
+                request,
+                result: Err("relay unreachable".into()),
+            },
+            5,
+        );
+        assert_eq!(app.mention_failure(), Some("relay unreachable"));
+        assert!(app.mention_items().is_empty());
+        app.handle(Action::PickerRetry, 6);
+        let (retried, token) = roster_request(&mut app);
+        assert_eq!(retried, channel);
+        assert!(token > request, "the retry is a new read, not a repeat");
+        assert!(app.mention_loading());
+    }
+
+    #[test]
+    fn a_send_carries_the_bindings_and_a_block_returns_the_draft() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        let channel = app.channels[0].id;
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@buzzx");
+        let (_, request) = roster_request(&mut app);
+        app.apply(
+            candidates(channel, request, vec![candidate("aa", "Buzzx Build")]),
+            5,
+        );
+        assert!(app.mention_confirm());
+        typing(&mut app, "hi");
+        app.handle(Action::ComposerSend, 6);
+        let commands = take_commands(&mut app);
+        let [
+            SessionCommand::Send {
+                local,
+                bindings,
+                content,
+                ..
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("expected one send, got {commands:?}");
+        };
+        assert_eq!(content, "@Buzzx Build hi");
+        assert_eq!(
+            bindings,
+            &vec![mentions::Binding {
+                start: 0,
+                label: "Buzzx Build".into(),
+                pubkey: "aa".into(),
+            }],
+            "the identity the picker inserted travels with the draft"
+        );
+        let local = local.clone();
+        app.apply(
+            ChatEvent::MentionBlocked {
+                local,
+                channel,
+                block: mentions::Block::Ambiguous {
+                    name: "buzzx build".into(),
+                    candidates: vec!["aa".into(), "bb".into()],
+                },
+            },
+            7,
+        );
+        assert_eq!(app.composer.text(), "@Buzzx Build hi", "the draft is kept");
+        assert_eq!(app.mode, Mode::Composer);
+        let block = app.mention_block.clone().expect("the refusal is kept");
+        assert_eq!(block.kind, "ambiguous");
+        assert_eq!(block.channel, channel);
+        assert_eq!(block.community, None);
+        assert_eq!(block.details.len(), 2, "both exact references stay");
+        // A binding the draft no longer carries is dropped with the text.
+        assert_eq!(app.mention_bindings.len(), 1);
+        app.composer.set_text("plain text");
+        app.prune_mention_bindings();
+        assert!(app.mention_bindings.is_empty());
+    }
+
+    #[test]
+    fn a_community_switch_drops_the_picker_its_roster_and_the_block() {
+        let mut app = app();
+        app.set_community(Some("work"), Some("Work"));
+        app.set_communities(vec![
+            CommunityChoice {
+                id: "work".into(),
+                name: "Work".into(),
+                relay_url: "https://work.example".into(),
+                last_channel: None,
+            },
+            CommunityChoice {
+                id: "home".into(),
+                name: "Home".into(),
+                relay_url: "https://home.example".into(),
+                last_channel: None,
+            },
+        ]);
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@a");
+        let (channel, request) = roster_request(&mut app);
+        app.apply(candidates(channel, request, vec![candidate("aa", "Ap")]), 5);
+        assert!(app.mention_confirm());
+        app.mention_block = Some(MentionBlock {
+            kind: "unknown".into(),
+            summary: "stale".into(),
+            details: Vec::new(),
+            channel,
+            community: Some("work".into()),
+            generation: 1,
+        });
+        let _ = take_commands(&mut app);
+        // The picker reopens on the roster this session already read: the
+        // switch below is what must drop it.
+        assert!(
+            !take_commands(&mut app)
+                .iter()
+                .any(|command| matches!(command, SessionCommand::MentionCandidates { .. }))
+        );
+        app.apply(
+            ChatEvent::CommunitySwitching {
+                generation: 2,
+                id: Some("home".into()),
+                name: "Home".into(),
+                relay_url: "https://home.example".into(),
+            },
+            8,
+        );
+        assert_eq!(app.community_id.as_deref(), Some("home"));
+        let _ = take_commands(&mut app);
+        assert!(app.mention_picker.is_none(), "no picker crosses the switch");
+        assert!(app.mention_bindings.is_empty());
+        assert!(app.mention_block.is_none());
+        assert!(!app.mention_loading(), "the old roster is gone");
+        assert!(app.mention_items().is_empty());
+    }
+
+    #[test]
+    fn a_channel_switch_discards_the_previous_channel_picker() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2)];
+        app.stub_roster();
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@a");
+        let (channel, request) = roster_request(&mut app);
+        app.apply(candidates(channel, request, vec![candidate("aa", "Ap")]), 1);
+        assert_eq!(app.mention_items().len(), 1);
+        app.web_select_channel(app.channels[1].id).unwrap();
+        assert!(app.mention_picker.is_none());
+        assert!(app.mention_items().is_empty());
+        assert_ne!(app.composer_channel(), Some(channel));
+    }
+
+    #[test]
+    fn a_fork_does_not_inherit_the_previous_tabs_picker_or_creation() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@a");
+        assert!(app.mention_picker.is_some());
+        app.open_create_channel();
+        let fork = app.web_fork();
+        assert!(fork.mention_picker.is_none());
+        assert!(fork.mention_block.is_none());
+        assert!(fork.mention_bindings.is_empty());
+        assert!(fork.create_channel.is_none());
+        assert!(!fork.create_write_pending());
+    }
+
+    #[test]
+    fn a_generation_bump_re_reads_the_roster_a_picker_still_shows() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        app.handle(Action::ComposeNew, 0);
+        let channel = app.channels[0].id;
+        typing(&mut app, "@a");
+        let (_, request) = roster_request(&mut app);
+        app.apply(candidates(channel, request, vec![candidate("aa", "Ap")]), 5);
+        assert_eq!(app.mention_items().len(), 1);
+        app.apply(
+            ChatEvent::Generation {
+                generation: 2,
+                event: Box::new(ChatEvent::Connected),
+            },
+            6,
+        );
+        let (re_asked, token) = roster_request(&mut app);
+        assert_eq!(re_asked, channel);
+        assert!(token > request, "the new connection reads its own roster");
+        assert!(
+            app.mention_items().is_empty(),
+            "the old snapshot is not shown over the new connection"
+        );
+    }
+
+    #[test]
+    fn ordinary_live_events_do_not_restart_an_open_mention_lookup() {
+        let mut app = app();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 0);
+        app.handle(Action::ComposeNew, 0);
+        let channel = app.channels[0].id;
+        typing(&mut app, "@a");
+        let (_, request) = roster_request(&mut app);
+        app.apply(candidates(channel, request, vec![candidate("aa", "Ap")]), 1);
+        app.apply(
+            ChatEvent::Generation {
+                generation: 0,
+                event: Box::new(ChatEvent::Status("live update".into())),
+            },
+            2,
+        );
+        assert_eq!(app.mention_items().len(), 1);
+        assert!(!app.mention_loading());
+        assert!(
+            take_commands(&mut app)
+                .iter()
+                .all(|command| !matches!(command, SessionCommand::MentionCandidates { .. }))
+        );
+    }
+
+    #[test]
+    fn space_types_in_text_fields_and_cycles_the_choices() {
+        let mut app = app();
+        app.open_create_channel();
+        app.handle(Action::ComposerInput(' '), 0);
+        assert_eq!(app.create_channel.as_ref().unwrap().name, " ");
+        typing(&mut app, "项目 讨论");
+        assert_eq!(app.create_channel.as_ref().unwrap().name, " 项目 讨论");
+        app.handle(Action::ComposerCursorDown, 0);
+        assert_eq!(
+            app.create_channel.as_ref().unwrap().field,
+            CreateField::Type
+        );
+        let before = app.create_channel.as_ref().unwrap().kind;
+        app.handle(Action::ComposerInput(' '), 0);
+        assert_ne!(app.create_channel.as_ref().unwrap().kind, before);
+        app.handle(Action::ComposerCursorDown, 0);
+        app.handle(Action::ComposerInput(' '), 0);
+        assert_eq!(
+            app.create_channel.as_ref().unwrap().visibility,
+            buzz_core::channel::ChannelVisibility::Private
+        );
+        app.handle(Action::ComposerCursorDown, 0);
+        assert_eq!(
+            app.create_channel.as_ref().unwrap().field,
+            CreateField::Description
+        );
+        app.handle(Action::ComposerInput(' '), 0);
+        assert_eq!(app.create_channel.as_ref().unwrap().description, " ");
+    }
+
+    #[test]
+    fn a_create_submit_without_a_name_writes_nothing() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.open_create_channel();
+        typing(&mut app, "   ");
+        app.handle(Action::ComposerSend, 0);
+        assert!(
+            take_commands(&mut app).is_empty(),
+            "no write, no roster read"
+        );
+        assert_eq!(
+            app.create_channel.as_ref().unwrap().state,
+            CreateState::Editing
+        );
+        assert!(app.status.contains("name is required"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_create_submit_sends_the_trimmed_draft_once() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.open_create_channel();
+        typing(&mut app, " 项目讨论 ");
+        app.handle(Action::ComposerCursorDown, 0);
+        app.handle(Action::ComposerCursorRight, 0);
+        app.handle(Action::ComposerCursorDown, 0);
+        app.handle(Action::ComposerCursorRight, 0);
+        app.handle(Action::ComposerCursorDown, 0);
+        typing(&mut app, " 可选说明 ");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        assert_eq!(draft.name, "项目讨论");
+        assert_eq!(draft.kind, buzz_core::channel::ChannelType::Forum);
+        assert_eq!(
+            draft.visibility,
+            buzz_core::channel::ChannelVisibility::Private
+        );
+        assert_eq!(draft.description.as_deref(), Some("可选说明"));
+        assert_eq!(*request, 1);
+        assert_eq!(
+            app.create_unsettled.as_ref().map(|open| open.known.clone()),
+            Some(vec![app.channels[0].id])
+        );
+        // A second Enter while the write is in flight is not a second write.
+        app.handle(Action::ComposerSend, 1);
+        assert!(take_commands(&mut app).is_empty());
+        assert_eq!(
+            app.create_channel.as_ref().unwrap().state,
+            CreateState::Creating
+        );
+    }
+
+    #[test]
+    fn a_confirmed_create_opens_the_channel_the_roster_brought() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.open_create_channel();
+        typing(&mut app, "项目讨论");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, request) = (draft.clone(), *request);
+        let channel_id = Uuid::from_u64_pair(9, 0);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome: crate::client::CreateOutcome::Confirmed { channel_id },
+            },
+            5,
+        );
+        assert!(app.create_channel.is_none(), "a confirmed form closes");
+        assert!(
+            matches!(
+                take_commands(&mut app).as_slice(),
+                [SessionCommand::LoadChannels]
+            ),
+            "a confirmed creation refreshes the roster"
+        );
+        assert_ne!(app.selected_entry().map(|entry| entry.id), Some(channel_id));
+        let mut info = channel_info(9);
+        info.id = channel_id;
+        info.name = "项目讨论".into();
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1), info])), 6);
+        assert_eq!(
+            app.selected_entry().map(|entry| entry.id),
+            Some(channel_id),
+            "the new channel is opened once the roster carries it"
+        );
+    }
+
+    #[test]
+    fn a_refused_create_keeps_the_form_and_writes_nothing_more() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.open_create_channel();
+        typing(&mut app, "项目讨论");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, request) = (draft.clone(), *request);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome: crate::client::CreateOutcome::Refused {
+                    category: crate::failure::Category::Forbidden,
+                    reason: "HTTP 403: not allowed".into(),
+                },
+            },
+            5,
+        );
+        let form = app.create_channel.as_ref().expect("the form stays");
+        assert!(matches!(form.state, CreateState::Failed(_)));
+        assert!(form.ready(), "a refusal leaves the form editable");
+        assert!(take_commands(&mut app).is_empty(), "nothing is retried");
+        assert!(!app.create_write_pending());
+    }
+
+    #[test]
+    fn a_form_reopened_over_an_open_write_shows_that_write() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.open_create_channel();
+        typing(&mut app, "项目讨论");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, request) = (draft.clone(), *request);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome: crate::client::CreateOutcome::Unconfirmed {
+                    channel_id: Uuid::from_u64_pair(9, 0),
+                    category: crate::failure::Category::TimeoutUnknown,
+                    reason: "timed out".into(),
+                },
+            },
+            1,
+        );
+        app.handle(Action::Dismiss, 2);
+        assert!(app.create_channel.is_none(), "the form closes");
+        // Opening again shows the write that is still open: the same draft,
+        // the same unresolved state, and no second write.
+        app.open_create_channel();
+        let form = app.create_channel.as_ref().expect("the form reopens");
+        assert_eq!(form.name, "项目讨论");
+        assert!(
+            matches!(form.state, CreateState::Unknown(_)),
+            "the reopened form shows the unresolved write"
+        );
+        app.handle(Action::ComposerSend, 3);
+        assert!(
+            take_commands(&mut app).is_empty(),
+            "a reopened form does not submit a second creation"
+        );
+        assert!(app.status.contains("unresolved"), "{}", app.status);
+        // The refresh that came back with a complete roster lacking the
+        // channel settles the write: the reopened form starts clean, and the
+        // name is the reader's to submit again.
+        app.handle(Action::Dismiss, 4);
+        app.handle(Action::CreateChannelRefresh, 5);
+        let _ = take_commands(&mut app);
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 6);
+        assert!(
+            !app.create_write_pending(),
+            "the complete roster settles the write it answered"
+        );
+        assert!(app.status.contains("did not land"), "{}", app.status);
+        app.open_create_channel();
+        let form = app.create_channel.as_ref().expect("the form reopens");
+        assert!(
+            matches!(form.state, CreateState::Editing),
+            "a settled form is ready for a fresh submit"
+        );
+    }
+
+    #[test]
+    fn a_second_creation_takes_a_new_token() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.open_create_channel();
+        typing(&mut app, "alpha");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, first) = (draft.clone(), *request);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request: first,
+                draft,
+                outcome: crate::client::CreateOutcome::Refused {
+                    category: crate::failure::Category::RelayRejected,
+                    reason: "a channel with that name exists".into(),
+                },
+            },
+            1,
+        );
+        assert!(!app.create_write_pending(), "a refusal settles the write");
+        assert!(matches!(
+            app.create_channel.as_ref().unwrap().state,
+            CreateState::Failed(_)
+        ));
+        app.create_channel.as_mut().unwrap().name = "beta".into();
+        app.handle(Action::ComposerSend, 2);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { request, .. }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        assert!(
+            *request > first,
+            "the token climbs: {request} after {first}"
+        );
+        // An answer for the write that is over is dropped.
+        let draft = app.create_unsettled.as_ref().unwrap().draft.clone();
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request: first,
+                draft,
+                outcome: crate::client::CreateOutcome::Confirmed {
+                    channel_id: Uuid::from_u64_pair(7, 0),
+                },
+            },
+            3,
+        );
+        assert!(
+            app.create_write_pending(),
+            "a late answer for the refused write settles nothing"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_create_waits_for_the_refresh_the_reader_asks_for() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.open_create_channel();
+        typing(&mut app, "项目讨论");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, request) = (draft.clone(), *request);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome: crate::client::CreateOutcome::Unconfirmed {
+                    channel_id: Uuid::from_u64_pair(9, 0),
+                    category: crate::failure::Category::TimeoutUnknown,
+                    reason: "HTTP 502: bad gateway".into(),
+                },
+            },
+            5,
+        );
+        assert!(matches!(
+            app.create_channel.as_ref().unwrap().state,
+            CreateState::Unknown(_)
+        ));
+        assert!(app.create_write_pending(), "the write is not settled");
+        // Esc closes the form, and what is unresolved stays unresolved: the
+        // record, not the overlay, is what keeps the session honest.
+        app.handle(Action::Dismiss, 6);
+        assert!(app.create_channel.is_none());
+        assert!(app.status.contains("Ctrl+R"), "{}", app.status);
+        assert!(app.create_write_pending(), "a closed form settles nothing");
+        // A roster answer nobody asked for settles nothing either.
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 7);
+        assert!(app.create_write_pending());
+        // The refresh the reader asks for is what resolves it.
+        app.handle(Action::CreateChannelRefresh, 8);
+        let commands = take_commands(&mut app);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, SessionCommand::LoadChannels))
+                .count(),
+            1,
+            "the refresh asks for one roster read: {commands:?}"
+        );
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 9);
+        assert!(
+            !app.create_write_pending(),
+            "a complete list that lacks the channel settles the write"
+        );
+        assert!(
+            app.status.contains("did not land"),
+            "the reader is told the creation did not land: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_brings_the_channel_opens_it_instead_of_offering_another() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.open_create_channel();
+        typing(&mut app, "项目讨论");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, request) = (draft.clone(), *request);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome: crate::client::CreateOutcome::Unconfirmed {
+                    channel_id: Uuid::from_u64_pair(9, 0),
+                    category: crate::failure::Category::TimeoutUnknown,
+                    reason: "timed out".into(),
+                },
+            },
+            5,
+        );
+        app.handle(Action::CreateChannelRefresh, 6);
+        let _ = take_commands(&mut app);
+        let mut info = channel_info(9);
+        info.name = "项目讨论".into();
+        let opened = info.id;
+        app.handle(Action::Dismiss, 7);
+        assert!(app.create_channel.is_none(), "the form may close");
+        assert!(app.create_write_pending(), "the write is still open");
+        app.handle(Action::CreateChannelRefresh, 8);
+        let _ = take_commands(&mut app);
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1), info])), 9);
+        assert!(app.create_channel.is_none(), "the creation is settled");
+        assert_eq!(app.selected_entry().map(|entry| entry.id), Some(opened));
+        assert!(!app.create_write_pending(), "and the block is gone");
+    }
+
+    #[test]
+    fn a_partial_roster_never_settles_an_uncertain_creation() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.open_create_channel();
+        typing(&mut app, "项目讨论");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, request) = (draft.clone(), *request);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome: crate::client::CreateOutcome::Unconfirmed {
+                    channel_id: Uuid::from_u64_pair(9, 0),
+                    category: crate::failure::Category::TimeoutUnknown,
+                    reason: "timed out".into(),
+                },
+            },
+            5,
+        );
+        app.handle(Action::CreateChannelRefresh, 6);
+        let _ = take_commands(&mut app);
+        app.apply(
+            ChatEvent::Channels(Roster {
+                items: vec![channel_info(1)],
+                complete: false,
+            }),
+            7,
+        );
+        assert!(
+            app.create_write_pending(),
+            "a partial list cannot prove the channel is absent"
+        );
+        assert!(app.status.contains("incomplete"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_refresh_alone_does_not_claim_a_channel_that_was_already_there() {
+        let mut app = app();
+        let mut twin = channel(2);
+        twin.name = "项目讨论".to_owned();
+        app.channels = vec![channel(1), twin];
+        app.stub_roster();
+        app.open_create_channel();
+        typing(&mut app, "项目讨论");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, request) = (draft.clone(), *request);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome: crate::client::CreateOutcome::Unconfirmed {
+                    channel_id: Uuid::from_u64_pair(9, 0),
+                    category: crate::failure::Category::TimeoutUnknown,
+                    reason: "timed out".into(),
+                },
+            },
+            5,
+        );
+        app.handle(Action::CreateChannelRefresh, 6);
+        let _ = take_commands(&mut app);
+        app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 7);
+        assert!(
+            !app.create_write_pending(),
+            "the refresh that answered it settles the write"
+        );
+        assert!(
+            matches!(
+                app.create_channel.as_ref().map(|form| &form.state),
+                Some(CreateState::Failed(_))
+            ),
+            "the form stays open and editable with the relay's answer"
+        );
+        assert_ne!(
+            app.selected_entry().map(|entry| entry.id),
+            Some(Uuid::from_u64_pair(2, 0)),
+            "a name the roster already carried is not this creation"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_create_blocks_a_community_switch() {
+        let mut app = app();
+        app.set_community(Some("work"), Some("Work"));
+        app.set_communities(vec![
+            CommunityChoice {
+                id: "work".into(),
+                name: "Work".into(),
+                relay_url: "https://work.example".into(),
+                last_channel: None,
+            },
+            CommunityChoice {
+                id: "home".into(),
+                name: "Home".into(),
+                relay_url: "https://home.example".into(),
+                last_channel: None,
+            },
+        ]);
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.open_create_channel();
+        typing(&mut app, "项目讨论");
+        let _ = take_commands(&mut app);
+        app.handle(Action::ComposerSend, 0);
+        let commands = take_commands(&mut app);
+        let [SessionCommand::CreateChannel { draft, request }] = commands.as_slice() else {
+            panic!("expected one create, got {commands:?}");
+        };
+        let (draft, request) = (draft.clone(), *request);
+        app.apply(
+            ChatEvent::ChannelCreated {
+                request,
+                draft,
+                outcome: crate::client::CreateOutcome::Unconfirmed {
+                    channel_id: Uuid::from_u64_pair(9, 0),
+                    category: crate::failure::Category::TimeoutUnknown,
+                    reason: "timed out".into(),
+                },
+            },
+            5,
+        );
+        app.handle(Action::Dismiss, 6);
+        assert!(app.create_channel.is_none(), "the form closes");
+        app.handle(Action::ToggleCommunityPicker, 7);
+        app.handle(Action::CommunityNext, 8);
+        app.handle(Action::CommunityConfirm, 9);
+        assert!(
+            take_commands(&mut app).is_empty(),
+            "the unresolved creation belongs to the community it was aimed at"
+        );
+        assert!(
+            app.status.contains("blocks community switching"),
+            "{}",
+            app.status
+        );
+    }
+
     #[test]
     fn a_palette_command_routes_to_the_action_its_key_reaches() {
         let mut app = app();
@@ -9961,6 +11858,16 @@ mod tests {
         app.handle(Action::Dismiss, 100);
         app.handle(Action::Dismiss, 100);
         assert!(!app.search.open);
+        // Create channel opens the form and creates nothing until the user
+        // submits it, so the palette entry is not a write.
+        app.handle(Action::TogglePalette, 0);
+        walk_palette(&mut app, SlashCommand::CreateChannel);
+        app.handle(Action::PaletteConfirm, 0);
+        assert!(app.create_channel.is_some(), "the form is open");
+        assert_eq!(app.overlay(), keys::Overlay::CreateChannel);
+        app.handle(Action::Dismiss, 0);
+        assert!(app.create_channel.is_none(), "Esc closes the form");
+        assert!(take_commands(&mut app).is_empty(), "no channel was created");
         // Quit is the last command and sets the same flag `q` does.
         app.handle(Action::TogglePalette, 0);
         for _ in 0..SlashCommand::PALETTE.len() {

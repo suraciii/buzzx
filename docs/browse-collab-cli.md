@@ -21,6 +21,7 @@ Enable this complete flow from a non-interactive terminal:
 2. Read recent messages in one channel, or read a thread.
 3. Send a new message or reply to an existing event.
 4. Confirm the resulting event id and its channel/thread context.
+5. Create a channel in the selected community and confirm its canonical id.
 
 The commands are one-shot JSON operations. They complement the held TUI
 session and do not change the TUI's interaction model.
@@ -30,6 +31,7 @@ session and do not change the TUI's interaction model.
 ### In scope
 
 - `channels list`
+- `channels create`
 - `messages get`
 - `messages thread`
 - `messages send`
@@ -40,10 +42,12 @@ session and do not change the TUI's interaction model.
 
 ### Out of scope
 
-Agent creation or lifecycle management, channel administration, full-text
-search, `watch`, a new protocol (MCP/A2A), persistence of runs, and a TUI
-redesign. Those capabilities may use this contract later, but they are not
-requirements for this slice.
+Agent creation or lifecycle management, member administration/invites,
+archival, full-text search, `watch`, a new protocol (MCP/A2A), persistence of
+runs, and a TUI redesign remain outside this contract. Channel creation is the
+small exception specified in
+[mentions-and-channel-creation.md](mentions-and-channel-creation.md#cli-contract);
+membership management remains a separate slice.
 
 ## User flow
 
@@ -73,6 +77,7 @@ channel and creates a top-level message.
 | Command | Required input | Result |
 | --- | --- | --- |
 | `channels list` | identity | Channels the identity can access |
+| `channels create` | `--name`, optional type/visibility/description | Confirmed, uncertain or refused channel-create result |
 | `messages get` | `--channel`, or `--event` for one event | Recent channel messages, or one canonical event |
 | `messages thread` | `--event` | Root event and replies in stable order |
 | `messages send` | `--channel`, content | A top-level message write result |

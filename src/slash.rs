@@ -18,6 +18,8 @@ pub enum Command {
     Thread,
     Agents,
     Status,
+    /// Palette only: opens the channel-creation form. Slash remains read-only.
+    CreateChannel,
     /// Palette only. Quitting duplicates `q`/`Esc`, so the composer never
     /// recognizes it and `/quit` stays plain text.
     Quit,
@@ -41,13 +43,13 @@ impl Command {
         Command::Status,
     ];
 
-    /// The palette's action directory, in display order. The palette runs
-    /// actions the timeline already has a key for, so it lists `Quit` even
-    /// though the composer does not.
-    pub const PALETTE: [Command; 7] = [
+    /// Palette actions include form entry without exposing a write command
+    /// in the slash composer.
+    pub const PALETTE: [Command; 8] = [
         Command::Switch,
         Command::Search,
         Command::Agents,
+        Command::CreateChannel,
         Command::Thread,
         Command::Help,
         Command::Status,
@@ -62,6 +64,7 @@ impl Command {
             Command::Switch => "switch",
             Command::Thread => "thread",
             Command::Agents => "agents",
+            Command::CreateChannel => "create-channel",
             Command::Status => "status",
             Command::Quit => "quit",
         }
@@ -76,6 +79,7 @@ impl Command {
             Command::Switch => "/switch [name]",
             Command::Thread => "/thread",
             Command::Agents => "/agents",
+            Command::CreateChannel => "Create channel",
             Command::Status => "/status",
             Command::Quit => "q",
         }
@@ -89,6 +93,7 @@ impl Command {
             Command::Switch => "Switch conversation",
             Command::Thread => "Open the focused event's thread",
             Command::Agents => "Open the Agents list",
+            Command::CreateChannel => "Open channel creation form",
             Command::Status => "Show connection and target status",
             Command::Quit => "Quit",
         }
@@ -102,6 +107,7 @@ impl Command {
             Command::Switch => "Switch conversation",
             Command::Thread => "Open thread",
             Command::Agents => "My agents",
+            Command::CreateChannel => "Create channel",
             Command::Status => "Status",
             Command::Quit => "Quit",
         }
@@ -116,6 +122,7 @@ impl Command {
             Command::Switch => "c",
             Command::Thread => "t",
             Command::Agents => "a",
+            Command::CreateChannel => "",
             Command::Status => "",
             Command::Quit => "q",
         }
@@ -132,7 +139,7 @@ impl Command {
             }
             Command::Search => &["channel", "context", "thread"],
             Command::Thread => &["channel", "context"],
-            Command::Switch | Command::Agents => &["channel"],
+            Command::Switch | Command::Agents | Command::CreateChannel => &["channel"],
         }
     }
 
@@ -416,6 +423,9 @@ mod tests {
 
         assert!(!Command::ALL.contains(&Command::Quit));
         assert!(Command::PALETTE.contains(&Command::Quit));
+        assert_eq!(parse("/create-channel"), Parse::Unknown);
+        assert!(!suggestions("/").contains(&Command::CreateChannel));
+        assert!(Command::PALETTE.contains(&Command::CreateChannel));
         for command in Command::PALETTE {
             assert!(!command.label().is_empty());
             assert!(!command.summary().is_empty());

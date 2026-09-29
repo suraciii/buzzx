@@ -115,6 +115,80 @@ pub struct Roster {
     pub complete: bool,
 }
 
+/// The fields one channel-creation request carries.
+///
+/// Name, type and visibility are the whole of the first slice: the relay
+/// establishes the channel id, the creator's ownership and the initial
+/// membership, and member invites, TTL and archival are separate work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelDraft {
+    pub name: String,
+    pub kind: buzz_core::channel::ChannelType,
+    pub visibility: buzz_core::channel::ChannelVisibility,
+    pub description: Option<String>,
+}
+
+impl ChannelDraft {
+    /// The draft a form submits: the name trimmed, an empty description
+    /// dropped. An empty name is bad input before anything is signed.
+    pub fn new(
+        name: &str,
+        kind: buzz_core::channel::ChannelType,
+        visibility: buzz_core::channel::ChannelVisibility,
+        description: Option<&str>,
+    ) -> Result<Self, Failure> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Failure::invalid_input("channel name is required"));
+        }
+        let description = description
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
+        Ok(Self {
+            name: name.to_owned(),
+            kind,
+            visibility,
+            description,
+        })
+    }
+}
+
+/// The outcome of a channel creation.
+///
+/// The relay, not the client, establishes that the channel exists: a canonical
+/// answer confirms it, a refused one means nothing was created, and a lost
+/// answer is unconfirmed and must never be retried by itself.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreateOutcome {
+    /// The relay stored the creation event under the client's channel id.
+    Confirmed { channel_id: Uuid },
+    /// The write may have happened: the answer was lost. The channel id is
+    /// the one the request carried, and the caller refreshes instead of
+    /// submitting a duplicate.
+    Unconfirmed {
+        channel_id: Uuid,
+        category: Category,
+        reason: String,
+    },
+    /// Nothing was created: bad input, or the relay refused it.
+    Refused { category: Category, reason: String },
+}
+
+impl CreateOutcome {
+    /// The channel id the request carried, whenever the client chose one. It
+    /// is known before the relay answers, so it is present on a refused
+    /// request too; only a confirmed or unconfirmed write means the channel
+    /// may exist.
+    pub fn channel_id(&self) -> Option<Uuid> {
+        match self {
+            CreateOutcome::Confirmed { channel_id }
+            | CreateOutcome::Unconfirmed { channel_id, .. } => Some(*channel_id),
+            CreateOutcome::Refused { .. } => None,
+        }
+    }
+}
+
 /// What one conversation's catch-up asks for.
 #[derive(Debug, Clone, Copy)]
 pub enum CatchUp {
@@ -945,10 +1019,10 @@ impl Client {
         Ok(resolved)
     }
 
-    /// The current membership and the member profiles a mention preflight
-    /// matches names against. A failed read is an error, never an empty
-    /// directory: an incomplete roster would drop the recipients a draft
-    /// names without saying so.
+    /// The current membership, the member roles and the member profiles a
+    /// mention preflight matches names against. A failed read is an error,
+    /// never an empty directory: an incomplete roster would drop the
+    /// recipients a draft names without saying so.
     pub async fn mention_directory(&self, channel: Uuid) -> Result<mentions::Directory, Failure> {
         let rosters = self
             .transport
@@ -961,6 +1035,10 @@ impl Client {
         let members = rosters
             .first()
             .map(content::member_pubkeys)
+            .unwrap_or_default();
+        let roles = rosters
+            .first()
+            .map(content::member_roles)
             .unwrap_or_default();
         let mut profiles: Vec<(String, String)> = Vec::new();
         for chunk in members.chunks(PROFILE_CHUNK) {
@@ -978,7 +1056,67 @@ impl Client {
                     .map(|event| (event.pubkey.to_hex(), event.content.clone())),
             );
         }
-        Ok(mentions::Directory { members, profiles })
+        Ok(mentions::Directory {
+            members,
+            profiles,
+            roles,
+        })
+    }
+
+    /// The recipients a draft names in one conversation, or why it cannot be
+    /// published. Every surface calls this one preflight: the CLI, the
+    /// composer and the browser have no name rules of their own.
+    pub async fn plan_mentions(
+        &self,
+        channel: Uuid,
+        content: &str,
+        bindings: &[mentions::Binding],
+    ) -> Result<Vec<String>, mentions::Block> {
+        if !mentions::needs_lookup(content) {
+            return Ok(Vec::new());
+        }
+        match self.mention_directory(channel).await {
+            Ok(directory) => mentions::plan(content, &directory, bindings),
+            Err(failure) => Err(mentions::Block::LookupFailed {
+                reason: failure.detail,
+                category: failure.category,
+            }),
+        }
+    }
+
+    /// Create a channel in the active community. The client chooses the id and
+    /// the relay establishes the rest: the canonical event, the creator's
+    /// ownership and the initial membership. A write whose answer was lost is
+    /// unconfirmed, never retried.
+    pub async fn create_channel(&self, draft: &ChannelDraft) -> CreateOutcome {
+        let channel_id = Uuid::new_v4();
+        let builder = match buzz_sdk::builders::build_create_channel(
+            channel_id,
+            &draft.name,
+            Some(draft.visibility),
+            Some(draft.kind),
+            draft.description.as_deref(),
+            None,
+        ) {
+            Ok(builder) => builder,
+            Err(error) => {
+                return CreateOutcome::Refused {
+                    category: Category::InvalidInput,
+                    reason: error.to_string(),
+                };
+            }
+        };
+        match self.submit(builder).await {
+            WriteOutcome::Stored { .. } => CreateOutcome::Confirmed { channel_id },
+            WriteOutcome::Unknown { category, reason } => CreateOutcome::Unconfirmed {
+                channel_id,
+                category,
+                reason,
+            },
+            WriteOutcome::Refused { category, reason } => {
+                CreateOutcome::Refused { category, reason }
+            }
+        }
     }
 
     /// Attach the identity's NIP-OA tag, sign, and submit. Every write the
@@ -1016,15 +1154,14 @@ impl Client {
     }
 
     /// Answer one event: its channel and its thread context, derived from the
-    /// event itself. The CLI's reply has no mention input of its own, so it
-    /// carries no recipients; a TUI reply goes through `send_message` with the
-    /// thread the composer holds.
-    pub async fn reply(&self, target: &Event, content: &str) -> WriteOutcome {
+    /// event itself. `mentions` are the recipients the caller resolved from
+    /// the content, exactly as `send_message` reads them.
+    pub async fn reply(&self, target: &Event, content: &str, mentions: &[String]) -> WriteOutcome {
         let route = match routing(target) {
             Ok(route) => route,
             Err(failure) => return failure.into(),
         };
-        self.send_message(route.channel, content, Some(route.thread), &[])
+        self.send_message(route.channel, content, Some(route.thread), mentions)
             .await
     }
 

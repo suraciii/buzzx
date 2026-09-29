@@ -10,10 +10,11 @@ use clap::Subcommand;
 use nostr::Event;
 use serde_json::{Value, json};
 
-use crate::client::{Client, WriteOutcome, channel_id, event_id};
+use crate::client::{ChannelDraft, Client, CreateOutcome, WriteOutcome, channel_id, event_id};
 use crate::config::{self, CommunityProfile, ConfigFile, Resolved};
 use crate::content;
 use crate::failure::{Category, Failure};
+use crate::mentions;
 
 /// The default `messages get --limit`.
 const DEFAULT_LIMIT: u64 = 20;
@@ -22,6 +23,21 @@ const DEFAULT_LIMIT: u64 = 20;
 pub enum ChannelsCommand {
     /// List the channels the identity can access.
     List,
+    /// Create a channel in the active community.
+    Create {
+        /// Channel name. Required.
+        #[arg(long)]
+        name: Option<String>,
+        /// Channel type: `stream` or `forum`.
+        #[arg(long = "type")]
+        kind: Option<String>,
+        /// Visibility: `open` or `private`.
+        #[arg(long)]
+        visibility: Option<String>,
+        /// Optional description.
+        #[arg(long)]
+        description: Option<String>,
+    },
 }
 
 /// The local community profiles: what a session connects to. `add` and
@@ -110,6 +126,22 @@ pub enum MessagesCommand {
 pub async fn run_channels(resolved: &Resolved, action: ChannelsCommand) -> i32 {
     let client = Client::new(resolved);
     match action {
+        ChannelsCommand::Create {
+            name,
+            kind,
+            visibility,
+            description,
+        } => {
+            create_channel(
+                resolved,
+                &client,
+                name.as_deref(),
+                kind.as_deref(),
+                visibility.as_deref(),
+                description.as_deref(),
+            )
+            .await
+        }
         ChannelsCommand::List => match client.channels().await {
             Ok(roster) => {
                 // The documented shape is one object per channel with the id
@@ -186,11 +218,22 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
                 Ok(content) => content,
                 Err(failure) => return refuse(&failure, Some(&channel.to_string()), None),
             };
+            // The same preflight the composer runs: a visible name resolves to
+            // a signed recipient, or the write does not happen.
+            let recipients = match client.plan_mentions(channel, &content, &[]).await {
+                Ok(recipients) => recipients,
+                Err(block) => {
+                    return block_result(resolved, &block, Some(&channel.to_string()), None);
+                }
+            };
             write_result_with_community(
                 resolved,
-                client.send_message(channel, &content, None, &[]).await,
+                client
+                    .send_message(channel, &content, None, &recipients)
+                    .await,
                 Some(&channel.to_string()),
                 None,
+                &recipients,
             )
         }
         MessagesCommand::Reply { event, content } => {
@@ -222,11 +265,19 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
                     Some(&target_hex),
                 );
             };
+            let channel_hex = channel.to_string();
+            let recipients = match client.plan_mentions(channel, &content, &[]).await {
+                Ok(recipients) => recipients,
+                Err(block) => {
+                    return block_result(resolved, &block, Some(&channel_hex), Some(&target_hex));
+                }
+            };
             write_result_with_community(
                 resolved,
-                client.reply(&resolved_event, &content).await,
-                Some(&channel.to_string()),
+                client.reply(&resolved_event, &content, &recipients).await,
+                Some(&channel_hex),
                 Some(&target_hex),
+                &recipients,
             )
         }
     }
@@ -704,8 +755,12 @@ fn write_result_with_community(
     outcome: WriteOutcome,
     channel: Option<&str>,
     reply_to: Option<&str>,
+    mentions: &[String],
 ) -> i32 {
     let mut value = write_json(&outcome, channel, reply_to);
+    if matches!(outcome, WriteOutcome::Stored { .. }) {
+        value["mention_pubkeys"] = json!(mentions);
+    }
     value["community"] = community_json(resolved);
     print(&value);
     match outcome {
@@ -715,6 +770,162 @@ fn write_result_with_community(
             exit_code(category)
         }
     }
+}
+
+/// One mention preflight refusal, as the contract's object: the write did not
+/// happen, the block names its kind and the correction, and the exit code says
+/// the caller must change the input. It is never a success shape.
+fn block_result(
+    resolved: &Resolved,
+    block: &mentions::Block,
+    channel: Option<&str>,
+    reply_to: Option<&str>,
+) -> i32 {
+    let category = match block {
+        mentions::Block::LookupFailed { category, .. } => *category,
+        _ => Category::InvalidInput,
+    };
+    let mut value = json!({
+        "status": "not_sent",
+        "event_id": Value::Null,
+        "error": category.as_str(),
+        "message": block.summary(),
+        "mention_block": {
+            "kind": block.kind(),
+            "summary": block.summary(),
+            "details": block.details(),
+        },
+    });
+    if let Some(channel) = channel {
+        value["channel_id"] = json!(channel);
+    }
+    if let Some(reply_to) = reply_to {
+        value["reply_to"] = json!(reply_to);
+    }
+    value["community"] = community_json(resolved);
+    print(&value);
+    eprintln!("buzzx: {}", block.summary());
+    exit_code(category)
+}
+
+/// `channels create`: one validated draft, one write, one JSON result.
+///
+/// The client chooses the channel id and the relay establishes the channel;
+/// this command never invents a channel row. An unconfirmed write is reported
+/// as such and is never submitted a second time here.
+async fn create_channel(
+    resolved: &Resolved,
+    client: &Client,
+    name: Option<&str>,
+    kind: Option<&str>,
+    visibility: Option<&str>,
+    description: Option<&str>,
+) -> i32 {
+    let submitted = SubmittedFields {
+        name,
+        kind,
+        visibility,
+        description,
+    };
+    let Some(name) = name else {
+        return create_refused(
+            resolved,
+            &Failure::invalid_input("--name is required"),
+            &submitted,
+        );
+    };
+    let kind = match kind {
+        None | Some("stream") => buzz_core::channel::ChannelType::Stream,
+        Some("forum") => buzz_core::channel::ChannelType::Forum,
+        Some(raw) => {
+            return create_refused(
+                resolved,
+                &Failure::invalid_input(format!(
+                    "unknown channel type: {raw:?}; expected stream or forum"
+                )),
+                &submitted,
+            );
+        }
+    };
+    let visibility = match visibility {
+        None => buzz_core::channel::ChannelVisibility::Open,
+        Some(raw) => match raw.parse() {
+            Ok(visibility) => visibility,
+            Err(reason) => {
+                return create_refused(resolved, &Failure::invalid_input(reason), &submitted);
+            }
+        },
+    };
+    let draft = match ChannelDraft::new(name, kind, visibility, description) {
+        Ok(draft) => draft,
+        Err(failure) => return create_refused(resolved, &failure, &submitted),
+    };
+    let outcome = client.create_channel(&draft).await;
+    let (status, error) = match &outcome {
+        CreateOutcome::Confirmed { .. } => ("created_confirmed", None),
+        CreateOutcome::Unconfirmed {
+            category, reason, ..
+        } => ("created_unconfirmed", Some((*category, reason.clone()))),
+        CreateOutcome::Refused { category, reason } => {
+            ("not_created", Some((*category, reason.clone())))
+        }
+    };
+    let mut value = json!({
+        "community": community_json(resolved),
+        "status": status,
+        "channel_id": outcome.channel_id().map(|id| id.to_string()),
+        "name": draft.name,
+        "type": draft.kind.as_str(),
+        "visibility": draft.visibility.as_str(),
+        "description": draft.description,
+    });
+    if let Some((category, reason)) = error {
+        value["error"] = json!(category.as_str());
+        value["message"] = json!(reason);
+    }
+    print(&value);
+    match outcome {
+        CreateOutcome::Confirmed { .. } => 0,
+        CreateOutcome::Unconfirmed {
+            category, reason, ..
+        } => {
+            eprintln!("buzzx: {reason}");
+            exit_code(category)
+        }
+        CreateOutcome::Refused { category, reason } => {
+            eprintln!("buzzx: {reason}");
+            exit_code(category)
+        }
+    }
+}
+
+/// The fields the caller handed `channels create`, as typed. A refusal echoes
+/// them beside the reason, so the caller sees exactly what was rejected.
+struct SubmittedFields<'a> {
+    name: Option<&'a str>,
+    kind: Option<&'a str>,
+    visibility: Option<&'a str>,
+    description: Option<&'a str>,
+}
+
+/// A creation the command refused before anything was signed: it answers with
+/// the same object a relay refusal does, so a caller reads `status` on every
+/// path.
+fn create_refused(resolved: &Resolved, failure: &Failure, submitted: &SubmittedFields) -> i32 {
+    let value = json!({
+        "community": community_json(resolved),
+        "status": "not_created",
+        "channel_id": Value::Null,
+        "name": submitted.name,
+        "type": submitted.kind,
+        "visibility": submitted.visibility,
+        "description": submitted.description,
+        "error": failure.category.as_str(),
+        "message": failure.detail,
+    });
+    print(&value);
+    eprintln!("buzzx: {}", failure.detail);
+    exit_code(failure.category)
 }
 
 /// The outcome of a write the command refused before the relay saw it.
