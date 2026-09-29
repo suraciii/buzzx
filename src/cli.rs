@@ -23,7 +23,16 @@ const DEFAULT_LIMIT: u64 = 20;
 #[derive(Subcommand)]
 pub enum ChannelsCommand {
     /// List the channels the identity can access.
-    List,
+    List {
+        /// Include channels archived by the relay.
+        #[arg(long)]
+        include_archived: bool,
+    },
+    /// Read one channel's authoritative metadata.
+    Get {
+        #[arg(long)]
+        channel: String,
+    },
     /// Create a channel in the active community.
     Create {
         /// Channel name. Required.
@@ -38,6 +47,54 @@ pub enum ChannelsCommand {
         /// Optional description.
         #[arg(long)]
         description: Option<String>,
+    },
+    Update {
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        visibility: Option<String>,
+    },
+    Archive {
+        #[arg(long)]
+        channel: String,
+    },
+    Unarchive {
+        #[arg(long)]
+        channel: String,
+    },
+    Members {
+        #[arg(long)]
+        channel: String,
+    },
+    AddMember {
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        pubkey: String,
+        #[arg(long)]
+        role: Option<String>,
+    },
+    SetRole {
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        pubkey: String,
+        #[arg(long)]
+        role: String,
+    },
+    RemoveMember {
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        pubkey: String,
+    },
+    Leave {
+        #[arg(long)]
+        channel: String,
     },
 }
 
@@ -137,6 +194,48 @@ pub enum MessagesCommand {
 pub async fn run_channels(resolved: &Resolved, action: ChannelsCommand) -> i32 {
     let client = Client::new(resolved);
     match action {
+        ChannelsCommand::List { include_archived } => match client.channels().await {
+            Ok(roster) => {
+                let list: Vec<Value> = roster
+                    .items
+                    .iter()
+                    .filter(|channel| !channel.hidden && (include_archived || !channel.archived))
+                    .map(|channel| {
+                        json!({
+                            "channel_id": channel.id.to_string(),
+                            "name": channel.name,
+                            "community": community_json(resolved),
+                        })
+                    })
+                    .collect();
+                if !roster.complete {
+                    print(&json!({
+                        "status": "incomplete",
+                        "channels": list,
+                        "error": "timeout_unknown",
+                        "message": "channel metadata is incomplete; refresh before relying on this list",
+                    }));
+                    2
+                } else {
+                    print(&json!(list));
+                    0
+                }
+            }
+            Err(failure) => fail(&failure, None),
+        },
+        ChannelsCommand::Get { channel } => {
+            let id = match channel_id(&channel) {
+                Ok(id) => id,
+                Err(failure) => return fail(&failure, Some(("channel_id", &channel))),
+            };
+            match client.channel(id).await {
+                Ok(info) => {
+                    print(&channel_json(resolved, &info));
+                    0
+                }
+                Err(failure) => fail(&failure, Some(("channel_id", &channel))),
+            }
+        }
         ChannelsCommand::Create {
             name,
             kind,
@@ -153,37 +252,264 @@ pub async fn run_channels(resolved: &Resolved, action: ChannelsCommand) -> i32 {
             )
             .await
         }
-        ChannelsCommand::List => match client.channels().await {
-            Ok(roster) => {
-                // The documented shape is one object per channel with the id
-                // and the name, and stdout carries that one value.
-                let list: Vec<Value> = roster
-                    .items
-                    .iter()
-                    .map(|channel| {
-                        let mut value = json!({
-                            "channel_id": channel.id.to_string(),
-                            "name": channel.name,
-                        });
-                        value["community"] = community_json(resolved);
-                        value
-                    })
-                    .collect();
-                if !roster.complete {
-                    // A list that may be missing rows says so, on stderr,
-                    // where the diagnostics belong.
-                    eprintln!(
-                        "warning: the channel list may be incomplete: a query it \
-                         depends on failed, or a row carried no metadata"
-                    );
+        ChannelsCommand::Update {
+            channel,
+            name,
+            description,
+            visibility,
+        } => {
+            let id = match channel_id(&channel) {
+                Ok(id) => id,
+                Err(failure) => return channel_refuse(resolved, &channel, "update", &failure),
+            };
+            let visibility = match visibility {
+                Some(value) => match value.parse() {
+                    Ok(value) => Some(value),
+                    Err(reason) => {
+                        return channel_refuse(
+                            resolved,
+                            &channel,
+                            "update",
+                            &Failure::invalid_input(reason),
+                        );
+                    }
+                },
+                None => None,
+            };
+            let update = crate::client::ChannelUpdate {
+                name,
+                description,
+                visibility,
+            };
+            channel_write(
+                resolved,
+                &client,
+                id,
+                client.update_channel(id, &update).await,
+                "update",
+            )
+        }
+        ChannelsCommand::Archive { channel } => {
+            archive_write(resolved, &client, &channel, true).await
+        }
+        ChannelsCommand::Unarchive { channel } => {
+            archive_write(resolved, &client, &channel, false).await
+        }
+        ChannelsCommand::Members { channel } => {
+            let id = match channel_id(&channel) {
+                Ok(id) => id,
+                Err(failure) => return fail(&failure, Some(("channel_id", &channel))),
+            };
+            match client.members(id).await {
+                Ok(members) => {
+                    let rows: Vec<Value> = members
+                        .items
+                        .iter()
+                        .map(|member| {
+                            json!({
+                                "pubkey": member.pubkey,
+                                "role": member.role.as_str(),
+                                "name": member.name,
+                            })
+                        })
+                        .collect();
+                    let complete = members.complete;
+                    print(&json!({
+                        "community": community_json(resolved),
+                        "channel_id": id.to_string(),
+                        "members": rows,
+                        "complete": complete,
+                        "status": if complete { "ok" } else { "incomplete" },
+                        "error": if complete { Value::Null } else { json!("timeout_unknown") },
+                    }));
+                    if complete { 0 } else { 2 }
                 }
-                print(&json!(list));
-                0
+                Err(failure) => fail(&failure, Some(("channel_id", &channel))),
             }
-            // The channel list is the identity's own: there is no id to name.
-            Err(failure) => fail(&failure, None),
-        },
+        }
+        ChannelsCommand::AddMember {
+            channel,
+            pubkey,
+            role,
+        } => {
+            member_write(
+                resolved,
+                &client,
+                &channel,
+                &pubkey,
+                role.as_deref().unwrap_or("member"),
+                "add-member",
+            )
+            .await
+        }
+        ChannelsCommand::SetRole {
+            channel,
+            pubkey,
+            role,
+        } => member_write(resolved, &client, &channel, &pubkey, &role, "set-role").await,
+        ChannelsCommand::RemoveMember { channel, pubkey } => {
+            let id = match channel_id(&channel) {
+                Ok(id) => id,
+                Err(failure) => {
+                    return channel_refuse(resolved, &channel, "remove-member", &failure);
+                }
+            };
+            let pubkey = match canonical_pubkey(&pubkey) {
+                Ok(key) => key,
+                Err(failure) => {
+                    return channel_refuse(resolved, &channel, "remove-member", &failure);
+                }
+            };
+            channel_write(
+                resolved,
+                &client,
+                id,
+                client.remove_member(id, &pubkey).await,
+                "remove-member",
+            )
+        }
+        ChannelsCommand::Leave { channel } => {
+            let id = match channel_id(&channel) {
+                Ok(id) => id,
+                Err(failure) => return channel_refuse(resolved, &channel, "leave", &failure),
+            };
+            channel_write(
+                resolved,
+                &client,
+                id,
+                client.leave_channel(id).await,
+                "leave",
+            )
+        }
     }
+}
+
+fn channel_json(resolved: &Resolved, channel: &crate::client::ChannelInfo) -> Value {
+    json!({
+        "community": community_json(resolved),
+        "channel_id": channel.id.to_string(),
+        "name": channel.name,
+        "description": channel.description,
+        "type": channel.channel_type.map(|kind| kind.as_str()).unwrap_or_else(|| match channel.kind {
+            crate::client::ChannelKind::Dm => "dm",
+            crate::client::ChannelKind::Channel => "channel",
+            crate::client::ChannelKind::Unknown => "unknown",
+        }),
+        "visibility": channel.visibility.map(|value| value.as_str()),
+        "archived": channel.archived,
+        "role": channel.my_role.map(|role| role.as_str()),
+    })
+}
+
+fn channel_write(
+    resolved: &Resolved,
+    _client: &Client,
+    channel: uuid::Uuid,
+    outcome: WriteOutcome,
+    action: &str,
+) -> i32 {
+    let (status, event_id, error) = match &outcome {
+        WriteOutcome::Stored { event_id } => ("confirmed", Some(event_id.clone()), None),
+        WriteOutcome::Refused { category, reason } => {
+            ("refused", None, Some((category.as_str(), reason.clone())))
+        }
+        WriteOutcome::Unknown { category, reason } => {
+            ("unknown", None, Some((category.as_str(), reason.clone())))
+        }
+    };
+    let mut value = json!({
+        "community": community_json(resolved),
+        "channel_id": channel.to_string(),
+        "action": action,
+        "status": status,
+        "event_id": event_id,
+        "readback_status": if matches!(&outcome, WriteOutcome::Stored { .. }) {
+            "pending_refresh"
+        } else if matches!(&outcome, WriteOutcome::Unknown { .. }) {
+            "unknown"
+        } else {
+            "not_applicable"
+        },
+        "refresh_hint": matches!(&outcome, WriteOutcome::Unknown { .. }),
+    });
+    if let Some((category, reason)) = error {
+        value["error"] = json!(category);
+        value["message"] = json!(reason);
+    }
+    print(&value);
+    match outcome {
+        WriteOutcome::Stored { .. } => 0,
+        WriteOutcome::Refused { category, reason } | WriteOutcome::Unknown { category, reason } => {
+            eprintln!("buzzx: {reason}");
+            exit_code(category)
+        }
+    }
+}
+
+async fn member_write(
+    resolved: &Resolved,
+    client: &Client,
+    raw_channel: &str,
+    pubkey: &str,
+    raw_role: &str,
+    action: &str,
+) -> i32 {
+    let channel = match channel_id(raw_channel) {
+        Ok(channel) => channel,
+        Err(failure) => return channel_refuse(resolved, raw_channel, action, &failure),
+    };
+    let pubkey = match canonical_pubkey(pubkey) {
+        Ok(key) => key,
+        Err(failure) => return channel_refuse(resolved, raw_channel, action, &failure),
+    };
+    let role = match raw_role.parse::<buzz_core::channel::MemberRole>() {
+        Ok(role) => role,
+        Err(reason) => {
+            return channel_refuse(
+                resolved,
+                raw_channel,
+                action,
+                &Failure::invalid_input(reason),
+            );
+        }
+    };
+    let outcome = if action == "set-role" {
+        client.set_role(channel, &pubkey, role).await
+    } else {
+        client.add_member(channel, &pubkey, role).await
+    };
+    channel_write(resolved, client, channel, outcome, action)
+}
+
+async fn archive_write(
+    resolved: &Resolved,
+    client: &Client,
+    raw_channel: &str,
+    archive: bool,
+) -> i32 {
+    let channel = match channel_id(raw_channel) {
+        Ok(channel) => channel,
+        Err(failure) => {
+            return channel_refuse(
+                resolved,
+                raw_channel,
+                if archive { "archive" } else { "unarchive" },
+                &failure,
+            );
+        }
+    };
+    let outcome = if archive {
+        client.archive_channel(channel).await
+    } else {
+        client.unarchive_channel(channel).await
+    };
+    channel_write(
+        resolved,
+        client,
+        channel,
+        outcome,
+        if archive { "archive" } else { "unarchive" },
+    )
 }
 
 pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
@@ -977,6 +1303,32 @@ fn refusal(failure: &Failure) -> WriteOutcome {
 /// a caller reads `status` on every recognized write.
 fn refuse(failure: &Failure, channel: Option<&str>, reply_to: Option<&str>) -> i32 {
     write_result(refusal(failure), channel, reply_to)
+}
+
+fn channel_refuse(resolved: &Resolved, channel: &str, action: &str, failure: &Failure) -> i32 {
+    print(&json!({
+        "community": community_json(resolved),
+        "channel_id": channel,
+        "action": action,
+        "status": "refused",
+        "event_id": Value::Null,
+        "readback_status": "not_applicable",
+        "refresh_hint": false,
+        "error": failure.category.as_str(),
+        "message": failure.detail,
+    }));
+    eprintln!("buzzx: {}", failure.detail);
+    exit_code(failure.category)
+}
+
+fn canonical_pubkey(raw: &str) -> Result<String, Failure> {
+    let key = raw.trim();
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Failure::invalid_input(
+            "pubkey must be exactly 64 hexadecimal characters",
+        ));
+    }
+    Ok(key.to_ascii_lowercase())
 }
 
 /// The default `--limit`, or the caller's own. Zero and nonsense are bad

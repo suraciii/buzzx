@@ -32,6 +32,8 @@ session and do not change the TUI's interaction model.
 
 - `channels list`
 - `channels create`
+- `channels get`, `update`, `archive`, `unarchive`
+- `channels members`, `add-member`, `set-role`, `remove-member`, `leave`
 - `messages get`
 - `messages thread`
 - `messages send`
@@ -42,12 +44,12 @@ session and do not change the TUI's interaction model.
 
 ### Out of scope
 
-Agent creation or lifecycle management, member administration/invites,
-archival, full-text search, `watch`, a new protocol (MCP/A2A), persistence of
-runs, and a TUI redesign remain outside this contract. Channel creation is the
-small exception specified in
-[mentions-and-channel-creation.md](mentions-and-channel-creation.md#cli-contract);
-membership management remains a separate slice.
+Agent creation or lifecycle management, open-channel discovery/join, destructive
+channel deletion, TTL/topic/purpose, global member search, full-text search,
+`watch`, a new protocol (MCP/A2A), persistence of runs, and a TUI redesign
+remain outside this contract. The channel lifecycle commands are specified in
+[channel-lifecycle.md](channel-lifecycle.md); their write statuses and
+community selectors follow the same JSON contract as the browse flow.
 
 ## User flow
 

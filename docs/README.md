@@ -24,6 +24,9 @@ works with it.
 - [mentions-and-channel-creation.md](mentions-and-channel-creation.md) specifies
   the implementation-ready mention suggestion, signed-recipient and channel
   creation contract for TUI, WebUI and CLI.
+- [channel-lifecycle.md](channel-lifecycle.md) specifies channel metadata,
+  archive/restore, member roles, add/remove/leave flows, permissions and
+  write-outcome handling for TUI, WebUI and CLI.
 - [web.md](web.md) specifies the proposed local browser surface, its TUI
   equivalent controls, interaction flows and acceptance. It is not implemented.
 

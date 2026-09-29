@@ -42,6 +42,15 @@ pub enum Action {
     PickerRetry,
     /// Ask for a fresh channel roster to answer an unresolved creation.
     CreateChannelRefresh,
+    LifecycleRefresh,
+    MemberSelect,
+    MemberAdd,
+    MemberRemove,
+    MemberRole,
+    MemberLeave,
+    MemberRoleNext,
+    MemberRoleSelect(u8),
+    MemberRolePrev,
     /// `f`: the next Inbox filter.
     FilterNext,
     /// `a`: open the Agents overlay, or close it when it is open.
@@ -151,6 +160,10 @@ pub enum Overlay {
     /// The saved-community selector: the profiles the identity may switch to.
     CommunityPicker,
     CreateChannel,
+    EditChannel,
+    Archive,
+    Members,
+    MemberPicker,
     Help,
     Agents,
 }
@@ -210,6 +223,17 @@ pub fn map_navigation(
             // The create form's own refresh: an unresolved creation is settled
             // by the roster answer the user asks for here.
             KeyCode::Char('r') if overlay == Overlay::CreateChannel => Action::CreateChannelRefresh,
+            KeyCode::Char('r')
+                if matches!(
+                    overlay,
+                    Overlay::EditChannel
+                        | Overlay::Archive
+                        | Overlay::Members
+                        | Overlay::MemberPicker
+                ) =>
+            {
+                Action::LifecycleRefresh
+            }
             // The same refresh from the timeline: a form may be closed while
             // its write is still unresolved.
             KeyCode::Char('r') if overlay == Overlay::None && surface == Surface::Channel => {
@@ -246,6 +270,56 @@ pub fn map_navigation(
             KeyCode::BackTab | KeyCode::Up => Action::ComposerCursorUp,
             KeyCode::Left => Action::ComposerCursorLeft,
             KeyCode::Right => Action::ComposerCursorRight,
+            KeyCode::Backspace => Action::ComposerBackspace,
+            KeyCode::Char(c) if key.modifiers.is_empty() => Action::ComposerInput(c),
+            _ => Action::Ignored,
+        };
+    }
+    if overlay == Overlay::EditChannel {
+        return match key.code {
+            KeyCode::Esc => Action::Dismiss,
+            KeyCode::Enter => Action::ComposerSend,
+            KeyCode::Tab | KeyCode::Down => Action::ComposerCursorDown,
+            KeyCode::BackTab | KeyCode::Up => Action::ComposerCursorUp,
+            KeyCode::Left => Action::ComposerCursorLeft,
+            KeyCode::Right => Action::ComposerCursorRight,
+            KeyCode::Backspace => Action::ComposerBackspace,
+            KeyCode::Char(c) if key.modifiers.is_empty() => Action::ComposerInput(c),
+            _ => Action::Ignored,
+        };
+    }
+    if overlay == Overlay::Archive {
+        return match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => Action::MemberSelect,
+            KeyCode::Esc | KeyCode::Char('n') => Action::Dismiss,
+            _ => Action::Ignored,
+        };
+    }
+    if overlay == Overlay::Members {
+        return match key.code {
+            KeyCode::Esc => Action::Dismiss,
+            KeyCode::Up | KeyCode::Char('k') => Action::PickerPrev,
+            KeyCode::Down | KeyCode::Char('j') => Action::PickerNext,
+            KeyCode::Enter => Action::MemberSelect,
+            KeyCode::Char('a') => Action::MemberAdd,
+            KeyCode::Char('d') => Action::MemberRemove,
+            KeyCode::Char('r') => Action::MemberRole,
+            KeyCode::Char('l') => Action::MemberLeave,
+            KeyCode::Char(c @ '1'..='5') => Action::MemberRoleSelect(c as u8 - b'1'),
+            KeyCode::Left | KeyCode::BackTab => Action::MemberRolePrev,
+            KeyCode::Right | KeyCode::Tab => Action::MemberRoleNext,
+            _ => Action::Ignored,
+        };
+    }
+    if overlay == Overlay::MemberPicker {
+        return match key.code {
+            KeyCode::Esc => Action::Dismiss,
+            KeyCode::Up => Action::PickerPrev,
+            KeyCode::Down => Action::PickerNext,
+            KeyCode::Char(' ') => Action::MemberSelect,
+            KeyCode::Enter => Action::MemberAdd,
+            KeyCode::Left | KeyCode::BackTab => Action::MemberRolePrev,
+            KeyCode::Right | KeyCode::Tab => Action::MemberRoleNext,
             KeyCode::Backspace => Action::ComposerBackspace,
             KeyCode::Char(c) if key.modifiers.is_empty() => Action::ComposerInput(c),
             _ => Action::Ignored,

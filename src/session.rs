@@ -3,7 +3,7 @@
 //! into one core call and one `ChatEvent`; the relay operations themselves
 //! live in `client.rs`. The contract is design/shared-core.md.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use nostr::Event;
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +29,32 @@ pub enum HistorySurface {
     Channel,
     Context,
     Thread,
+}
+/// Lifecycle operation named in write responses. The relay is authoritative;
+/// the session never turns a stored event into optimistic local state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelOp {
+    Edit,
+    Archive,
+    Unarchive,
+}
+
+/// A membership mutation. One command is emitted for each target identity so
+/// a batch can stop between targets when its generation changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberOp {
+    Add {
+        pubkey: String,
+        role: buzz_core::channel::MemberRole,
+    },
+    SetRole {
+        pubkey: String,
+        role: buzz_core::channel::MemberRole,
+    },
+    Remove {
+        pubkey: String,
+    },
+    Leave,
 }
 
 /// What the transport side tells the UI. Every mutation the UI renders
@@ -269,6 +295,40 @@ pub enum ChatEvent {
         local: String,
         reason: String,
     },
+    /// Result of one channel metadata/archive operation. The UI refreshes
+    /// authoritative state after a stored result; it never mutates from this.
+    ChannelWriteResult {
+        request: u64,
+        channel: Uuid,
+        op: ChannelOp,
+        outcome: crate::client::WriteOutcome,
+    },
+    /// Authoritative membership readback. Errors remain distinct from an
+    /// empty roster.
+    Members {
+        channel: Uuid,
+        request: u64,
+        result: Result<crate::client::Members, String>,
+    },
+    /// Result of one membership mutation in a sequential batch.
+    MemberWriteResult {
+        request: u64,
+        channel: Uuid,
+        op: MemberOp,
+        outcome: crate::client::WriteOutcome,
+    },
+    /// A queued community switch stopped the unsubmitted targets in a batch.
+    MemberBatchCancelled {
+        request: u64,
+        channel: Uuid,
+        remaining: Vec<String>,
+    },
+    /// Candidate identities for the member picker.
+    MemberCandidates {
+        channel: Uuid,
+        request: u64,
+        result: Result<Vec<crate::mentions::Candidate>, String>,
+    },
 }
 
 /// What the UI asks the session to do.
@@ -351,6 +411,56 @@ pub enum SessionCommand {
     /// Create a channel in the active community.
     CreateChannel {
         draft: crate::client::ChannelDraft,
+        request: u64,
+    },
+    /// Update channel name, description and visibility (9002).
+    EditChannel {
+        channel: Uuid,
+        name: String,
+        description: String,
+        visibility: buzz_core::channel::ChannelVisibility,
+        request: u64,
+    },
+    /// Archive or restore a channel (9002).
+    SetArchived {
+        channel: Uuid,
+        archived: bool,
+        request: u64,
+    },
+    /// Refresh authoritative membership.
+    LoadMembers {
+        channel: Uuid,
+        request: u64,
+    },
+    /// Search visible profiles, independently of the channel's member roster.
+    MemberCandidates {
+        channel: Uuid,
+        query: String,
+        request: u64,
+    },
+    /// Add several identities, one relay write per identity.
+    AddMembers {
+        channel: Uuid,
+        pubkeys: Vec<String>,
+        role: buzz_core::channel::MemberRole,
+        request: u64,
+    },
+    /// Change a member role (9000).
+    SetMemberRole {
+        channel: Uuid,
+        pubkey: String,
+        role: buzz_core::channel::MemberRole,
+        request: u64,
+    },
+    /// Remove a member (9001).
+    RemoveMember {
+        channel: Uuid,
+        pubkey: String,
+        request: u64,
+    },
+    /// Leave a channel (9022).
+    LeaveChannel {
+        channel: Uuid,
         request: u64,
     },
     Edit {
@@ -467,6 +577,13 @@ fn thread_ref(thread: &Option<(String, String)>) -> Result<Option<buzz_sdk::Thre
     }))
 }
 
+struct MemberBatch {
+    channel: Uuid,
+    remaining: VecDeque<String>,
+    role: buzz_core::channel::MemberRole,
+    request: u64,
+}
+
 async fn run_command_pump(
     mut client: Client,
     mut active_community: Option<String>,
@@ -478,19 +595,64 @@ async fn run_command_pump(
     let mut generation = 0u64;
     let mut pending_read: Option<HashMap<String, u64>> = None;
     let mut due: Option<tokio::time::Instant> = None;
+    let mut queued = VecDeque::new();
+    let mut member_batch: Option<MemberBatch> = None;
     loop {
-        let command = match due {
-            Some(at) => tokio::select! {
-                command = commands.recv() => command,
-                _ = tokio::time::sleep_until(at) => {
-                    due = None;
-                    if let Some(contexts) = pending_read.take() {
-                        publish_read(&client, &contexts, &events).await;
-                    }
-                    continue;
+        if let Some(batch) = member_batch.as_mut() {
+            while let Ok(command) = commands.try_recv() {
+                queued.push_back(command);
+            }
+            if queued.iter().any(|command| {
+                matches!(
+                    command,
+                    SessionCommand::SwitchCommunity(_) | SessionCommand::Shutdown
+                )
+            }) {
+                let batch = member_batch.take().expect("active batch");
+                let _ = events
+                    .send(ChatEvent::MemberBatchCancelled {
+                        request: batch.request,
+                        channel: batch.channel,
+                        remaining: batch.remaining.into(),
+                    })
+                    .await;
+            } else if let Some(pubkey) = batch.remaining.pop_front() {
+                let outcome = client.add_member(batch.channel, &pubkey, batch.role).await;
+                let _ = events
+                    .send(ChatEvent::MemberWriteResult {
+                        request: batch.request,
+                        channel: batch.channel,
+                        op: MemberOp::Add {
+                            pubkey,
+                            role: batch.role,
+                        },
+                        outcome,
+                    })
+                    .await;
+                if batch.remaining.is_empty() {
+                    member_batch = None;
                 }
-            },
-            None => commands.recv().await,
+                continue;
+            } else {
+                member_batch = None;
+            }
+        }
+        let command = if let Some(command) = queued.pop_front() {
+            Some(command)
+        } else {
+            match due {
+                Some(at) => tokio::select! {
+                    command = commands.recv() => command,
+                    _ = tokio::time::sleep_until(at) => {
+                        due = None;
+                        if let Some(contexts) = pending_read.take() {
+                            publish_read(&client, &contexts, &events).await;
+                        }
+                        continue;
+                    }
+                },
+                None => commands.recv().await,
+            }
         };
         let Some(command) = command else {
             // The command channel closing is the other way a session ends, and
@@ -681,6 +843,140 @@ async fn run_command_pump(
                     .send(ChatEvent::ChannelCreated {
                         request,
                         draft,
+                        outcome,
+                    })
+                    .await;
+            }
+            SessionCommand::EditChannel {
+                channel,
+                name,
+                description,
+                visibility,
+                request,
+            } => {
+                let update = crate::client::ChannelUpdate {
+                    name: Some(name),
+                    description: Some(description),
+                    visibility: Some(visibility),
+                };
+                let outcome = client.update_channel(channel, &update).await;
+                let _ = events
+                    .send(ChatEvent::ChannelWriteResult {
+                        request,
+                        channel,
+                        op: ChannelOp::Edit,
+                        outcome,
+                    })
+                    .await;
+            }
+            SessionCommand::SetArchived {
+                channel,
+                archived,
+                request,
+            } => {
+                let outcome = if archived {
+                    client.archive_channel(channel).await
+                } else {
+                    client.unarchive_channel(channel).await
+                };
+                let _ = events
+                    .send(ChatEvent::ChannelWriteResult {
+                        request,
+                        channel,
+                        op: if archived {
+                            ChannelOp::Archive
+                        } else {
+                            ChannelOp::Unarchive
+                        },
+                        outcome,
+                    })
+                    .await;
+            }
+            SessionCommand::LoadMembers { channel, request } => {
+                let result = client.members(channel).await.map_err(|error| error.detail);
+                let _ = events
+                    .send(ChatEvent::Members {
+                        channel,
+                        request,
+                        result,
+                    })
+                    .await;
+            }
+            SessionCommand::MemberCandidates {
+                channel,
+                query,
+                request,
+            } => {
+                let result = client
+                    .search_profiles(&query)
+                    .await
+                    .map_err(|error| error.detail);
+                let _ = events
+                    .send(ChatEvent::MemberCandidates {
+                        channel,
+                        request,
+                        result,
+                    })
+                    .await;
+            }
+            SessionCommand::AddMembers {
+                channel,
+                pubkeys,
+                role,
+                request,
+            } => {
+                member_batch = Some(MemberBatch {
+                    channel,
+                    remaining: pubkeys.into(),
+                    role,
+                    request,
+                });
+            }
+            SessionCommand::SetMemberRole {
+                channel,
+                pubkey,
+                role,
+                request,
+            } => {
+                let op = MemberOp::SetRole {
+                    pubkey: pubkey.clone(),
+                    role,
+                };
+                let outcome = client.set_role(channel, &pubkey, role).await;
+                let _ = events
+                    .send(ChatEvent::MemberWriteResult {
+                        request,
+                        channel,
+                        op,
+                        outcome,
+                    })
+                    .await;
+            }
+            SessionCommand::RemoveMember {
+                channel,
+                pubkey,
+                request,
+            } => {
+                let op = MemberOp::Remove {
+                    pubkey: pubkey.clone(),
+                };
+                let outcome = client.remove_member(channel, &pubkey).await;
+                let _ = events
+                    .send(ChatEvent::MemberWriteResult {
+                        request,
+                        channel,
+                        op,
+                        outcome,
+                    })
+                    .await;
+            }
+            SessionCommand::LeaveChannel { channel, request } => {
+                let outcome = client.leave_channel(channel).await;
+                let _ = events
+                    .send(ChatEvent::MemberWriteResult {
+                        request,
+                        channel,
+                        op: MemberOp::Leave,
                         outcome,
                     })
                     .await;

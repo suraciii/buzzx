@@ -60,6 +60,7 @@ Web entries define the required browser equivalent.
 | [New messages and replies](tui-use.md#keys) | Composer, explicit target | Composer and Reply button |
 | [Mention suggestions and verified recipients](mentions-and-channel-creation.md#shared-mention-contract) | `@` picker; Enter inserts, send signs recipients | `@` popover; Enter inserts, send signs recipients |
 | [Create a channel](mentions-and-channel-creation.md#channel-creation) | `Ctrl+P` → Create channel | `+ Create channel` in Inbox/sidebar or menu |
+| [Channel lifecycle and membership](channel-lifecycle.md) | `Ctrl+P` → Edit/archive/restore/manage members/leave | Channel header/sidebar or action sheet; Archived filter |
 | [Reaction, own edit and own delete](tui-use.md#keys) | `r`, `e`, `d` | Reaction chip and message action menu |
 | [Read progress and unknown coverage](../design/shared-core.md#inbox-and-read-state) | Presented latest ordinary timeline | Same frontier; visible, focused browser view |
 | [Incoming typing](tui-use.md#typing-indicators) | Channel line/list signal | Channel line/list signal |
@@ -124,7 +125,7 @@ shortcut or pane arrangement is not a different capability.
 ## Reference features outside this release
 
 Dedicated forum authoring/navigation, media upload/download or inline playback,
-DM creation, member administration, persisted drafts, thread-follow management,
+DM creation, destructive channel deletion, global member search, persisted drafts, thread-follow management,
 per-message/thread unread controls, Agent configuration/control, workflows,
 projects and huddles are not introduced here. Existing forum rows and
 attachment labels remain readable as before.

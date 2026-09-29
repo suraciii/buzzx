@@ -224,7 +224,9 @@ the submitted fields:
 
 The client uses the existing relay/channel creation contract. The relay, not a
 local optimistic cache, establishes channel id, creator ownership and initial
-membership. Member invites, join/leave, TTL and archive are separate P1 work.
+membership. Archive/restore and membership management are defined in
+[channel-lifecycle.md](channel-lifecycle.md). Discovery/join, destructive
+delete, TTL and member-directory expansion remain separate P1 work there.
 
 ## Shared implementation boundary
 
