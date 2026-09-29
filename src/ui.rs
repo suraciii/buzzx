@@ -11,8 +11,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::agents;
 use crate::app::{
-    AgentStatus, App, Command, ConnState, Context, CreateChannelForm, CreateState, Filter, Marker,
-    Mode, ReaderOrigin, Sections,
+    AgentStatus, App, Command, ConnState, Context, CreateChannelForm, CreateState, EditField,
+    Filter, Marker, MemberConfirm, Mode, ReaderOrigin, Sections, WriteStatus,
 };
 use crate::content::{Row, short_pubkey};
 use crate::layout::{self, LayoutMode};
@@ -434,6 +434,12 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     }
     if mode != LayoutMode::TooSmall && app.create_channel.is_some() {
         draw_create_channel(frame, app, area);
+    } else if mode != LayoutMode::TooSmall && app.edit_channel.is_some() {
+        draw_edit_channel(frame, app, area);
+    } else if mode != LayoutMode::TooSmall && app.archive.is_some() {
+        draw_archive(frame, app, area);
+    } else if mode != LayoutMode::TooSmall && app.members.is_some() {
+        draw_members(frame, app, area);
     } else if mode != LayoutMode::TooSmall
         && app.mode == Mode::Composer
         && app.mention_picker.is_some()
@@ -1168,11 +1174,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
         // people in it are the name.
         Some(entry) => {
             let label = app.label(entry);
+            let status = if entry.archived { " · Archived" } else { "" };
             match (entry.is_dm(), loading) {
                 (true, false) => label,
                 (true, true) => format!("{label} loading"),
-                (false, false) => format!("#{label}"),
-                (false, true) => format!("#{label} loading"),
+                (false, false) => format!("#{label}{status}"),
+                (false, true) => format!("#{label} loading{status}"),
             }
         }
         None => "no conversation".to_owned(),
@@ -1798,6 +1805,207 @@ fn draw_create_channel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_edit_channel(frame: &mut Frame, app: &App, area: Rect) {
+    let form = app.edit_channel.as_ref().expect("edit form");
+    let fields = [
+        EditField::Name,
+        EditField::Description,
+        EditField::Visibility,
+    ];
+    let mut lines: Vec<Line> = fields
+        .iter()
+        .map(|field| {
+            let value = match field {
+                EditField::Name => form.name.as_str(),
+                EditField::Description => form.description.as_str(),
+                EditField::Visibility => form.visibility.as_str(),
+            };
+            Line::raw(format!(
+                "{}{}: {}",
+                if *field == form.field { "> " } else { "  " },
+                crate::app::EditChannelForm::label(*field),
+                value
+            ))
+        })
+        .collect();
+    lines.push(Line::raw(format!("State: {:?}", form.state)));
+    if let Some(w) = &app.edit_unsettled {
+        lines.push(Line::raw(format!("Write unresolved: {:?}", w.state)));
+    }
+    lines.push(Line::raw(
+        "Tab field · Space choice · Enter save · Ctrl+R refresh · Esc close",
+    ));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Edit channel"))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_archive(frame: &mut Frame, app: &App, area: Rect) {
+    let form = app.archive.as_ref().expect("archive confirmation");
+    let verb = if form.unarchive { "Restore" } else { "Archive" };
+    let lines = vec![
+        Line::raw(format!(
+            "{verb} #{} in {}?",
+            form.channel_name, app.community_name
+        )),
+        Line::raw("Existing content and drafts remain."),
+        Line::raw(format!("State: {:?}", form.state)),
+        Line::raw("Enter confirm · Ctrl+R refresh · Esc cancel"),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Channel archive"),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_members(frame: &mut Frame, app: &App, area: Rect) {
+    let panel = app.members.as_ref().expect("members panel");
+    let title = format!("#{} members", panel.channel_name);
+    let mut lines = Vec::new();
+    if let Some(confirm) = &panel.confirm {
+        lines.push(Line::raw(match confirm {
+            MemberConfirm::Remove { label, pubkey } => format!("Remove {label} ({pubkey})?"),
+            MemberConfirm::ChangeRole {
+                label,
+                pubkey,
+                role,
+            } => {
+                format!("Change {label} ({pubkey}) to {}?", role.as_str())
+            }
+            MemberConfirm::Leave {
+                last_owner_warning: true,
+            } => "Last owner cannot leave; appoint another owner".to_owned(),
+            MemberConfirm::Leave { .. } => "Leave channel?".to_owned(),
+        }));
+        lines.push(Line::raw("Enter confirm · Esc cancel"));
+    } else if panel.picker.open {
+        lines.push(Line::raw(format!("Search: {}", panel.picker.query)));
+        lines.push(Line::raw(format!(
+            "Role: {}{}",
+            panel.picker.role.as_str(),
+            if panel.picker.role_chosen {
+                ""
+            } else {
+                " (select explicitly)"
+            }
+        )));
+        if panel.picker.loading {
+            lines.push(Line::raw("Searching..."));
+        }
+        if let Some(reason) = &panel.picker.failed {
+            lines.push(Line::raw(format!("Search failed: {reason}")));
+        }
+        let rows = area.height.saturating_sub(2) as usize;
+        let available = rows.saturating_sub(
+            3 + usize::from(panel.picker.loading) + usize::from(panel.picker.failed.is_some()),
+        );
+        let start = panel
+            .picker
+            .cursor
+            .saturating_sub(available.saturating_sub(1));
+        for (index, candidate) in panel
+            .picker
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(available)
+        {
+            lines.push(Line::raw(format!(
+                "{}{} {} {}",
+                if index == panel.picker.cursor {
+                    ">"
+                } else {
+                    " "
+                },
+                if panel.picker.selected.contains(&candidate.pubkey) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                },
+                candidate.label,
+                short_pubkey(&candidate.pubkey)
+            )));
+        }
+        if panel.picker.candidates.is_empty() && !panel.picker.selected.is_empty() {
+            lines.push(Line::raw(format!(
+                "{} selected",
+                panel.picker.selected.len()
+            )));
+        }
+        lines.push(Line::raw(
+            "Arrows choose · Space select · Tab role · Enter add · Esc",
+        ));
+    } else {
+        if panel.loading {
+            lines.push(Line::raw("Loading members..."));
+        }
+        if let Some(reason) = &panel.failed {
+            lines.push(Line::raw(format!("Load failed: {reason}")));
+        }
+        if !panel.complete {
+            lines.push(Line::raw(
+                "Membership incomplete: last-owner checks unavailable",
+            ));
+        }
+        let reserved_results = panel.picker.results.len().min(2);
+        let available = (area.height as usize).saturating_sub(
+            3 + usize::from(panel.loading)
+                + usize::from(panel.failed.is_some())
+                + usize::from(!panel.complete)
+                + reserved_results,
+        );
+        let start = panel.cursor.saturating_sub(available.saturating_sub(1));
+        for (index, row) in panel.members.iter().enumerate().skip(start).take(available) {
+            let role = row.role.map(|r| r.as_str()).unwrap_or("unknown");
+            lines.push(Line::raw(format!(
+                "{} {} ({role}) {}",
+                if index == panel.cursor { ">" } else { " " },
+                row.label,
+                short_pubkey(&row.pubkey)
+            )));
+        }
+        lines.push(Line::raw(
+            "a add · 1-5 role · d remove · l leave · Ctrl+R refresh · Esc",
+        ));
+    }
+    let result_slots = (area.height as usize).saturating_sub(lines.len() + 2);
+    if result_slots > 0 {
+        let skipped = panel.picker.results.len().saturating_sub(result_slots);
+        for result in panel.picker.results.iter().skip(skipped) {
+            let status = match result.status {
+                WriteStatus::Confirmed => "stored",
+                WriteStatus::Refused => "refused",
+                WriteStatus::Unknown => "unknown",
+                WriteStatus::CancelledGeneration => "cancelled",
+            };
+            lines.push(Line::raw(format!(
+                "{}: {status} {}",
+                short_pubkey(&result.pubkey),
+                result.error.as_deref().unwrap_or("")
+            )));
+        }
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -3104,6 +3312,31 @@ mod tests {
         assert!(text.contains("relay:"), "{text}");
     }
 
+    #[test]
+    fn lifecycle_overlays_render_on_supported_terminal_sizes() {
+        let mut app = chat_app(Vec::new());
+        let id = app.channels[0].id;
+        app.channels[0].my_role = Some(crate::app::MemberRole::Owner);
+        app.channels[0].visibility = Some(buzz_core::channel::ChannelVisibility::Open);
+        app.open_edit_channel();
+        for (width, height) in [(24, 6), (40, 10), (79, 12), (80, 12)] {
+            let frame = frame_text(&app, width, height);
+            assert!(frame.contains("Edit channel"), "{width}x{height}: {frame}");
+        }
+        app.close_edit_channel();
+        app.open_archive(id);
+        for (width, height) in [(24, 6), (40, 10), (79, 12), (80, 12)] {
+            let frame = frame_text(&app, width, height);
+            assert!(frame.contains("Archive"), "{width}x{height}: {frame}");
+        }
+        app.close_archive();
+        app.open_members(id);
+        for (width, height) in [(24, 6), (40, 10), (79, 12), (80, 12)] {
+            let frame = frame_text(&app, width, height);
+            assert!(frame.contains("members"), "{width}x{height}: {frame}");
+        }
+    }
+
     fn frame_text(app: &App, width: u16, height: u16) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -3131,7 +3364,11 @@ mod tests {
                 items: vec![crate::client::ChannelInfo {
                     id,
                     name: "general".to_owned(),
+                    description: None,
+                    visibility: None,
+                    my_role: None,
                     kind: crate::client::ChannelKind::Channel,
+                    channel_type: Some(buzz_core::channel::ChannelType::Stream),
                     participants: Vec::new(),
                     archived: false,
                     hidden: false,
@@ -3244,7 +3481,11 @@ mod tests {
                 items: vec![crate::client::ChannelInfo {
                     id: app.channels[0].id,
                     name: "DM".to_owned(),
+                    description: None,
+                    visibility: None,
+                    my_role: None,
                     kind: crate::client::ChannelKind::Dm,
+                    channel_type: Some(buzz_core::channel::ChannelType::Dm),
                     participants: vec!["p".to_owned()],
                     archived: false,
                     hidden: false,

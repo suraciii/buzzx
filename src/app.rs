@@ -8,12 +8,16 @@ use nostr::Keys;
 use uuid::Uuid;
 
 use crate::agents;
+use crate::client::WriteOutcome;
 use crate::client::{CatchUp, ChannelInfo, ChannelKind, HistoryDirection, Roster};
 use crate::config;
 use crate::content::{self, Row};
 use crate::keys::{self, Action, PAGE_ROWS};
 use crate::mentions;
+use crate::session::{ChannelOp, MemberOp};
 use crate::session::{ChatEvent, HistorySurface, SessionCommand};
+use buzz_core::channel::ChannelVisibility;
+pub use buzz_core::channel::MemberRole;
 
 /// One answered history page, grouped the way the view that asked reads it.
 struct HistoryPageRead {
@@ -220,7 +224,13 @@ impl Composer {
 #[derive(Debug, Clone)]
 pub struct ChannelEntry {
     pub id: Uuid,
+    /// Metadata supplied by the relay. Archived rows remain in the projection
+    /// so the explicit Archived picker can inspect and restore them.
     pub name: String,
+    pub description: Option<String>,
+    pub visibility: Option<buzz_core::channel::ChannelVisibility>,
+    pub my_role: Option<buzz_core::channel::MemberRole>,
+    pub archived: bool,
     /// What the relay says this row is. It chooses the section the list shows
     /// it under.
     pub kind: ChannelKind,
@@ -228,7 +238,7 @@ pub struct ChannelEntry {
     /// name of its own is shown under.
     pub participants: Vec<String>,
     pub rows: Vec<Row>,
-    pub seen: HashSet<String>,
+    seen: HashSet<String>,
     /// Whether an adjacent history boundary has been proven exhausted.
     older_complete: bool,
     newer_complete: bool,
@@ -317,27 +327,30 @@ impl ReadTrack {
     }
 }
 
-/// The Inbox filter. All, Unread and For you are views of one list, not
-/// separate stores.
+/// The Inbox and channel-picker filters. Archived is explicit so archived
+/// history is never mixed into the normal Inbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Filter {
-    /// Every eligible conversation.
     All,
-    /// Conversations with known unread messages.
     Unread,
-    /// Channels with unread direct mentions, and DMs with unread messages.
     ForYou,
+    Archived,
 }
 
 impl Filter {
-    /// The filter cycle `f` and Tab walk.
-    pub const CYCLE: [Filter; 3] = [Filter::All, Filter::Unread, Filter::ForYou];
+    pub const CYCLE: [Filter; 4] = [
+        Filter::All,
+        Filter::Unread,
+        Filter::ForYou,
+        Filter::Archived,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Filter::All => "All",
             Filter::Unread => "Unread",
             Filter::ForYou => "For you",
+            Filter::Archived => "Archived",
         }
     }
 
@@ -356,6 +369,11 @@ pub enum Command {
     SearchMessages,
     MyAgents,
     CreateChannel,
+    EditChannel,
+    ArchiveChannel,
+    UnarchiveChannel,
+    ArchivedChannels,
+    ManageMembers,
     About,
     Help,
     Quit,
@@ -363,11 +381,16 @@ pub enum Command {
 
 impl Command {
     /// The list, in the order the palette shows it.
-    pub const ALL: [Command; 7] = [
+    pub const ALL: [Command; 12] = [
         Command::SwitchConversation,
         Command::SearchMessages,
         Command::MyAgents,
         Command::CreateChannel,
+        Command::EditChannel,
+        Command::ArchiveChannel,
+        Command::UnarchiveChannel,
+        Command::ArchivedChannels,
+        Command::ManageMembers,
         Command::About,
         Command::Help,
         Command::Quit,
@@ -378,6 +401,11 @@ impl Command {
             Command::SearchMessages => "Search messages",
             Command::MyAgents => "My agents",
             Command::CreateChannel => "Create channel",
+            Command::EditChannel => "Edit channel",
+            Command::ArchiveChannel => "Archive channel",
+            Command::UnarchiveChannel => "Unarchive channel",
+            Command::ArchivedChannels => "Archived channels",
+            Command::ManageMembers => "Manage members",
             Command::About => "About",
             Command::Help => "Help",
             Command::Quit => "Quit",
@@ -391,6 +419,11 @@ impl Command {
             Command::SearchMessages => "/",
             Command::MyAgents => "a",
             Command::CreateChannel => "—",
+            Command::EditChannel
+            | Command::ArchiveChannel
+            | Command::UnarchiveChannel
+            | Command::ArchivedChannels
+            | Command::ManageMembers => "",
             Command::About => "—",
             Command::Help => "?",
             Command::Quit => "q",
@@ -504,17 +537,17 @@ impl ChannelEntry {
 }
 
 impl Filter {
-    /// Whether one conversation belongs in this view. An unknown conversation
-    /// is never counted as unread: the view says it is unknown instead.
+    /// Whether one conversation belongs in this view. Archived channels are
+    /// deliberately excluded from normal attention filters.
     pub(crate) fn matches(self, entry: &ChannelEntry) -> bool {
         match self {
-            Filter::All => true,
-            Filter::Unread => entry.read.has_unread(),
-            // A channel qualifies on an unread direct mention only: an ordinary
-            // channel message is not personal attention. A DM qualifies on any
-            // unread message, and leaves the view once it has been read - the
-            // view answers "what needs reading", not "what is a DM".
-            Filter::ForYou => (entry.is_dm() && entry.read.has_unread()) || entry.read.mentioned(),
+            Filter::All => !entry.archived,
+            Filter::Unread => !entry.archived && entry.read.has_unread(),
+            Filter::ForYou => {
+                !entry.archived
+                    && ((entry.is_dm() && entry.read.has_unread()) || entry.read.mentioned())
+            }
+            Filter::Archived => entry.archived,
         }
     }
 }
@@ -724,6 +757,168 @@ impl CreateChannelForm {
         !self.name.trim().is_empty()
             && matches!(self.state, CreateState::Editing | CreateState::Failed(_))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditField {
+    Name,
+    Description,
+    Visibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditChannelForm {
+    pub channel: Uuid,
+    pub name: String,
+    pub description: String,
+    pub visibility: ChannelVisibility,
+    pub state: CreateState,
+    pub field: EditField,
+}
+impl EditChannelForm {
+    pub fn ready(&self) -> bool {
+        !self.name.trim().is_empty()
+            && matches!(self.state, CreateState::Editing | CreateState::Failed(_))
+    }
+    pub fn label(field: EditField) -> &'static str {
+        match field {
+            EditField::Name => "Name",
+            EditField::Description => "Description",
+            EditField::Visibility => "Visibility",
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsettledEdit {
+    pub request: u64,
+    pub channel: Uuid,
+    pub name: String,
+    pub description: String,
+    pub visibility: ChannelVisibility,
+    pub state: CreateState,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveConfirm {
+    pub channel: Uuid,
+    pub channel_name: String,
+    pub unarchive: bool,
+    pub state: CreateState,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsettledArchive {
+    pub request: u64,
+    pub channel: Uuid,
+    pub channel_name: String,
+    pub unarchive: bool,
+    pub state: CreateState,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteStatus {
+    Confirmed,
+    Refused,
+    Unknown,
+    CancelledGeneration,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberRow {
+    pub pubkey: String,
+    pub label: String,
+    pub role: Option<MemberRole>,
+    pub agent: bool,
+    pub is_self: bool,
+    pub last_owner: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberCandidate {
+    pub pubkey: String,
+    pub label: String,
+    pub agent: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberOutcome {
+    pub pubkey: String,
+    pub status: WriteStatus,
+    pub error: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberConfirm {
+    Remove {
+        pubkey: String,
+        label: String,
+    },
+    ChangeRole {
+        pubkey: String,
+        label: String,
+        role: MemberRole,
+    },
+    Leave {
+        last_owner_warning: bool,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberPicker {
+    pub open: bool,
+    pub query: String,
+    pub loading: bool,
+    pub failed: Option<String>,
+    pub candidates: Vec<MemberCandidate>,
+    pub selected: Vec<String>,
+    pub role: MemberRole,
+    pub writing: bool,
+    pub results: Vec<MemberOutcome>,
+    pub cursor: usize,
+    pub role_chosen: bool,
+}
+impl Default for MemberPicker {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            loading: false,
+            failed: None,
+            candidates: Vec::new(),
+            selected: Vec::new(),
+            role: MemberRole::Member,
+            writing: false,
+            results: Vec::new(),
+            cursor: 0,
+            role_chosen: false,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembersPanel {
+    pub channel: Uuid,
+    pub channel_name: String,
+    pub loading: bool,
+    pub failed: Option<String>,
+    pub members: Vec<MemberRow>,
+    pub my_role: Option<MemberRole>,
+    pub picker: MemberPicker,
+    pub confirm: Option<MemberConfirm>,
+    pub generation: u64,
+    pub cursor: usize,
+    pub complete: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelDetails {
+    pub name: String,
+    pub description: String,
+    pub visibility: Option<ChannelVisibility>,
+    pub kind: ChannelKind,
+    pub archived: bool,
+    pub my_role: Option<MemberRole>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsettledMember {
+    pub request: u64,
+    pub channel: Uuid,
+    pub action: String,
+    pub targets: Vec<String>,
+    pub expected: Vec<(String, Option<MemberRole>)>,
+    pub results: Vec<MemberOutcome>,
+    pub read_after: u64,
+    pub generation: u64,
 }
 
 /// What a local pending id stands for, so a write result can be undone or
@@ -1280,6 +1475,18 @@ pub struct App {
     /// The token the next create write takes. It only climbs, so an answer
     /// that arrives late can never be read as the answer to a newer write.
     create_request: u64,
+    pub edit_channel: Option<EditChannelForm>,
+    pub edit_unsettled: Option<UnsettledEdit>,
+    pub archive: Option<ArchiveConfirm>,
+    pub archive_unsettled: Option<UnsettledArchive>,
+    pub members: Option<MembersPanel>,
+    pub member_unsettled: Option<UnsettledMember>,
+    lifecycle_request: u64,
+    member_read_request: u64,
+    member_search_request: u64,
+    edit_refresh_pending: bool,
+    archive_refresh_pending: bool,
+
     /// Conversations waiting for a marker answer before their catch-up can be
     /// asked for.
     catch_up_pending: Vec<Uuid>,
@@ -1376,6 +1583,17 @@ impl App {
             create_refresh_pending: false,
             create_unsettled: None,
             create_request: 0,
+            edit_channel: None,
+            edit_unsettled: None,
+            archive: None,
+            archive_unsettled: None,
+            members: None,
+            member_unsettled: None,
+            lifecycle_request: 0,
+            member_read_request: 0,
+            member_search_request: 0,
+            edit_refresh_pending: false,
+            archive_refresh_pending: false,
             catch_up_pending: Vec::new(),
             conn: ConnState::Connecting,
             status: "connecting".to_owned(),
@@ -1465,6 +1683,14 @@ impl App {
         view.create_channel = None;
         view.create_unsettled = None;
         view.create_refresh_pending = false;
+        view.edit_channel = None;
+        view.edit_unsettled = None;
+        view.archive = None;
+        view.archive_unsettled = None;
+        view.members = None;
+        view.member_unsettled = None;
+        view.edit_refresh_pending = false;
+        view.archive_refresh_pending = false;
         view.pending_open = None;
         view.search = SearchView::default();
         view.context = ContextView::default();
@@ -1496,7 +1722,7 @@ impl App {
     /// settled yet. The browser uses this only to keep its local draft
     /// read-only; write classification remains owned by the session.
     pub fn web_write_pending(&self) -> bool {
-        !self.pending.is_empty() || self.create_write_pending()
+        self.pending_write_summary().is_some()
     }
 
     /// Whether a channel creation is in flight or unresolved. An unresolved
@@ -1824,9 +2050,8 @@ impl App {
         self.outbox.push(SessionCommand::LoadChannels);
     }
 
-    /// Answer an unresolved creation with the roster the user asked for. The
-    /// name is either in the refreshed list or it is not; either way the write
-    /// stops being open, and nothing is created a second time.
+    /// A refresh can confirm an uncertain creation by its canonical id. An
+    /// absent row is not proof of rejection: relay readback can lag acceptance.
     fn resolve_create_refresh(&mut self) {
         if !std::mem::take(&mut self.create_refresh_pending) {
             return;
@@ -1838,8 +2063,6 @@ impl App {
             self.note("creation has no channel id to confirm; refresh the roster again");
             return;
         };
-        // A partial roster cannot prove that the channel is absent. Keep the
-        // operation unknown so a refresh never licenses a duplicate submit.
         if !self.roster_complete {
             self.note("channel roster is incomplete; creation remains unknown");
             return;
@@ -1858,21 +2081,9 @@ impl App {
             ));
             self.open_confirmed_channel();
         } else {
-            // The complete roster is the relay's own answer to the refresh
-            // the reader asked for, and it does not carry the channel: the
-            // write did not land. The record closes so the session can move
-            // on — an unsubmittable form that also wed the reader to this
-            // community would leave no way out — and the next creation is
-            // still the reader's explicit submit, never an automatic retry.
-            self.create_unsettled = None;
-            let name = open.draft.name.clone();
-            if let Some(form) = self.create_channel.as_mut() {
-                form.state = CreateState::Failed(
-                    "the relay's channel list does not carry this creation".to_owned(),
-                );
-            }
             self.note(format!(
-                "#{name} is not in the relay's list; the creation did not land — submit again"
+                "#{} is not yet in the relay's list; creation remains unknown; refresh again before deciding whether to retry",
+                open.draft.name
             ));
         }
     }
@@ -2007,6 +2218,878 @@ impl App {
             }
         }
     }
+    fn resolve_lifecycle_refresh(&mut self) {
+        if !self.roster_complete {
+            return;
+        }
+        if std::mem::take(&mut self.edit_refresh_pending)
+            && let Some(w) = self.edit_unsettled.take()
+        {
+            let confirmed = self.channels.iter().any(|c| {
+                c.id == w.channel
+                    && c.name == w.name
+                    && c.description.as_deref().unwrap_or_default() == w.description
+                    && c.visibility == Some(w.visibility)
+            });
+            if confirmed {
+                self.edit_channel = None;
+                self.note("channel metadata confirmed by relay");
+            } else {
+                if let Some(form) = self.edit_channel.as_mut() {
+                    form.state = CreateState::Unknown(
+                        "relay metadata has not confirmed this edit".to_owned(),
+                    );
+                }
+                self.edit_unsettled = Some(w);
+                self.note("channel edit still unresolved; refresh again before another write");
+            }
+        }
+        if std::mem::take(&mut self.archive_refresh_pending)
+            && let Some(w) = self.archive_unsettled.take()
+        {
+            let confirmed = self
+                .channels
+                .iter()
+                .any(|c| c.id == w.channel && c.archived == !w.unarchive);
+            if confirmed {
+                self.archive = None;
+                let next = if self.selected_entry().is_some_and(|c| c.id == w.channel)
+                    && !self.view().all().any(|id| id == w.channel)
+                {
+                    self.view().all().next().and_then(|id| self.index_of(id))
+                } else {
+                    None
+                };
+                if let Some(index) = next {
+                    self.switch_channel(index);
+                }
+                self.note(format!(
+                    "channel #{} state confirmed by relay",
+                    w.channel_name
+                ));
+            } else {
+                if let Some(form) = self.archive.as_mut() {
+                    form.state = CreateState::Unknown(
+                        "relay has not confirmed this archive state".to_owned(),
+                    );
+                }
+                self.archive_unsettled = Some(w);
+                self.note("archive still unresolved; refresh again before another write");
+            }
+        }
+    }
+    fn apply_channel_write(
+        &mut self,
+        request: u64,
+        channel: Uuid,
+        op: ChannelOp,
+        outcome: WriteOutcome,
+    ) {
+        let (state, note, stored) = match outcome {
+            WriteOutcome::Stored { .. } => (
+                CreateState::Creating,
+                "Saved; waiting for channel refresh".to_owned(),
+                true,
+            ),
+            WriteOutcome::Refused { reason, .. } => (
+                CreateState::Failed(reason.clone()),
+                format!("channel write refused: {reason}"),
+                false,
+            ),
+            WriteOutcome::Unknown { reason, .. } => (
+                CreateState::Unknown(reason.clone()),
+                format!("channel write unknown; Ctrl+R refresh: {reason}"),
+                false,
+            ),
+        };
+        match op {
+            ChannelOp::Edit => {
+                if self
+                    .edit_unsettled
+                    .as_ref()
+                    .is_none_or(|w| w.request != request || w.channel != channel)
+                {
+                    return;
+                }
+                if let Some(form) = self.edit_channel.as_mut() {
+                    form.state = state.clone();
+                }
+                if stored {
+                    if let Some(w) = self.edit_unsettled.as_mut() {
+                        w.state = CreateState::Editing;
+                    }
+                    self.edit_refresh_pending = true;
+                } else if matches!(state, CreateState::Failed(_)) {
+                    self.edit_unsettled = None;
+                } else if let Some(w) = self.edit_unsettled.as_mut() {
+                    w.state = state;
+                }
+            }
+            ChannelOp::Archive | ChannelOp::Unarchive => {
+                if self
+                    .archive_unsettled
+                    .as_ref()
+                    .is_none_or(|w| w.request != request || w.channel != channel)
+                {
+                    return;
+                }
+                if let Some(form) = self.archive.as_mut() {
+                    form.state = state.clone();
+                }
+                if stored {
+                    if let Some(w) = self.archive_unsettled.as_mut() {
+                        w.state = CreateState::Editing;
+                    }
+                    self.archive_refresh_pending = true;
+                } else if matches!(state, CreateState::Failed(_)) {
+                    self.archive_unsettled = None;
+                } else if let Some(w) = self.archive_unsettled.as_mut() {
+                    w.state = state;
+                }
+            }
+        }
+        if stored {
+            self.outbox.push(SessionCommand::LoadChannels);
+        }
+        self.note(note);
+    }
+    fn apply_members_read(
+        &mut self,
+        channel: Uuid,
+        request: u64,
+        result: Result<crate::client::Members, String>,
+    ) {
+        if request != self.member_read_request {
+            return;
+        }
+        let Some(panel) = self
+            .members
+            .as_mut()
+            .filter(|p| p.channel == channel && p.generation == self.transport_generation)
+        else {
+            return;
+        };
+        panel.loading = false;
+        match result {
+            Err(reason) => {
+                panel.failed = Some(reason);
+                panel.complete = false;
+            }
+            Ok(members) => {
+                let owners = members
+                    .items
+                    .iter()
+                    .filter(|m| m.role == MemberRole::Owner)
+                    .count();
+                panel.complete = members.complete;
+                panel.failed = None;
+                panel.members = members
+                    .items
+                    .into_iter()
+                    .map(|member| {
+                        let is_self = member.pubkey == self.me;
+                        MemberRow {
+                            label: member.name.unwrap_or_else(|| {
+                                format!("{}...", &member.pubkey[..8.min(member.pubkey.len())])
+                            }),
+                            agent: member.role == MemberRole::Bot,
+                            last_owner: member.role == MemberRole::Owner
+                                && (!members.complete || owners == 1),
+                            role: Some(member.role),
+                            is_self,
+                            pubkey: member.pubkey,
+                        }
+                    })
+                    .collect();
+                panel.cursor = panel.cursor.min(panel.members.len().saturating_sub(1));
+                let resolved = self.member_unsettled.as_ref().is_some_and(|write| {
+                    write.channel == channel
+                        && write.generation == self.transport_generation
+                        && request > write.read_after
+                        && write.results.len() == write.targets.len()
+                        && write
+                            .results
+                            .iter()
+                            .any(|result| result.status == WriteStatus::Unknown)
+                        && write
+                            .results
+                            .iter()
+                            .filter(|result| result.status == WriteStatus::Unknown)
+                            .all(|result| {
+                                write.expected.iter().any(|(key, role)| {
+                                    key == &result.pubkey
+                                        && panel
+                                            .members
+                                            .iter()
+                                            .find(|member| member.pubkey == *key)
+                                            .and_then(|member| member.role)
+                                            == *role
+                                })
+                            })
+                });
+                if panel.complete && resolved {
+                    self.member_unsettled = None;
+                    self.note("member write uncertainty resolved by fresh membership read");
+                }
+            }
+        }
+    }
+    fn apply_member_write(
+        &mut self,
+        request: u64,
+        channel: Uuid,
+        op: MemberOp,
+        outcome: WriteOutcome,
+    ) {
+        let Some(w) = self.member_unsettled.as_mut().filter(|w| {
+            w.request == request
+                && w.channel == channel
+                && w.generation == self.transport_generation
+        }) else {
+            return;
+        };
+        let left = matches!(op, MemberOp::Leave) && matches!(outcome, WriteOutcome::Stored { .. });
+        let key = match op {
+            MemberOp::Add { pubkey, .. }
+            | MemberOp::SetRole { pubkey, .. }
+            | MemberOp::Remove { pubkey } => pubkey,
+            MemberOp::Leave => self.me.clone(),
+        };
+        if !w.targets.contains(&key) || w.results.iter().any(|r| r.pubkey == key) {
+            return;
+        }
+        let (status, error) = match outcome {
+            WriteOutcome::Stored { .. } => (WriteStatus::Confirmed, None),
+            WriteOutcome::Refused { reason, .. } => (WriteStatus::Refused, Some(reason)),
+            WriteOutcome::Unknown { reason, .. } => (WriteStatus::Unknown, Some(reason)),
+        };
+        w.results.push(MemberOutcome {
+            pubkey: key,
+            status,
+            error,
+        });
+        if w.results.len() == w.targets.len() {
+            self.finish_member_write();
+            self.refresh_members();
+            if left {
+                self.outbox.push(SessionCommand::LoadChannels);
+            }
+        }
+    }
+    fn finish_member_write(&mut self) {
+        let Some(w) = self.member_unsettled.take() else {
+            return;
+        };
+        let unknown = w.results.iter().any(|r| r.status == WriteStatus::Unknown);
+        if let Some(panel) = self.members.as_mut().filter(|p| p.channel == w.channel) {
+            panel.picker.writing = false;
+            panel.picker.results = w.results.clone();
+        }
+        if unknown {
+            let mut w = w;
+            w.read_after = self.member_read_request;
+            self.member_unsettled = Some(w);
+            self.note("member write unknown; refresh members before another write");
+        } else {
+            self.note("member write settled; refreshing membership");
+        }
+    }
+    fn apply_member_cancelled(&mut self, request: u64, channel: Uuid, remaining: Vec<String>) {
+        let Some(w) = self
+            .member_unsettled
+            .as_mut()
+            .filter(|w| w.request == request && w.channel == channel)
+        else {
+            return;
+        };
+        for pubkey in remaining {
+            if !w.results.iter().any(|r| r.pubkey == pubkey) {
+                w.results.push(MemberOutcome {
+                    pubkey,
+                    status: WriteStatus::CancelledGeneration,
+                    error: None,
+                });
+            }
+        }
+        self.finish_member_write();
+        self.refresh_members();
+    }
+
+    fn next_lifecycle_request(&mut self) -> u64 {
+        self.lifecycle_request = self.lifecycle_request.wrapping_add(1);
+        self.lifecycle_request
+    }
+    fn administrative(&self, channel: Uuid) -> bool {
+        self.channels.iter().any(|c| {
+            c.id == channel
+                && !c.archived
+                && matches!(c.my_role, Some(MemberRole::Owner | MemberRole::Admin))
+        })
+    }
+    fn channel_write_locked(&self, channel: Uuid) -> bool {
+        self.edit_unsettled
+            .as_ref()
+            .is_some_and(|w| w.channel == channel)
+            || self
+                .archive_unsettled
+                .as_ref()
+                .is_some_and(|w| w.channel == channel)
+            || self
+                .member_unsettled
+                .as_ref()
+                .is_some_and(|w| w.channel == channel)
+    }
+    pub fn pending_write_summary(&self) -> Option<String> {
+        if let Some(w) = &self.create_unsettled {
+            return Some(format!("creation of #{}", w.draft.name));
+        }
+        if let Some(w) = &self.edit_unsettled {
+            return Some(format!("edit of #{}", w.name));
+        }
+        if let Some(w) = &self.archive_unsettled {
+            return Some(format!(
+                "{} of #{}",
+                if w.unarchive { "restore" } else { "archive" },
+                w.channel_name
+            ));
+        }
+        if let Some(w) = &self.member_unsettled {
+            return Some(format!("{} in {}", w.action, w.channel));
+        }
+        if !self.pending.is_empty() {
+            return Some("message publication".to_owned());
+        }
+        None
+    }
+    pub fn channel_details(&self) -> Option<ChannelDetails> {
+        self.selected_entry().map(|c| ChannelDetails {
+            name: c.name.clone(),
+            description: c.description.clone().unwrap_or_default(),
+            visibility: c.visibility,
+            kind: c.kind,
+            archived: c.archived,
+            my_role: c.my_role,
+        })
+    }
+    pub fn composer_blocked(&self) -> Option<String> {
+        let c = self.selected_entry()?;
+        if c.archived {
+            Some("Archived channel: restore it before sending; your draft is saved".to_owned())
+        } else if c.my_role == Some(MemberRole::Guest) {
+            Some("Guests cannot send to this channel".to_owned())
+        } else {
+            None
+        }
+    }
+    pub fn open_edit_channel(&mut self) {
+        let Some(c) = self.selected_entry() else {
+            return;
+        };
+        if !self.administrative(c.id)
+            && self
+                .edit_unsettled
+                .as_ref()
+                .is_none_or(|w| w.channel != c.id)
+        {
+            self.note("only an owner or admin may edit an active channel");
+            return;
+        }
+        if c.visibility.is_none() {
+            self.note("channel visibility is unknown; refresh metadata before editing");
+            return;
+        }
+        let unsettled = self.edit_unsettled.as_ref().filter(|w| w.channel == c.id);
+        let state = unsettled.map_or(CreateState::Editing, |w| w.state.clone());
+        self.edit_channel = Some(EditChannelForm {
+            channel: c.id,
+            name: unsettled.map_or_else(|| c.name.clone(), |w| w.name.clone()),
+            description: unsettled.map_or_else(
+                || c.description.clone().unwrap_or_default(),
+                |w| w.description.clone(),
+            ),
+            visibility: unsettled.map_or(c.visibility.unwrap_or(ChannelVisibility::Open), |w| {
+                w.visibility
+            }),
+            state,
+            field: EditField::Name,
+        });
+    }
+    pub fn close_edit_channel(&mut self) -> bool {
+        self.edit_channel = None;
+        if self.edit_unsettled.is_some() {
+            self.note("channel edit unresolved; Ctrl+R refreshes its metadata");
+        }
+        true
+    }
+    pub fn edit_channel_submit(&mut self) {
+        let Some(form) = self.edit_channel.clone() else {
+            return;
+        };
+        if !form.ready()
+            || self.channel_write_locked(form.channel)
+            || !self.administrative(form.channel)
+        {
+            self.note("channel edit unavailable until the current write settles");
+            return;
+        }
+        let request = self.next_lifecycle_request();
+        self.edit_unsettled = Some(UnsettledEdit {
+            request,
+            channel: form.channel,
+            name: form.name.trim().to_owned(),
+            description: form.description.clone(),
+            visibility: form.visibility,
+            state: CreateState::Creating,
+        });
+        if let Some(form) = self.edit_channel.as_mut() {
+            form.state = CreateState::Creating;
+        }
+        self.outbox.push(SessionCommand::EditChannel {
+            channel: form.channel,
+            name: form.name.trim().to_owned(),
+            description: form.description,
+            visibility: form.visibility,
+            request,
+        });
+    }
+    pub fn refresh_edit_channel(&mut self) {
+        if self.edit_unsettled.is_some() {
+            self.edit_refresh_pending = true;
+            self.outbox.push(SessionCommand::LoadChannels);
+        }
+    }
+    pub fn open_archive(&mut self, channel: Uuid) {
+        self.open_archive_intent(channel, false);
+    }
+    pub fn open_unarchive(&mut self, channel: Uuid) {
+        self.open_archive_intent(channel, true);
+    }
+    fn open_archive_intent(&mut self, channel: Uuid, unarchive: bool) {
+        let Some(c) = self.channels.iter().find(|c| c.id == channel) else {
+            self.note("channel unavailable");
+            return;
+        };
+        if c.kind != ChannelKind::Channel
+            || c.archived != unarchive
+            || !matches!(c.my_role, Some(MemberRole::Owner | MemberRole::Admin))
+            || (self.channel_write_locked(channel)
+                && self
+                    .archive_unsettled
+                    .as_ref()
+                    .is_none_or(|w| w.channel != channel))
+        {
+            self.note("channel archive action unavailable or write unresolved");
+            return;
+        }
+        self.archive = Some(ArchiveConfirm {
+            channel,
+            channel_name: c.name.clone(),
+            unarchive,
+            state: self
+                .archive_unsettled
+                .as_ref()
+                .filter(|w| w.channel == channel)
+                .map_or(CreateState::Editing, |w| w.state.clone()),
+        });
+    }
+    pub fn close_archive(&mut self) {
+        self.archive = None;
+        if self.archive_unsettled.is_some() {
+            self.note("archive unresolved; Ctrl+R refreshes channel metadata");
+        }
+    }
+    pub fn confirm_archive(&mut self) {
+        let Some(confirm) = self.archive.clone() else {
+            return;
+        };
+        if !matches!(confirm.state, CreateState::Editing | CreateState::Failed(_))
+            || self.channel_write_locked(confirm.channel)
+            || !self.channels.iter().any(|c| {
+                c.id == confirm.channel
+                    && c.kind == ChannelKind::Channel
+                    && c.archived == confirm.unarchive
+                    && matches!(c.my_role, Some(MemberRole::Owner | MemberRole::Admin))
+            })
+        {
+            return;
+        }
+        let request = self.next_lifecycle_request();
+        self.archive_unsettled = Some(UnsettledArchive {
+            request,
+            channel: confirm.channel,
+            channel_name: confirm.channel_name,
+            unarchive: confirm.unarchive,
+            state: CreateState::Creating,
+        });
+        if let Some(c) = self.archive.as_mut() {
+            c.state = CreateState::Creating;
+        }
+        self.outbox.push(SessionCommand::SetArchived {
+            channel: confirm.channel,
+            archived: !confirm.unarchive,
+            request,
+        });
+    }
+    pub fn refresh_archive(&mut self) {
+        if self.archive_unsettled.is_some() {
+            self.archive_refresh_pending = true;
+            self.outbox.push(SessionCommand::LoadChannels);
+        }
+    }
+    pub fn open_members(&mut self, channel: Uuid) {
+        let Some(c) = self
+            .channels
+            .iter()
+            .find(|c| c.id == channel && c.kind == ChannelKind::Channel)
+        else {
+            self.note("channel unavailable");
+            return;
+        };
+        self.members = Some(MembersPanel {
+            channel,
+            channel_name: c.name.clone(),
+            loading: false,
+            failed: None,
+            members: Vec::new(),
+            my_role: c.my_role,
+            picker: MemberPicker::default(),
+            confirm: None,
+            generation: self.transport_generation,
+            cursor: 0,
+            complete: false,
+        });
+        self.refresh_members();
+    }
+    pub fn close_members(&mut self) {
+        self.members = None;
+    }
+    pub fn refresh_members(&mut self) {
+        let Some(panel) = self.members.as_mut() else {
+            return;
+        };
+        self.member_read_request = self.member_read_request.wrapping_add(1);
+        panel.loading = true;
+        panel.failed = None;
+        self.outbox.push(SessionCommand::LoadMembers {
+            channel: panel.channel,
+            request: self.member_read_request,
+        });
+    }
+    pub fn members_picker_open(&mut self) {
+        let Some(channel) = self.members.as_ref().map(|p| p.channel) else {
+            return;
+        };
+        if !self.administrative(channel) || self.channel_write_locked(channel) {
+            self.note("member administration unavailable");
+            return;
+        }
+        if let Some(panel) = self.members.as_mut() {
+            panel.picker.open = true;
+        }
+    }
+    pub fn members_picker_close(&mut self) {
+        if let Some(panel) = self.members.as_mut() {
+            panel.picker.open = false;
+        }
+    }
+    pub fn members_picker_query(&mut self, query: &str) {
+        let Some(panel) = self.members.as_mut() else {
+            return;
+        };
+        self.member_search_request = self.member_search_request.wrapping_add(1);
+        panel.picker.query = query.to_owned();
+        panel.picker.loading = !query.trim().is_empty();
+        panel.picker.failed = None;
+        panel.picker.candidates.clear();
+        panel.picker.cursor = 0;
+        if panel.picker.loading {
+            self.outbox.push(SessionCommand::MemberCandidates {
+                channel: panel.channel,
+                query: query.to_owned(),
+                request: self.member_search_request,
+            });
+        }
+        if query.len() == 64 && query.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let key = query.to_ascii_lowercase();
+            if !panel.members.iter().any(|m| m.pubkey == key) {
+                panel.picker.candidates.push(MemberCandidate {
+                    pubkey: key.clone(),
+                    label: format!("{}...", &key[..8]),
+                    agent: false,
+                });
+            }
+        }
+    }
+    pub fn members_picker_toggle(&mut self, pubkey: &str) {
+        let Some(panel) = self.members.as_mut() else {
+            return;
+        };
+        let key = pubkey.to_ascii_lowercase();
+        if !panel.picker.candidates.iter().any(|c| c.pubkey == key)
+            || panel.members.iter().any(|m| m.pubkey == key)
+        {
+            return;
+        }
+        if let Some(index) = panel.picker.selected.iter().position(|k| k == &key) {
+            panel.picker.selected.remove(index);
+        } else {
+            panel.picker.selected.push(key);
+        }
+    }
+    pub fn members_picker_exact(&mut self, pubkey: &str) -> Result<(), String> {
+        let key = pubkey.trim().to_ascii_lowercase();
+        if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("enter an exact 64-character hex public key".to_owned());
+        }
+        let Some(panel) = self.members.as_mut() else {
+            return Err("open member management first".to_owned());
+        };
+        if panel.members.iter().any(|m| m.pubkey == key) {
+            return Err("already a channel member".to_owned());
+        }
+        if !panel.picker.selected.contains(&key) {
+            panel.picker.selected.push(key);
+        }
+        Ok(())
+    }
+    pub fn members_picker_role(&mut self, role: MemberRole) {
+        if let Some(panel) = self.members.as_mut() {
+            panel.picker.role = role;
+            panel.picker.role_chosen = true;
+        }
+    }
+    pub fn members_picker_submit(&mut self) {
+        let Some(panel) = self.members.as_ref() else {
+            return;
+        };
+        if !self.administrative(panel.channel)
+            || self.channel_write_locked(panel.channel)
+            || !panel.picker.role_chosen
+            || panel.picker.selected.is_empty()
+        {
+            self.note("select identities and an explicit role before adding");
+            return;
+        }
+        let channel = panel.channel;
+        let role = panel.picker.role;
+        let targets = panel.picker.selected.clone();
+        let request = self.next_lifecycle_request();
+        self.member_unsettled = Some(UnsettledMember {
+            request,
+            channel,
+            action: "add members".to_owned(),
+            expected: targets
+                .iter()
+                .map(|key| (key.clone(), Some(role)))
+                .collect(),
+            targets: targets.clone(),
+            results: Vec::new(),
+            read_after: self.member_read_request,
+            generation: self.transport_generation,
+        });
+        if let Some(panel) = self.members.as_mut() {
+            panel.picker.writing = true;
+            panel.picker.selected.clear();
+            panel.picker.results.clear();
+        }
+        self.outbox.push(SessionCommand::AddMembers {
+            channel,
+            pubkeys: targets,
+            role,
+            request,
+        });
+    }
+    pub fn members_role_open(&mut self, pubkey: &str, role: MemberRole) {
+        let Some(panel) = self.members.as_ref() else {
+            return;
+        };
+        if !self.administrative(panel.channel) || self.channel_write_locked(panel.channel) {
+            self.note("member administration unavailable");
+            return;
+        }
+        let Some(row) = panel.members.iter().find(|m| m.pubkey == pubkey) else {
+            return;
+        };
+        if !panel.complete && row.role == Some(MemberRole::Owner) && row.role != Some(role) {
+            self.note("refresh complete membership before demoting an owner");
+            return;
+        }
+        if row.last_owner && row.role != Some(role) {
+            self.note("the last owner cannot be demoted");
+            return;
+        }
+        let confirm = MemberConfirm::ChangeRole {
+            pubkey: row.pubkey.clone(),
+            label: row.label.clone(),
+            role,
+        };
+        if let Some(panel) = self.members.as_mut() {
+            panel.confirm = Some(confirm);
+        }
+    }
+    pub fn members_remove_open(&mut self, pubkey: &str) {
+        let Some(panel) = self.members.as_ref() else {
+            return;
+        };
+        if !self.administrative(panel.channel) || self.channel_write_locked(panel.channel) {
+            self.note("member administration unavailable");
+            return;
+        }
+        let Some(row) = panel.members.iter().find(|m| m.pubkey == pubkey) else {
+            return;
+        };
+        if row.is_self || row.last_owner {
+            self.note("use Leave channel; the last owner cannot be removed");
+            return;
+        }
+        let confirm = MemberConfirm::Remove {
+            pubkey: row.pubkey.clone(),
+            label: row.label.clone(),
+        };
+        if let Some(panel) = self.members.as_mut() {
+            panel.confirm = Some(confirm);
+        }
+    }
+    pub fn members_leave_open(&mut self) {
+        let Some(panel) = self.members.as_ref() else {
+            return;
+        };
+        if self.channel_write_locked(panel.channel)
+            || !self
+                .channels
+                .iter()
+                .any(|c| c.id == panel.channel && !c.archived && c.my_role.is_some())
+        {
+            return;
+        }
+        let warning = self
+            .channels
+            .iter()
+            .find(|c| c.id == panel.channel)
+            .and_then(|c| c.my_role)
+            == Some(MemberRole::Owner)
+            && (!panel.complete
+                || panel
+                    .members
+                    .iter()
+                    .any(|row| row.is_self && row.last_owner));
+        if let Some(panel) = self.members.as_mut() {
+            panel.confirm = Some(MemberConfirm::Leave {
+                last_owner_warning: warning,
+            });
+        }
+    }
+    pub fn members_confirm_cancel(&mut self) {
+        if let Some(panel) = self.members.as_mut() {
+            panel.confirm = None;
+        }
+    }
+    pub fn members_confirm(&mut self) {
+        let Some(panel) = self.members.as_ref() else {
+            return;
+        };
+        let Some(confirm) = panel.confirm.clone() else {
+            return;
+        };
+        let current_role = self
+            .channels
+            .iter()
+            .find(|c| c.id == panel.channel && !c.archived)
+            .and_then(|c| c.my_role);
+        let leaving = matches!(confirm, MemberConfirm::Leave { .. });
+        if self.channel_write_locked(panel.channel)
+            || (leaving && current_role == Some(MemberRole::Owner) && !panel.complete)
+            || !panel.complete && !leaving
+            || (leaving && current_role.is_none())
+            || (!leaving && !matches!(current_role, Some(MemberRole::Owner | MemberRole::Admin)))
+        {
+            self.note("refresh membership and permissions before confirming");
+            return;
+        }
+        match &confirm {
+            MemberConfirm::Remove { pubkey, .. }
+                if panel
+                    .members
+                    .iter()
+                    .find(|row| &row.pubkey == pubkey)
+                    .is_none_or(|row| row.is_self || row.last_owner) =>
+            {
+                self.note("the last owner cannot be removed");
+                return;
+            }
+            MemberConfirm::ChangeRole { pubkey, role, .. }
+                if panel
+                    .members
+                    .iter()
+                    .find(|row| &row.pubkey == pubkey)
+                    .is_none_or(|row| row.last_owner && row.role != Some(*role)) =>
+            {
+                self.note("the last owner cannot be demoted");
+                return;
+            }
+            MemberConfirm::Leave { .. }
+                if current_role == Some(MemberRole::Owner)
+                    && panel
+                        .members
+                        .iter()
+                        .any(|row| row.is_self && row.last_owner) =>
+            {
+                self.note("the last owner cannot leave; appoint another owner first");
+                return;
+            }
+            _ => {}
+        }
+        let channel = panel.channel;
+        let (action, target, expected) = match &confirm {
+            MemberConfirm::Remove { pubkey, .. } => ("remove member", pubkey.clone(), None),
+            MemberConfirm::ChangeRole { pubkey, role, .. } => {
+                ("change role", pubkey.clone(), Some(*role))
+            }
+            MemberConfirm::Leave {
+                last_owner_warning: true,
+            } => {
+                self.note("the last owner cannot leave; appoint another owner first");
+                return;
+            }
+            MemberConfirm::Leave { .. } => ("leave channel", self.me.clone(), None),
+        };
+        let request = self.next_lifecycle_request();
+        self.member_unsettled = Some(UnsettledMember {
+            request,
+            channel,
+            action: action.to_owned(),
+            targets: vec![target.clone()],
+            expected: vec![(target.clone(), expected)],
+            results: Vec::new(),
+            read_after: self.member_read_request,
+            generation: self.transport_generation,
+        });
+        if let Some(panel) = self.members.as_mut() {
+            panel.confirm = None;
+            panel.picker.writing = true;
+            panel.picker.results.clear();
+        }
+        match confirm {
+            MemberConfirm::Remove { pubkey, .. } => {
+                self.outbox.push(SessionCommand::RemoveMember {
+                    channel,
+                    pubkey,
+                    request,
+                })
+            }
+            MemberConfirm::ChangeRole { pubkey, role, .. } => {
+                self.outbox.push(SessionCommand::SetMemberRole {
+                    channel,
+                    pubkey,
+                    role,
+                    request,
+                })
+            }
+            MemberConfirm::Leave { .. } => self
+                .outbox
+                .push(SessionCommand::LeaveChannel { channel, request }),
+        }
+    }
 
     /// Open a confirmed channel once the roster knows it. The roster is the
     /// only source of a channel row, so a confirmation that arrives first
@@ -2040,6 +3123,14 @@ impl App {
             keys::Overlay::Help
         } else if self.create_channel.is_some() {
             keys::Overlay::CreateChannel
+        } else if self.edit_channel.is_some() {
+            keys::Overlay::EditChannel
+        } else if self.archive.is_some() {
+            keys::Overlay::Archive
+        } else if self.members.as_ref().is_some_and(|p| p.picker.open) {
+            keys::Overlay::MemberPicker
+        } else if self.members.is_some() {
+            keys::Overlay::Members
         } else if self.community_picker.is_some() {
             keys::Overlay::CommunityPicker
         } else if self.palette.is_some() {
@@ -2449,6 +3540,18 @@ impl App {
                 self.conn = ConnState::Connecting;
                 self.status = format!("switching to {name}");
                 self.agents = AgentView::default();
+                self.create_channel = None;
+                self.create_unsettled = None;
+                self.create_refresh_pending = false;
+                self.filter = Filter::All;
+                self.edit_channel = None;
+                self.edit_unsettled = None;
+                self.archive = None;
+                self.archive_unsettled = None;
+                self.members = None;
+                self.member_unsettled = None;
+                self.edit_refresh_pending = false;
+                self.archive_refresh_pending = false;
                 self.outbox.clear();
             }
             ChatEvent::Connected => {
@@ -2547,6 +3650,7 @@ impl App {
                 // An unresolved creation checks itself against the same
                 // answer, when this is the refresh the user asked for.
                 self.resolve_create_refresh();
+                self.resolve_lifecycle_refresh();
             }
             ChatEvent::ReadState { contexts, complete } => {
                 self.apply_read_state(&contexts, complete);
@@ -2726,6 +3830,14 @@ impl App {
             }
             ChatEvent::Overlay(event) => self.apply_overlay(event),
             ChatEvent::ChannelGone { channel, reason } => {
+                if self
+                    .members
+                    .as_ref()
+                    .is_some_and(|panel| panel.channel == channel)
+                {
+                    self.members = None;
+                    self.member_unsettled = None;
+                }
                 let inspection_revoked = self.search_origin_channel() == Some(channel)
                     || (self.context.open && self.context.channel == channel);
                 let preserve_inspection_draft =
@@ -2848,6 +3960,68 @@ impl App {
                 draft,
                 outcome,
             } => self.apply_channel_created(request, draft, outcome),
+            ChatEvent::ChannelWriteResult {
+                request,
+                channel,
+                op,
+                outcome,
+            } => self.apply_channel_write(request, channel, op, outcome),
+            ChatEvent::Members {
+                channel,
+                request,
+                result,
+            } => self.apply_members_read(channel, request, result),
+            ChatEvent::MemberWriteResult {
+                request,
+                channel,
+                op,
+                outcome,
+            } => self.apply_member_write(request, channel, op, outcome),
+            ChatEvent::MemberBatchCancelled {
+                request,
+                channel,
+                remaining,
+            } => self.apply_member_cancelled(request, channel, remaining),
+            ChatEvent::MemberCandidates {
+                channel,
+                request,
+                result,
+            } => {
+                if request == self.member_search_request
+                    && let Some(panel) = self.members.as_mut().filter(|p| {
+                        p.channel == channel && p.generation == self.transport_generation
+                    })
+                {
+                    panel.picker.loading = false;
+                    match result {
+                        Ok(items) => {
+                            panel.picker.failed = None;
+                            panel.picker.candidates = items
+                                .into_iter()
+                                .map(|c| MemberCandidate {
+                                    pubkey: c.pubkey,
+                                    label: c.label,
+                                    agent: c.agent,
+                                })
+                                .collect();
+                        }
+                        Err(reason) => panel.picker.failed = Some(reason),
+                    }
+                    let query = panel.picker.query.trim();
+                    if query.len() == 64 && query.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        let key = query.to_ascii_lowercase();
+                        if !panel.members.iter().any(|m| m.pubkey == key)
+                            && !panel.picker.candidates.iter().any(|c| c.pubkey == key)
+                        {
+                            panel.picker.candidates.push(MemberCandidate {
+                                label: format!("{}...", &key[..8]),
+                                pubkey: key,
+                                agent: false,
+                            });
+                        }
+                    }
+                }
+            }
             ChatEvent::WriteOk { local, event_id } => self.complete_write(local, event_id),
             ChatEvent::WriteFailed { local, reason } => self.fail_write(local, reason),
             ChatEvent::WriteUncertain { local, reason } => self.uncertain_write(local, reason),
@@ -3247,7 +4421,7 @@ impl App {
         let listed: Vec<ChannelInfo> = roster
             .items
             .into_iter()
-            .filter(|item| item.listed())
+            .filter(|item| !item.hidden)
             .collect();
         let mut previous: HashMap<Uuid, ChannelEntry> = std::mem::take(&mut self.channels)
             .into_iter()
@@ -3283,6 +4457,10 @@ impl App {
                     merged.push(ChannelEntry {
                         id: item.id,
                         name: item.name.clone(),
+                        description: item.description.clone(),
+                        visibility: item.visibility,
+                        my_role: item.my_role,
+                        archived: item.archived,
                         kind: item.kind,
                         participants: item.participants.clone(),
                         rows: Vec::new(),
@@ -3301,6 +4479,10 @@ impl App {
                     continue;
                 };
                 entry.name = item.name.clone();
+                entry.description = item.description.clone();
+                entry.visibility = item.visibility;
+                entry.my_role = item.my_role;
+                entry.archived = item.archived;
                 entry.kind = item.kind;
                 entry.participants = item.participants.clone();
                 merged.push(entry);
@@ -3374,7 +4556,9 @@ impl App {
             if filter == Filter::All {
                 // All is the list: its order is the roster's.
                 for entry in &self.channels {
-                    order.push(entry.kind, entry.id);
+                    if filter.matches(entry) {
+                        order.push(entry.kind, entry.id);
+                    }
                 }
                 views.insert(filter, order);
                 continue;
@@ -3412,6 +4596,10 @@ impl App {
         ChannelEntry {
             id,
             name: name.to_owned(),
+            description: None,
+            visibility: None,
+            my_role: None,
+            archived: false,
             kind: ChannelKind::Channel,
             participants: Vec::new(),
             rows: Vec::new(),
@@ -3512,6 +4700,9 @@ impl App {
         let Some(entry) = self.channels.iter().find(|c| c.id == switcher.cursor) else {
             return view;
         };
+        if entry.archived != (self.filter == Filter::Archived) {
+            return view;
+        }
         let cursor_at = self.index_of(switcher.cursor).unwrap_or(usize::MAX);
         let section = if entry.is_dm() {
             &mut view.dms
@@ -3677,6 +4868,7 @@ impl App {
             Filter::All => "No conversations",
             Filter::Unread => "All read",
             Filter::ForYou => "No unread mentions or DMs",
+            Filter::Archived => "No archived channels",
         }
     }
 
@@ -6330,7 +7522,211 @@ impl App {
         }
     }
 
+    fn handle_lifecycle_overlay(&mut self, action: &Action) -> bool {
+        if self.edit_channel.is_some() {
+            let field = self.edit_channel.as_ref().map(|f| f.field);
+            match action {
+                Action::Dismiss => {
+                    self.close_edit_channel();
+                }
+                Action::LifecycleRefresh => self.refresh_edit_channel(),
+                Action::ComposerSend => self.edit_channel_submit(),
+                Action::ComposerCursorDown | Action::ComposerCursorUp => {
+                    let fields = [
+                        EditField::Name,
+                        EditField::Description,
+                        EditField::Visibility,
+                    ];
+                    if let Some(form) = self.edit_channel.as_mut() {
+                        let at = fields.iter().position(|f| *f == form.field).unwrap_or(0);
+                        form.field = fields[(at
+                            + usize::from(*action == Action::ComposerCursorDown))
+                        .min(2)
+                        .saturating_sub(usize::from(*action == Action::ComposerCursorUp))];
+                    }
+                }
+                Action::ComposerCursorLeft
+                | Action::ComposerCursorRight
+                | Action::ComposerInput(' ')
+                    if field == Some(EditField::Visibility) =>
+                {
+                    if let Some(form) = self.edit_channel.as_mut() {
+                        form.visibility = match form.visibility {
+                            ChannelVisibility::Open => ChannelVisibility::Private,
+                            ChannelVisibility::Private => ChannelVisibility::Open,
+                        };
+                    }
+                }
+                Action::ComposerInput(c) => {
+                    if let Some(form) = self.edit_channel.as_mut() {
+                        match form.field {
+                            EditField::Name => form.name.push(*c),
+                            EditField::Description => form.description.push(*c),
+                            EditField::Visibility => {}
+                        }
+                    }
+                }
+                Action::ComposerBackspace => {
+                    if let Some(form) = self.edit_channel.as_mut() {
+                        match form.field {
+                            EditField::Name => {
+                                form.name.pop();
+                            }
+                            EditField::Description => {
+                                form.description.pop();
+                            }
+                            EditField::Visibility => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if self.archive.is_some() {
+            match action {
+                Action::Dismiss => self.close_archive(),
+                Action::MemberSelect => self.confirm_archive(),
+                Action::LifecycleRefresh => self.refresh_archive(),
+                _ => {}
+            }
+            return true;
+        }
+        if self.members.is_some() {
+            if self.members.as_ref().is_some_and(|p| p.confirm.is_some()) {
+                match action {
+                    Action::MemberSelect => self.members_confirm(),
+                    Action::Dismiss => self.members_confirm_cancel(),
+                    _ => {}
+                }
+                return true;
+            }
+            if self.members.as_ref().is_some_and(|p| p.picker.open) {
+                match action {
+                    Action::Dismiss => self.members_picker_close(),
+                    Action::LifecycleRefresh => self.refresh_members(),
+                    Action::PickerNext | Action::PickerPrev => {
+                        if let Some(p) = self.members.as_mut() {
+                            let at = p.picker.cursor;
+                            p.picker.cursor = if *action == Action::PickerNext {
+                                (at + 1).min(p.picker.candidates.len().saturating_sub(1))
+                            } else {
+                                at.saturating_sub(1)
+                            };
+                        }
+                    }
+                    Action::MemberSelect => {
+                        if let Some(key) = self
+                            .members
+                            .as_ref()
+                            .and_then(|p| p.picker.candidates.get(p.picker.cursor))
+                            .map(|c| c.pubkey.clone())
+                        {
+                            self.members_picker_toggle(&key);
+                        }
+                    }
+                    Action::MemberRoleNext | Action::MemberRolePrev => {
+                        let roles = [
+                            MemberRole::Owner,
+                            MemberRole::Admin,
+                            MemberRole::Member,
+                            MemberRole::Guest,
+                            MemberRole::Bot,
+                        ];
+                        let at = self
+                            .members
+                            .as_ref()
+                            .and_then(|p| roles.iter().position(|r| *r == p.picker.role))
+                            .unwrap_or(2);
+                        let next = if *action == Action::MemberRoleNext {
+                            (at + 1) % roles.len()
+                        } else {
+                            (at + roles.len() - 1) % roles.len()
+                        };
+                        self.members_picker_role(roles[next]);
+                    }
+                    Action::MemberAdd => self.members_picker_submit(),
+                    Action::ComposerInput(c) => {
+                        let query = self
+                            .members
+                            .as_ref()
+                            .map(|p| format!("{}{}", p.picker.query, c))
+                            .unwrap_or_default();
+                        self.members_picker_query(&query);
+                    }
+                    Action::ComposerBackspace => {
+                        let mut query = self
+                            .members
+                            .as_ref()
+                            .map(|p| p.picker.query.clone())
+                            .unwrap_or_default();
+                        query.pop();
+                        self.members_picker_query(&query);
+                    }
+                    _ => {}
+                }
+            } else {
+                match action {
+                    Action::Dismiss => self.close_members(),
+                    Action::LifecycleRefresh => self.refresh_members(),
+                    Action::PickerNext | Action::PickerPrev => {
+                        if let Some(p) = self.members.as_mut() {
+                            let at = p.cursor;
+                            p.cursor = if *action == Action::PickerNext {
+                                (at + 1).min(p.members.len().saturating_sub(1))
+                            } else {
+                                at.saturating_sub(1)
+                            };
+                        }
+                    }
+                    Action::MemberAdd => self.members_picker_open(),
+                    Action::MemberRemove => {
+                        if let Some(key) = self
+                            .members
+                            .as_ref()
+                            .and_then(|p| p.members.get(p.cursor))
+                            .map(|r| r.pubkey.clone())
+                        {
+                            self.members_remove_open(&key);
+                        }
+                    }
+                    Action::MemberRole => {
+                        if let Some(p) = self.members.as_mut() {
+                            p.picker.role_chosen = false;
+                            self.note("choose role 1 owner, 2 admin, 3 member, 4 guest, 5 bot");
+                        }
+                    }
+                    Action::MemberRoleSelect(index) => {
+                        let roles = [
+                            MemberRole::Owner,
+                            MemberRole::Admin,
+                            MemberRole::Member,
+                            MemberRole::Guest,
+                            MemberRole::Bot,
+                        ];
+                        if let Some(role) = roles.get(*index as usize).copied()
+                            && let Some(key) = self
+                                .members
+                                .as_ref()
+                                .and_then(|p| p.members.get(p.cursor))
+                                .map(|r| r.pubkey.clone())
+                        {
+                            self.members_role_open(&key, role);
+                        }
+                    }
+                    Action::MemberLeave => self.members_leave_open(),
+                    _ => {}
+                }
+            }
+            return true;
+        }
+        false
+    }
+
     fn handle_navigation(&mut self, action: Action, now: u64) {
+        if self.handle_lifecycle_overlay(&action) {
+            return;
+        }
         if self.create_channel.is_some() {
             match action {
                 Action::Dismiss => {
@@ -6390,7 +7786,15 @@ impl App {
             Action::Quit => {
                 self.quit = true;
             }
-            Action::CreateChannelRefresh => self.refresh_create_channel(),
+            Action::CreateChannelRefresh => {
+                if self.archive_unsettled.is_some() {
+                    self.refresh_archive();
+                } else if self.edit_unsettled.is_some() {
+                    self.refresh_edit_channel();
+                } else {
+                    self.refresh_create_channel();
+                }
+            }
             Action::React
                 if self
                     .create_unsettled
@@ -6509,12 +7913,20 @@ impl App {
                 self.set_focus(next);
             }
             Action::ComposeNew => {
+                if let Some(reason) = self.composer_blocked() {
+                    self.note(reason);
+                    return;
+                }
                 self.composer.reply = None;
                 self.composer.edit = None;
                 self.mode = Mode::Composer;
                 self.sync_mention_picker();
             }
             Action::ComposeReply => {
+                if let Some(reason) = self.composer_blocked() {
+                    self.note(reason);
+                    return;
+                }
                 let target = self
                     .focused_row()
                     .map(|row| (row.event_id.clone(), row.author.clone(), row.pending));
@@ -7018,11 +8430,13 @@ impl App {
             self.switcher_query.clear();
             self.switcher_saved_query.clear();
             self.channels.get(self.selected).map(|entry| {
-                let at = self.view().all().position(|id| id == entry.id).unwrap_or(0);
-                Switcher {
-                    cursor: entry.id,
-                    at,
-                }
+                let id = if entry.archived == (self.filter == Filter::Archived) {
+                    entry.id
+                } else {
+                    self.view().all().next().unwrap_or(entry.id)
+                };
+                let at = self.view().all().position(|row| row == id).unwrap_or(0);
+                Switcher { cursor: id, at }
             })
         } else {
             None
@@ -7083,6 +8497,26 @@ impl App {
             Command::SearchMessages => self.open_search(false, now),
             Command::MyAgents => self.toggle_agents(),
             Command::CreateChannel => self.open_create_channel(),
+            Command::EditChannel => self.open_edit_channel(),
+            Command::ArchiveChannel => {
+                if let Some(id) = self.selected_entry().map(|c| c.id) {
+                    self.open_archive(id);
+                }
+            }
+            Command::UnarchiveChannel => {
+                if let Some(id) = self.selected_entry().map(|c| c.id) {
+                    self.open_unarchive(id);
+                }
+            }
+            Command::ArchivedChannels => {
+                self.set_filter(Filter::Archived);
+                self.toggle_switcher();
+            }
+            Command::ManageMembers => {
+                if let Some(id) = self.selected_entry().map(|c| c.id) {
+                    self.open_members(id);
+                }
+            }
             Command::About => {
                 self.about = true;
                 self.help = false;
@@ -7406,6 +8840,16 @@ impl App {
             self.draft_blocked = true;
             self.note("publishing blocked: channel membership was lost");
             return;
+        }
+        if let Some(entry) = self.channels.iter().find(|entry| entry.id == channel_id) {
+            if entry.archived {
+                self.note("publishing blocked: archived channel; draft kept");
+                return;
+            }
+            if entry.my_role == Some(MemberRole::Guest) {
+                self.note("publishing blocked: guest role is read-only; draft kept");
+                return;
+            }
         }
         let local = format!("pending:{}", Uuid::new_v4());
         if let Some(edit) = self.composer.edit.clone() {
@@ -7783,7 +9227,11 @@ mod tests {
         ChannelInfo {
             id: Uuid::from_u64_pair(id as u64, 0),
             name: format!("c{id}"),
+            description: None,
+            visibility: None,
+            my_role: None,
             kind: ChannelKind::Channel,
+            channel_type: Some(buzz_core::channel::ChannelType::Stream),
             participants: Vec::new(),
             archived: false,
             hidden: false,
@@ -7801,6 +9249,10 @@ mod tests {
         ChannelEntry {
             id: Uuid::from_u64_pair(id as u64, 0),
             name: format!("c{id}"),
+            description: None,
+            visibility: None,
+            my_role: None,
+            archived: false,
             kind: ChannelKind::Channel,
             participants: Vec::new(),
             rows: Vec::new(),
@@ -10967,24 +12419,20 @@ mod tests {
             "a reopened form does not submit a second creation"
         );
         assert!(app.status.contains("unresolved"), "{}", app.status);
-        // The refresh that came back with a complete roster lacking the
-        // channel settles the write: the reopened form starts clean, and the
-        // name is the reader's to submit again.
+        // Absence after refresh cannot distinguish rejection from delayed
+        // readback, so reopening must still show the uncertain write.
         app.handle(Action::Dismiss, 4);
         app.handle(Action::CreateChannelRefresh, 5);
         let _ = take_commands(&mut app);
         app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 6);
         assert!(
-            !app.create_write_pending(),
-            "the complete roster settles the write it answered"
+            app.create_write_pending(),
+            "absence cannot settle the write"
         );
-        assert!(app.status.contains("did not land"), "{}", app.status);
+        assert!(app.status.contains("remains unknown"), "{}", app.status);
         app.open_create_channel();
         let form = app.create_channel.as_ref().expect("the form reopens");
-        assert!(
-            matches!(form.state, CreateState::Editing),
-            "a settled form is ready for a fresh submit"
-        );
+        assert!(matches!(form.state, CreateState::Unknown(_)));
     }
 
     #[test]
@@ -11085,7 +12533,8 @@ mod tests {
         // A roster answer nobody asked for settles nothing either.
         app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 7);
         assert!(app.create_write_pending());
-        // The refresh the reader asks for is what resolves it.
+        // An explicit refresh still cannot prove rejection from absence: the
+        // relay may have accepted the event before its roster caught up.
         app.handle(Action::CreateChannelRefresh, 8);
         let commands = take_commands(&mut app);
         assert_eq!(
@@ -11098,14 +12547,13 @@ mod tests {
         );
         app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 9);
         assert!(
-            !app.create_write_pending(),
-            "a complete list that lacks the channel settles the write"
+            app.create_write_pending(),
+            "absence does not prove rejection"
         );
-        assert!(
-            app.status.contains("did not land"),
-            "the reader is told the creation did not land: {}",
-            app.status
-        );
+        assert!(app.status.contains("remains unknown"), "{}", app.status);
+        app.open_create_channel();
+        app.create_channel_submit();
+        assert!(take_commands(&mut app).is_empty(), "no duplicate creation");
     }
 
     #[test]
@@ -11224,16 +12672,13 @@ mod tests {
         let _ = take_commands(&mut app);
         app.apply(ChatEvent::Channels(roster(vec![channel_info(1)])), 7);
         assert!(
-            !app.create_write_pending(),
-            "the refresh that answered it settles the write"
+            app.create_write_pending(),
+            "absence leaves the write unknown"
         );
-        assert!(
-            matches!(
-                app.create_channel.as_ref().map(|form| &form.state),
-                Some(CreateState::Failed(_))
-            ),
-            "the form stays open and editable with the relay's answer"
-        );
+        assert!(matches!(
+            app.create_channel.as_ref().map(|form| &form.state),
+            Some(CreateState::Unknown(_))
+        ));
         assert_ne!(
             app.selected_entry().map(|entry| entry.id),
             Some(Uuid::from_u64_pair(2, 0)),
@@ -13550,6 +14995,23 @@ mod tests {
         assert!(app.context.rows.is_empty());
         assert!(!app.search.open);
     }
+
+    #[test]
+    fn revoking_a_channel_clears_its_member_panel() {
+        let mut app = app();
+        let id = channel(1).id;
+        app.channels = vec![channel(1)];
+        app.open_members(id);
+        assert!(app.members.is_some());
+        app.apply(
+            ChatEvent::ChannelGone {
+                channel: id,
+                reason: "membership lost".into(),
+            },
+            1,
+        );
+        assert!(app.members.is_none());
+    }
     #[test]
     fn community_switch_keeps_drafts_separate_and_rejects_stale_events() {
         let mut app = app();
@@ -13611,5 +15073,293 @@ mod tests {
         );
         assert_eq!(app.community_picker, Some(0));
         assert_eq!(app.status, "community switch failed: authentication failed");
+    }
+    #[test]
+    fn unknown_member_write_stays_locked_until_membership_matches() {
+        let mut app = app();
+        let mut info = channel_info(1);
+        info.my_role = Some(MemberRole::Owner);
+        app.apply(ChatEvent::Channels(roster(vec![info.clone()])), 0);
+        app.open_members(info.id);
+        let key = "ac".repeat(32);
+        app.member_unsettled = Some(UnsettledMember {
+            request: 42,
+            channel: info.id,
+            action: "add members".into(),
+            targets: vec![key.clone()],
+            expected: vec![(key.clone(), Some(MemberRole::Member))],
+            results: Vec::new(),
+            read_after: app.member_read_request,
+            generation: app.transport_generation,
+        });
+        app.apply(
+            ChatEvent::MemberWriteResult {
+                request: 42,
+                channel: info.id,
+                op: MemberOp::Add {
+                    pubkey: key.clone(),
+                    role: MemberRole::Member,
+                },
+                outcome: WriteOutcome::Unknown {
+                    reason: "connection lost".into(),
+                    category: crate::failure::Category::TimeoutUnknown,
+                },
+            },
+            1,
+        );
+        let request = app.member_read_request;
+        app.apply(
+            ChatEvent::Members {
+                channel: info.id,
+                request,
+                result: Ok(crate::client::Members {
+                    items: Vec::new(),
+                    complete: true,
+                }),
+            },
+            2,
+        );
+        assert!(
+            app.member_unsettled.is_some(),
+            "stale roster cannot resolve unknown write"
+        );
+        app.refresh_members();
+        let request = app.member_read_request;
+        app.apply(
+            ChatEvent::Members {
+                channel: info.id,
+                request,
+                result: Ok(crate::client::Members {
+                    items: vec![crate::client::MemberInfo {
+                        pubkey: key,
+                        name: None,
+                        role: MemberRole::Member,
+                    }],
+                    complete: true,
+                }),
+            },
+            3,
+        );
+        assert!(
+            app.member_unsettled.is_none(),
+            "matching authoritative roster settles write"
+        );
+    }
+
+    #[test]
+    fn metadata_edit_waits_for_all_changed_fields_on_authoritative_roster() {
+        let mut app = app();
+        let mut info = channel_info(1);
+        info.my_role = Some(MemberRole::Owner);
+        info.visibility = Some(ChannelVisibility::Open);
+        app.apply(ChatEvent::Channels(roster(vec![info.clone()])), 0);
+        app.open_edit_channel();
+        let form = app.edit_channel.as_mut().expect("editable form");
+        form.description = "new description".into();
+        form.visibility = ChannelVisibility::Private;
+        app.edit_channel_submit();
+        let request = app.edit_unsettled.as_ref().unwrap().request;
+        app.apply(
+            ChatEvent::ChannelWriteResult {
+                request,
+                channel: info.id,
+                op: ChannelOp::Edit,
+                outcome: WriteOutcome::Stored {
+                    event_id: "event".into(),
+                },
+            },
+            1,
+        );
+        app.apply(ChatEvent::Channels(roster(vec![info.clone()])), 2);
+        assert!(
+            app.edit_unsettled.is_some(),
+            "unchanged metadata is not confirmation"
+        );
+        assert!(matches!(
+            app.edit_channel.as_ref().unwrap().state,
+            CreateState::Unknown(_)
+        ));
+        info.description = Some("new description".into());
+        info.visibility = Some(ChannelVisibility::Private);
+        app.refresh_edit_channel();
+        app.apply(ChatEvent::Channels(roster(vec![info])), 3);
+        assert!(app.edit_unsettled.is_none());
+        assert!(app.edit_channel.is_none());
+    }
+
+    #[test]
+    fn archive_and_restore_follow_the_roster_and_leave_no_hidden_selection() {
+        let mut app = app();
+        let mut target = channel_info(1);
+        target.my_role = Some(MemberRole::Owner);
+        let neighbor = channel_info(2);
+        app.apply(
+            ChatEvent::Channels(roster(vec![target.clone(), neighbor.clone()])),
+            0,
+        );
+
+        app.open_archive(target.id);
+        assert!(app.archive.is_some(), "an active channel can be archived");
+        app.confirm_archive();
+        let request = app.archive_unsettled.as_ref().unwrap().request;
+        app.apply(
+            ChatEvent::ChannelWriteResult {
+                request,
+                channel: target.id,
+                op: ChannelOp::Archive,
+                outcome: WriteOutcome::Unknown {
+                    reason: "answer lost".into(),
+                    category: crate::failure::Category::TimeoutUnknown,
+                },
+            },
+            1,
+        );
+        app.close_archive();
+        app.handle(Action::CreateChannelRefresh, 2);
+        assert!(app.archive_refresh_pending);
+        assert!(
+            app.take_outbox()
+                .iter()
+                .any(|command| matches!(command, SessionCommand::LoadChannels))
+        );
+        target.archived = true;
+        app.apply(
+            ChatEvent::Channels(roster(vec![target.clone(), neighbor.clone()])),
+            3,
+        );
+        assert!(app.archive_unsettled.is_none());
+        assert_eq!(
+            app.selected_entry().map(|entry| entry.id),
+            Some(neighbor.id)
+        );
+
+        app.set_filter(Filter::Archived);
+        app.open_unarchive(target.id);
+        assert!(app.archive.is_some(), "an archived channel can be restored");
+        app.confirm_archive();
+        let request = app.archive_unsettled.as_ref().unwrap().request;
+        app.apply(
+            ChatEvent::ChannelWriteResult {
+                request,
+                channel: target.id,
+                op: ChannelOp::Unarchive,
+                outcome: WriteOutcome::Stored {
+                    event_id: "restore".into(),
+                },
+            },
+            4,
+        );
+        target.archived = false;
+        app.apply(ChatEvent::Channels(roster(vec![target, neighbor])), 5);
+        assert!(app.archive_unsettled.is_none());
+        assert!(app.archive.is_none());
+    }
+
+    #[test]
+    fn unresolved_edit_reopens_with_the_submitted_values() {
+        let mut app = app();
+        let mut target = channel_info(1);
+        target.my_role = Some(MemberRole::Owner);
+        target.visibility = Some(ChannelVisibility::Open);
+        app.apply(ChatEvent::Channels(roster(vec![target.clone()])), 0);
+        app.open_edit_channel();
+        let form = app.edit_channel.as_mut().unwrap();
+        form.name = "renamed".into();
+        form.description = "changed".into();
+        form.visibility = ChannelVisibility::Private;
+        app.edit_channel_submit();
+        app.close_edit_channel();
+        app.open_edit_channel();
+        let form = app.edit_channel.as_ref().unwrap();
+        assert_eq!(
+            (&form.name, &form.description, form.visibility),
+            (
+                &"renamed".to_owned(),
+                &"changed".to_owned(),
+                ChannelVisibility::Private
+            )
+        );
+    }
+
+    #[test]
+    fn exact_identity_remains_available_when_member_search_fails() {
+        let mut app = app();
+        let mut info = channel_info(1);
+        info.my_role = Some(MemberRole::Owner);
+        app.apply(ChatEvent::Channels(roster(vec![info.clone()])), 0);
+        app.open_members(info.id);
+        app.members_picker_open();
+        let key = "ab".repeat(32);
+        app.members_picker_query(&key);
+        let request = app.member_search_request;
+        app.apply(
+            ChatEvent::MemberCandidates {
+                channel: info.id,
+                request,
+                result: Err("search unavailable".into()),
+            },
+            1,
+        );
+        let picker = &app.members.as_ref().unwrap().picker;
+        assert_eq!(picker.failed.as_deref(), Some("search unavailable"));
+        assert_eq!(picker.candidates[0].pubkey, key);
+        app.members_picker_toggle(&key);
+        assert_eq!(app.members.as_ref().unwrap().picker.selected, vec![key]);
+    }
+
+    #[test]
+    fn cancelled_batch_keeps_success_and_never_resubmits_remaining_targets() {
+        let mut app = app();
+        let mut info = channel_info(1);
+        info.my_role = Some(MemberRole::Owner);
+        app.apply(ChatEvent::Channels(roster(vec![info.clone()])), 0);
+        app.open_members(info.id);
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        app.member_unsettled = Some(UnsettledMember {
+            request: 9,
+            channel: info.id,
+            action: "add members".into(),
+            targets: vec![a.clone(), b.clone()],
+            expected: vec![
+                (a.clone(), Some(MemberRole::Member)),
+                (b.clone(), Some(MemberRole::Member)),
+            ],
+            results: Vec::new(),
+            read_after: app.member_read_request,
+            generation: app.transport_generation,
+        });
+        app.apply(
+            ChatEvent::MemberWriteResult {
+                request: 9,
+                channel: info.id,
+                op: MemberOp::Add {
+                    pubkey: a.clone(),
+                    role: MemberRole::Member,
+                },
+                outcome: WriteOutcome::Stored {
+                    event_id: "event".into(),
+                },
+            },
+            1,
+        );
+        app.apply(
+            ChatEvent::MemberBatchCancelled {
+                request: 9,
+                channel: info.id,
+                remaining: vec![b.clone()],
+            },
+            2,
+        );
+        let results = &app.members.as_ref().unwrap().picker.results;
+        assert_eq!(results[0].status, WriteStatus::Confirmed);
+        assert_eq!(results[1].status, WriteStatus::CancelledGeneration);
+        assert_eq!(results[1].pubkey, b);
+        assert!(app.member_unsettled.is_none());
+        assert!(
+            !app.take_outbox()
+                .iter()
+                .any(|command| matches!(command, SessionCommand::AddMembers { .. }))
+        );
     }
 }

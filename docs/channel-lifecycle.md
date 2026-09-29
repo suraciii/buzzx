@@ -344,6 +344,33 @@ alone cannot prove relay authorization or eventual readback.
    roles, archive metadata and visibility from a second identity. Unit and
    fake-relay tests supplement but do not replace this evidence.
 
+## Acceptance evidence (2026-09-29)
+
+`just check` passed (475 Rust unit tests, 36 CLI tests, one fixture test, 24
+Python tests, formatting, clippy and documentation gates). On two isolated
+Buzz relays (`127.0.0.1:3030` and `:3031`), the CLI created same-name
+`lifecycle-dual-20260929` channels with distinct ids, `3a0930da-4f93-4c6e-9b04-f610afede34f`
+and `ff30af8f-ecc9-4da7-9aa1-1b91739d3d5c`. They kept separate stream/private
+and forum/open metadata, messages, and member/guest roles; the second identity
+read each relay's membership and messages with its own credential. Each relay
+returned `not_found` for the other's message id. An owner metadata update in B
+left A unchanged; a member archive attempt was refused by the relay.
+
+The WebUI archived and restored A with authoritative readback: the Archived
+filter found it, the composer and Send button were disabled while archived,
+and switching to B then A showed the correct channel ids. At 390x780 the
+channel action sheet remained usable. A TUI member at 80x24 opened the member
+panel and saw both canonical identities; attempting to archive produced an
+unavailable-action status. Separately, an isolated private channel on the
+deployed relay confirmed create/edit/add/role-change/archive/restore/remove,
+archived-send refusal, and last-owner protection by independent CLI readback.
+
+The normal relay API cannot force an unknown write by dropping its response;
+that path is covered by the deterministic test relay, not claimed as live
+acceptance. The isolated run did not verify cross-community draft persistence
+or late-result cancellation through a real lost connection.
+
+
 ## Non-goals
 
 This slice does not add automatic invites from mentions, global cross-community

@@ -567,14 +567,11 @@ once against a deployment where an owned Agent has a turn running. `Unknown`
 is the answer for a feed that is refused, closed, or not yet established; `No
 active turn observed` follows only a feed the relay has answered with `EOSE`.
 
-
 ## Mentions when sending
 
-[Mention suggestions and channel creation](mentions-and-channel-creation.md)
-is the product contract this follows. Channel archive/restore and membership
-actions use the shared [channel lifecycle contract](channel-lifecycle.md);
-they are exposed from the `Ctrl+P` command palette and keep the active
-community visible.
+The [mention/channel creation](mentions-and-channel-creation.md) contract governs
+mentions; [channel lifecycle](channel-lifecycle.md) governs archive, restore and
+membership via `Ctrl+P` in the active community.
 
 `@` at the start of a word opens a draft-local picker over the open
 conversation's members: exact names first, then prefix matches, with the Agent or

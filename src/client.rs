@@ -6,9 +6,11 @@
 use std::collections::{HashMap, HashSet};
 
 use buzz_sdk::builders::{
-    build_delete_message, build_edit, build_message, build_reaction, build_remove_reaction,
+    build_add_member, build_archive, build_delete_message, build_edit, build_leave, build_message,
+    build_reaction, build_remove_member, build_remove_reaction, build_unarchive,
+    build_update_channel,
 };
-use buzz_sdk::{ThreadRef, extract_channel_id};
+use buzz_sdk::{MemberRole, ThreadRef, extract_channel_id};
 use nostr::{Event, EventBuilder, EventId, Keys, Tag};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -51,8 +53,6 @@ const ARCHIVED_TAG: &str = "archived";
 const P_TAG: &str = "p";
 /// The tag that names one hidden channel on a visibility snapshot.
 const H_TAG: &str = "h";
-/// The channel type a direct conversation carries.
-const DM_TYPE: &str = "dm";
 /// How many channel ids one membership or metadata query carries.
 const CHANNEL_QUERY_LIMIT: u64 = 500;
 /// How many marker slots one answer may carry.
@@ -96,12 +96,37 @@ pub struct ChannelInfo {
     pub id: Uuid,
     /// The metadata name, or the id when the row has none.
     pub name: String,
+    pub description: Option<String>,
+    pub visibility: Option<buzz_core::channel::ChannelVisibility>,
+    pub my_role: Option<MemberRole>,
     pub kind: ChannelKind,
+    /// The authoritative functional type from metadata, when classified.
+    pub channel_type: Option<buzz_core::channel::ChannelType>,
     /// A DM's other members, in metadata order. Empty for a channel.
     pub participants: Vec<String>,
     pub archived: bool,
     /// The viewer hid this DM from its list, per the relay's snapshot.
     pub hidden: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelUpdate {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub visibility: Option<buzz_core::channel::ChannelVisibility>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberInfo {
+    pub pubkey: String,
+    pub role: MemberRole,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Members {
+    pub items: Vec<MemberInfo>,
+    pub complete: bool,
 }
 
 /// The membership roster and how much of it could be classified. `complete`
@@ -568,6 +593,14 @@ impl Client {
             .transport
             .query(&json!({
                 "kinds": [content::CHANNEL_METADATA_KIND],
+                "#d": ids.clone(),
+                "limit": CHANNEL_QUERY_LIMIT,
+            }))
+            .await;
+        let admins = self
+            .transport
+            .query(&json!({
+                "kinds": [39001],
                 "#d": ids,
                 "limit": CHANNEL_QUERY_LIMIT,
             }))
@@ -577,12 +610,12 @@ impl Client {
         let items = channels_from(
             &membership,
             described.as_deref().unwrap_or_default(),
+            admins.as_deref().unwrap_or_default(),
             hidden.as_ref().unwrap_or(&none),
             &me,
         );
-        let complete = described.is_ok()
-            && hidden.is_ok()
-            && items.iter().all(|item| item.kind != ChannelKind::Unknown);
+        let complete =
+            described.is_ok() && items.iter().all(|item| item.kind != ChannelKind::Unknown);
         Ok(Roster { items, complete })
     }
 
@@ -1019,6 +1052,70 @@ impl Client {
         Ok(resolved)
     }
 
+    /// Search profiles visible on this relay for channel-member selection.
+    /// This is not the channel's existing-member directory used by mentions.
+    pub async fn search_profiles(&self, query: &str) -> Result<Vec<mentions::Candidate>, Failure> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let profiles = self
+            .transport
+            .query(&json!({
+                "kinds": [content::PROFILE_KIND],
+                "search": query,
+                "limit": mentions::SUGGESTION_CAP as u64,
+            }))
+            .await?;
+        let needle = query.to_lowercase();
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for profile in profiles {
+            let pubkey = profile.pubkey.to_hex();
+            if !seen.insert(pubkey.clone()) {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&profile.content) else {
+                continue;
+            };
+            let display = value
+                .get("display_name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty());
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty());
+            if ![display, name]
+                .into_iter()
+                .flatten()
+                .any(|value| value.to_lowercase().contains(&needle))
+            {
+                continue;
+            }
+            let Some(label) = display.or(name) else {
+                continue;
+            };
+            candidates.push(mentions::Candidate {
+                pubkey,
+                label: label.to_owned(),
+                picture: value
+                    .get("picture")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                agent: false,
+                admin: false,
+            });
+        }
+        candidates.sort_by(|a, b| {
+            a.label
+                .to_lowercase()
+                .cmp(&b.label.to_lowercase())
+                .then(a.pubkey.cmp(&b.pubkey))
+        });
+        Ok(candidates)
+    }
+
     /// The current membership, the member roles and the member profiles a
     /// mention preflight matches names against. A failed read is an error,
     /// never an empty directory: an incomplete roster would drop the
@@ -1084,6 +1181,176 @@ impl Client {
         }
     }
 
+    /// Read one authoritative channel row from the active community.
+    pub async fn channel(&self, channel: Uuid) -> Result<ChannelInfo, Failure> {
+        let roster = self.channels().await?;
+        if !roster.complete {
+            return Err(Failure::new(
+                Category::TimeoutUnknown,
+                "channel metadata is incomplete; refresh before selecting a channel",
+            ));
+        }
+        roster
+            .items
+            .into_iter()
+            .find(|item| item.id == channel)
+            .ok_or_else(|| Failure::not_found(format!("no accessible channel {channel}")))
+    }
+
+    /// Read the relay's member roster and resolve display names separately.
+    pub async fn members(&self, channel: Uuid) -> Result<Members, Failure> {
+        let _ = self.channel(channel).await?;
+        let events = self
+            .transport
+            .query(&json!({
+                "kinds": [content::MEMBERSHIP_KIND],
+                "#d": [channel.to_string()],
+                "limit": 1,
+            }))
+            .await?;
+        let admins = self
+            .transport
+            .query(&json!({
+                "kinds": [39001],
+                "#d": [channel.to_string()],
+                "limit": 1,
+            }))
+            .await
+            .unwrap_or_default();
+        let Some(roster) = events.first() else {
+            return Ok(Members {
+                items: Vec::new(),
+                complete: false,
+            });
+        };
+        let roles: HashMap<String, MemberRole> = content::member_roles(roster)
+            .into_iter()
+            .filter_map(|(key, role)| role.parse().ok().map(|role| (key, role)))
+            .chain(admins.iter().flat_map(|event| {
+                event.tags.iter().filter_map(|tag| {
+                    let parts = tag.as_slice();
+                    if parts.first().map(String::as_str) != Some("p") {
+                        return None;
+                    }
+                    Some((parts.get(1)?.clone(), parts.get(2)?.parse().ok()?))
+                })
+            }))
+            .collect();
+        let keys = content::member_pubkeys(roster);
+        let roles_complete = keys.iter().all(|key| roles.contains_key(key));
+        let names = match self.profiles(keys.clone()).await {
+            Ok(values) => values.into_iter().collect::<HashMap<_, _>>(),
+            Err(_) => HashMap::new(),
+        };
+        let items = keys
+            .into_iter()
+            .map(|pubkey| MemberInfo {
+                role: roles.get(&pubkey).copied().unwrap_or(MemberRole::Member),
+                name: names.get(&pubkey).cloned(),
+                pubkey,
+            })
+            .collect();
+        Ok(Members {
+            items,
+            complete: roles_complete,
+        })
+    }
+
+    pub async fn update_channel(&self, channel: Uuid, update: &ChannelUpdate) -> WriteOutcome {
+        let visibility = update.visibility.map(|value| value.as_str());
+        let builder = match build_update_channel(
+            channel,
+            update.name.as_deref(),
+            update.description.as_deref(),
+            visibility,
+            None,
+        ) {
+            Ok(builder) => builder,
+            Err(error) => return refused(Category::InvalidInput, error.to_string()),
+        };
+        self.submit(builder).await
+    }
+
+    pub async fn archive_channel(&self, channel: Uuid) -> WriteOutcome {
+        match build_archive(channel) {
+            Ok(builder) => self.submit(builder).await,
+            Err(error) => refused(Category::InvalidInput, error.to_string()),
+        }
+    }
+
+    pub async fn unarchive_channel(&self, channel: Uuid) -> WriteOutcome {
+        match build_unarchive(channel) {
+            Ok(builder) => self.submit(builder).await,
+            Err(error) => refused(Category::InvalidInput, error.to_string()),
+        }
+    }
+
+    pub async fn add_member(&self, channel: Uuid, pubkey: &str, role: MemberRole) -> WriteOutcome {
+        match build_add_member(channel, pubkey, Some(role)) {
+            Ok(builder) => self.submit(builder).await,
+            Err(error) => refused(Category::InvalidInput, error.to_string()),
+        }
+    }
+
+    pub async fn set_role(&self, channel: Uuid, pubkey: &str, role: MemberRole) -> WriteOutcome {
+        if role != MemberRole::Owner
+            && let Some(outcome) = self.last_owner_refusal(channel, pubkey).await
+        {
+            return outcome;
+        }
+        self.add_member(channel, pubkey, role).await
+    }
+
+    pub async fn remove_member(&self, channel: Uuid, pubkey: &str) -> WriteOutcome {
+        if let Some(outcome) = self.last_owner_refusal(channel, pubkey).await {
+            return outcome;
+        }
+        match build_remove_member(channel, pubkey) {
+            Ok(builder) => self.submit(builder).await,
+            Err(error) => refused(Category::InvalidInput, error.to_string()),
+        }
+    }
+
+    pub async fn leave_channel(&self, channel: Uuid) -> WriteOutcome {
+        let me = self.keys.public_key().to_hex();
+        if let Some(outcome) = self.last_owner_refusal(channel, &me).await {
+            return outcome;
+        }
+        match build_leave(channel) {
+            Ok(builder) => self.submit(builder).await,
+            Err(error) => refused(Category::InvalidInput, error.to_string()),
+        }
+    }
+
+    async fn last_owner_refusal(&self, channel: Uuid, target: &str) -> Option<WriteOutcome> {
+        let members = match self.members(channel).await {
+            Ok(members) => members,
+            Err(failure) => return Some(refused(failure.category, failure.detail)),
+        };
+        if !members.complete {
+            return Some(refused(
+                Category::TimeoutUnknown,
+                "membership roster is incomplete; refusing owner-sensitive write".to_owned(),
+            ));
+        }
+        let owners = members
+            .items
+            .iter()
+            .filter(|member| member.role == MemberRole::Owner)
+            .count();
+        let target_is_owner = members.items.iter().any(|member| {
+            member.pubkey.eq_ignore_ascii_case(target) && member.role == MemberRole::Owner
+        });
+        if target_is_owner && owners <= 1 {
+            Some(refused(
+                Category::Forbidden,
+                "the last owner cannot be removed or demoted".to_owned(),
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Create a channel in the active community. The client chooses the id and
     /// the relay establishes the rest: the canonical event, the creator's
     /// ownership and the initial membership. A write whose answer was lost is
@@ -1145,6 +1412,38 @@ impl Client {
     ) -> WriteOutcome {
         if content.is_empty() {
             return refused(Category::InvalidInput, "content is empty".to_owned());
+        }
+        // One authoritative snapshot gates CLI, TUI and Web sends; a stale
+        // surface cannot turn an archived or read-only channel writable.
+        let info = match self.channel(channel).await {
+            Ok(info) => info,
+            Err(error) => return error.into(),
+        };
+        if info.kind == ChannelKind::Unknown {
+            return refused(
+                Category::TimeoutUnknown,
+                "channel metadata is unknown; refresh before sending".to_owned(),
+            );
+        }
+        if info.archived {
+            return refused(Category::Forbidden, "channel is archived".to_owned());
+        }
+        if info.kind == ChannelKind::Channel {
+            match info.my_role {
+                Some(MemberRole::Guest) => {
+                    return refused(
+                        Category::Forbidden,
+                        "guests cannot send to this channel".to_owned(),
+                    );
+                }
+                None => {
+                    return refused(
+                        Category::TimeoutUnknown,
+                        "channel role is unknown; refresh before sending".to_owned(),
+                    );
+                }
+                _ => {}
+            }
         }
         let mentions: Vec<&str> = mentions.iter().map(String::as_str).collect();
         match build_message(channel, content, thread.as_ref(), &mentions, false, &[]) {
@@ -1268,7 +1567,10 @@ fn hidden_ids(snapshot: &[Event]) -> HashSet<String> {
 /// The part of a metadata event that classifies its row.
 struct Metadata {
     name: Option<String>,
+    description: Option<String>,
+    visibility: Option<buzz_core::channel::ChannelVisibility>,
     kind: ChannelKind,
+    channel_type: Option<buzz_core::channel::ChannelType>,
     participants: Vec<String>,
     archived: bool,
 }
@@ -1279,6 +1581,7 @@ struct Metadata {
 fn channels_from(
     roster: &[Event],
     metadata: &[Event],
+    admins: &[Event],
     hidden: &HashSet<String>,
     me: &str,
 ) -> Vec<ChannelInfo> {
@@ -1289,15 +1592,15 @@ fn channels_from(
         };
         // The type tag is authoritative; a DM also carries the relay's hidden
         // hint, which classifies a row that predates the type tag.
-        let kind = match first_tag(event, TYPE_TAG).as_deref() {
-            Some(DM_TYPE) => ChannelKind::Dm,
+        let type_value = first_tag(event, TYPE_TAG);
+        let channel_type = type_value.as_deref().and_then(|value| value.parse().ok());
+        let kind = match channel_type {
+            Some(buzz_core::channel::ChannelType::Dm) => ChannelKind::Dm,
             Some(_) => ChannelKind::Channel,
             None if has_tag(event, DM_HINT_TAG) => ChannelKind::Dm,
             None => ChannelKind::Channel,
         };
         let participants = match kind {
-            // Only a DM's metadata lists its members: on a channel the same
-            // tag names its admins.
             ChannelKind::Dm => event
                 .tags
                 .iter()
@@ -1308,7 +1611,18 @@ fn channels_from(
         };
         described.entry(id).or_insert(Metadata {
             name: first_tag(event, NAME_TAG).filter(|name| !name.is_empty()),
+            description: first_tag(event, "about").filter(|value| !value.is_empty()),
+            visibility: if has_tag(event, "private") {
+                Some(buzz_core::channel::ChannelVisibility::Private)
+            } else if has_tag(event, "public") {
+                Some(buzz_core::channel::ChannelVisibility::Open)
+            } else {
+                first_tag(event, "visibility")
+                    .and_then(|value| value.parse().ok())
+                    .or(Some(buzz_core::channel::ChannelVisibility::Open))
+            },
             kind,
+            channel_type,
             participants,
             archived: first_tag(event, ARCHIVED_TAG).as_deref() == Some("true"),
         });
@@ -1323,7 +1637,34 @@ fn channels_from(
                 name: info
                     .and_then(|info| info.name.clone())
                     .unwrap_or_else(|| id.clone()),
+                description: info.and_then(|info| info.description.clone()),
+                visibility: info.and_then(|info| info.visibility),
+                my_role: roster
+                    .iter()
+                    .find(|event| first_tag(event, D_TAG).as_deref() == Some(id.as_str()))
+                    .and_then(|event| {
+                        content::member_roles(event)
+                            .into_iter()
+                            .find(|(key, _)| key == me)
+                            .and_then(|(_, role)| role.parse().ok())
+                    })
+                    .or_else(|| {
+                        admins
+                            .iter()
+                            .find(|event| first_tag(event, D_TAG).as_deref() == Some(id.as_str()))
+                            .and_then(|event| {
+                                event.tags.iter().find_map(|tag| {
+                                    let parts = tag.as_slice();
+                                    (parts.first().map(String::as_str) == Some("p")
+                                        && parts.get(1).is_some_and(|key| key == me))
+                                    .then(|| parts.get(2))
+                                    .flatten()
+                                    .and_then(|role| role.parse().ok())
+                                })
+                            })
+                    }),
                 kind: info.map_or(ChannelKind::Unknown, |info| info.kind),
+                channel_type: info.and_then(|info| info.channel_type),
                 participants: info
                     .map(|info| info.participants.clone())
                     .unwrap_or_default(),
@@ -1826,14 +2167,14 @@ mod tests {
             metadata(
                 &keys,
                 2,
-                Some(DM_TYPE),
+                Some("dm"),
                 None,
                 &[other.clone(), me.clone()],
                 false,
             ),
             metadata(&keys, 3, None, Some("old"), &[], true),
         ];
-        let items = channels_from(&roster, &metadata, &HashSet::new(), &me);
+        let items = channels_from(&roster, &metadata, &[], &HashSet::new(), &me);
         assert_eq!(items.len(), 3);
         assert_eq!(
             items.iter().find(|item| item.id == named).unwrap().kind,
@@ -1859,7 +2200,7 @@ mod tests {
         // The viewer's own hidden snapshot takes a DM out of the list without
         // claiming the row is not a DM.
         let hidden: HashSet<String> = HashSet::from([dm.to_string()]);
-        let items = channels_from(&roster, &metadata, &hidden, &me);
+        let items = channels_from(&roster, &metadata, &[], &hidden, &me);
         let dm_item = items.iter().find(|item| item.id == dm).unwrap();
         assert!(dm_item.hidden);
         assert!(!dm_item.listed());
@@ -1867,6 +2208,55 @@ mod tests {
             items.iter().filter(|item| item.listed()).count(),
             1,
             "a hidden DM and an archived channel are not the list"
+        );
+    }
+
+    #[test]
+    fn relay_public_and_private_tags_define_channel_visibility() {
+        let keys = keys();
+        let me = keys.public_key().to_hex();
+        let roster = vec![
+            signed(
+                &keys,
+                vec![Tag::parse(["d", &Uuid::from_u128(1).to_string()]).unwrap()],
+            ),
+            signed(
+                &keys,
+                vec![Tag::parse(["d", &Uuid::from_u128(2).to_string()]).unwrap()],
+            ),
+        ];
+        let metadata = [
+            signed(
+                &keys,
+                vec![
+                    Tag::parse(["d", &Uuid::from_u128(1).to_string()]).unwrap(),
+                    Tag::parse(["public"]).unwrap(),
+                ],
+            ),
+            signed(
+                &keys,
+                vec![
+                    Tag::parse(["d", &Uuid::from_u128(2).to_string()]).unwrap(),
+                    Tag::parse(["private"]).unwrap(),
+                ],
+            ),
+        ];
+        let channels = channels_from(&roster, &metadata, &[], &HashSet::new(), &me);
+        assert_eq!(
+            channels
+                .iter()
+                .find(|item| item.id == Uuid::from_u128(1))
+                .unwrap()
+                .visibility,
+            Some(buzz_core::channel::ChannelVisibility::Open)
+        );
+        assert_eq!(
+            channels
+                .iter()
+                .find(|item| item.id == Uuid::from_u128(2))
+                .unwrap()
+                .visibility,
+            Some(buzz_core::channel::ChannelVisibility::Private)
         );
     }
 
@@ -1879,7 +2269,7 @@ mod tests {
             &keys,
             vec![Tag::parse(["d", &bare.to_string()]).unwrap()],
         )];
-        let items = channels_from(&roster, &[], &HashSet::new(), &me);
+        let items = channels_from(&roster, &[], &[], &HashSet::new(), &me);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, ChannelKind::Unknown);
         assert_eq!(
@@ -1987,7 +2377,7 @@ mod tests {
             ),
         ];
         let me = Keys::generate().public_key().to_hex();
-        let channels = channels_from(&roster, &metadata, &HashSet::new(), &me);
+        let channels = channels_from(&roster, &metadata, &[], &HashSet::new(), &me);
         let names: Vec<(Uuid, String)> = channels
             .iter()
             .map(|channel| (channel.id, channel.name.clone()))
@@ -2011,7 +2401,7 @@ mod tests {
             ),
         ];
         let me = Keys::generate().public_key().to_hex();
-        let channels = channels_from(&roster, &[], &HashSet::new(), &me);
+        let channels = channels_from(&roster, &[], &[], &HashSet::new(), &me);
         assert_eq!(channels.len(), 1);
         assert_eq!(channels[0].id, Uuid::from_u128(4));
     }

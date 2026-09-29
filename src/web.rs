@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::agents::Load as AgentLoad;
 use crate::app::{
     AgentStatus, App, CommunityChoice, ConnState, Context, CreateChannelForm, CreateState, Filter,
-    Mode, SearchScope, SearchTime,
+    MemberRole, Mode, SearchScope, SearchTime,
 };
 use crate::client::ChannelKind;
 use crate::config::{self, Resolved};
@@ -45,7 +45,7 @@ const root=document.getElementById('root');root.textContent='Connecting…';wind
 const esc=(x)=>String(x??'');function draftFor(){const key=(state?.community?.id||'default')+':'+(state?.selected||'inbox');if(!drafts.has(key))drafts.set(key,{text:'',target:null,pending:false,caret:null});return drafts.get(key)}function saveDraft(){const box=document.querySelector('#composer');if(box&&!box.disabled)draftFor().text=box.value}
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:body?{'content-type':'application/json','x-buzzx-tab':tabKey}:{'x-buzzx-tab':tabKey},body:body?JSON.stringify(body):undefined,credentials:'same-origin'});if(!r.ok){throw new Error(await r.text()||r.statusText)}return r.json()}
 function rowHtml(r,selected){return `<article class="row ${selected?'focus':''}" data-row-id="${esc(r.event_id)}"><div class="meta"><span class="author"></span><span>${new Date((r.created_at||0)*1000).toLocaleString()}</span>${r.edited?'<span>(edited)</span>':''}${r.uncertain?'<span class="error">Unknown result</span>':''}</div><div class="body"></div><div class="row-actions"><button data-act="reply" data-id="${esc(r.event_id)}">Reply</button><button data-act="thread" data-id="${esc(r.event_id)}">Open thread</button><button data-act="reader" data-id="${esc(r.event_id)}">Read message</button><button data-act="react" data-id="${esc(r.event_id)}">Like</button>${r.own?' <button data-act="edit" data-id="'+esc(r.event_id)+'">Edit</button><button data-act="delete" data-id="'+esc(r.event_id)+'">Delete</button>':''}</div></article>`}
-function captureFocus(){const el=document.activeElement;if(!el||el===document.body||!el.id||!root.contains(el))return null;const caret=el.tagName==='INPUT'||el.tagName==='TEXTAREA'?{start:el.selectionStart,end:el.selectionEnd}:null;return{id:el.id,caret}}
+function captureFocus(){const el=document.activeElement;if(el?.hasAttribute?.('data-lifecycle'))lifecycleHeaderFocus=el.textContent;if(!el||el===document.body||!el.id||!root.contains(el))return null;const caret=el.tagName==='INPUT'||el.tagName==='TEXTAREA'?{start:el.selectionStart,end:el.selectionEnd}:null;return{id:el.id,caret}}
 function restoreFocus(seed){if(!seed)return;const el=root.querySelector('#'+CSS.escape(seed.id));if(!el)return;el.focus({preventScroll:true});if(seed.caret&&el.setSelectionRange)try{el.setSelectionRange(seed.caret.start,seed.caret.end)}catch(_){}}
 function render(){if(!state){root.textContent='Connecting…';return}const seed=captureFocus();const scrollY=window.scrollY;const anchorEl=root.querySelector('.rows .row.focus');const anchor=anchorEl&&anchorEl.dataset.rowId?{id:anchorEl.dataset.rowId,top:anchorEl.getBoundingClientRect().top}:null;const rowSeed=anchor?anchor.id:null;root.innerHTML='';const app=document.createElement('div');app.className='app';app.innerHTML=`<aside class="sidebar"><div class="brand">buzzx</div><div class="identity"></div><div class="community"></div><input id="find" placeholder="Find conversation" aria-label="Find conversation"><div class="filters"><button data-filter="All">All</button><button data-filter="Unread">Unread</button><button data-filter="For you">For you</button></div><div class="channels"></div><div class="sidebar-footer"></div></aside><main class="main"><header class="topbar"><button class="back" data-act="back">Inbox</button><div class="title"></div><span class="status"></span><button data-act="search">Search messages</button><button data-act="agents">My agents</button><button data-act="help">Help</button></header><section class="content"></section><footer class="composer"><div class="composer-label"></div><div class="composer-controls"><textarea id="composer" placeholder="Write a message…"></textarea><button data-act="send">Send</button></div></footer></main></div>`;root.appendChild(app);app.querySelector('.identity').textContent=state.identity+' · '+state.relay;const community=app.querySelector('.community');community.textContent='Community: '+(state.community?.name||'default')+' · '+(state.connection||'Connecting');(state.communities||[]).forEach(c=>{const b=document.createElement('button');b.textContent=c.name+(c.active?' ✓':'');b.title=c.relay_url;b.onclick=()=>act({action:'community',community:c.id});community.appendChild(b)});app.querySelector('.status').textContent=state.connection+(state.startup_error?' · '+state.startup_error:'');app.querySelector('.title').textContent=state.title||'Inbox';app.querySelector('.sidebar-footer').textContent=state.status||'';const list=app.querySelector('.channels');const empty=document.createElement('div');empty.className='empty';list.appendChild(empty);state.channels.forEach(c=>{const b=document.createElement('button');b.className='channel'+(c.id===state.selected?' active':'');b.dataset.channel=c.id;b.dataset.matched=c.matched?'1':'';b.hidden=!c.matched;const n=document.createElement('span');n.textContent=c.name;b.appendChild(n);if(c.unread||c.marker==='unknown'){const x=document.createElement('span');x.className='count';x.textContent=c.marker==='unknown'?'?':String(c.unread);b.appendChild(x)}list.appendChild(b)});app.querySelectorAll('[data-filter]').forEach(b=>{const on=b.dataset.filter===state.filter;b.classList.toggle('active',on);b.setAttribute('aria-pressed',on?'true':'false')});const cinput=app.querySelector('#find');cinput.value=fields.get('find')||'';const applyFind=()=>{const q=cinput.value.toLowerCase();let shown=0;list.querySelectorAll('.channel').forEach(b=>{b.hidden=b.dataset.matched!=='1'||!b.textContent.toLowerCase().includes(q);if(!b.hidden)shown++});empty.textContent=shown?'':(q?'No match':(state.filter_empty||''))};cinput.addEventListener('input',()=>{fields.set('find',cinput.value);applyFind()});applyFind();app.querySelector('.composer-label').textContent=state.composer_label||'New message';const content=app.querySelector('.content');
 if(view==='search'){renderSearch(content)}else if(view==='agents'){renderAgents(content)}else if(view==='help'){content.innerHTML='<h2>Help</h2><p>Enter sends. Shift+Enter inserts a newline. Search and inspection keep drafts in this tab. Browser Back returns through the current inspection path.</p><p>Only the local process can authorize this page. Refreshing or closing the tab does not persist drafts.</p>'}else if(view==='reader'){renderReader(content)}else if(view==='thread'){renderRows(content,state.thread,'Thread')}else if(view==='context'){renderRows(content,state.context,'Search context')}else{renderRows(content,state.rows,state.title||'Conversation')}
@@ -125,6 +125,23 @@ document.addEventListener('input',event=>{if(event.target?.id==='composer')menti
 function renderMentionBlock(){const composer=document.querySelector('.composer');if(!composer)return;let block=composer.querySelector('.mention-block');if(!state?.mention_block){if(block)block.remove();return}if(!block){block=document.createElement('div');block.className='mention-block notice';composer.prepend(block)}block.replaceChildren();const title=document.createElement('strong');title.textContent=state.mention_block.kind+': '+state.mention_block.summary;block.append(title);const detail=document.createElement('div');detail.textContent=(state.mention_block.details||[]).join(' ');block.append(detail);const retry=document.createElement('button');retry.textContent='Edit and retry';retry.onclick=()=>document.querySelector('#composer')?.focus();block.append(retry)}
 setInterval(renderMentionBlock,100);
 const webExtraStyle=document.createElement('style');webExtraStyle.textContent='.mention-popover{position:relative;z-index:5;background:var(--panel);border:1px solid var(--line);padding:6px;max-height:280px;overflow:auto}.mention-row{display:flex;align-items:center;gap:8px;width:100%;text-align:left}.mention-row.selected{border-color:var(--accent)}.mention-avatar{width:28px;height:28px;border-radius:50%;background:var(--panel2);display:inline-flex;align-items:center;justify-content:center;font-size:12px}.mention-avatar img{width:100%;height:100%;border-radius:50%}.create-channel-modal{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center}.create-channel-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}.create-channel-panel{position:relative;z-index:1;background:var(--panel);border:1px solid var(--line);padding:14px;display:flex;flex-direction:column;gap:8px;min-width:320px;max-width:min(560px,92vw);max-height:88vh;overflow:auto}.create-channel-panel label{display:flex;flex-direction:column;gap:4px;font-size:12px}.create-channel-actions{display:flex;gap:6px;justify-content:flex-end}.create-channel-panel input,.create-channel-panel select,.create-channel-panel textarea{min-height:32px}.create-unsettled{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:30;background:var(--panel);border:1px solid var(--line);padding:10px 12px;display:flex;flex-direction:column;gap:6px;max-width:min(560px,92vw)}';document.head.append(webExtraStyle);
+// Lifecycle controls are deliberately state-driven: a tab never invents a
+// successful archive, role, or membership row while readback is pending.
+let lifecycleFingerprint='',lifecycleHeaderFingerprint='',lifecycleHeaderFocus=null,archiveFingerprint='',memberQueryTimer=null;
+const lifecycleRole=(d)=>['owner','admin'].includes(d?.my_role);
+const lcButton=(parent,text,action,disabled=false)=>{const b=document.createElement('button');b.textContent=text;b.disabled=disabled;b.onclick=()=>act(action);parent.append(b);return b};
+function lcModal(className,title,body){document.querySelector('.'+className)?.remove();const m=document.createElement('div');m.className=className+' lifecycle-modal';const p=document.createElement('div');p.className='lifecycle-panel';p.setAttribute('role','dialog');p.setAttribute('aria-modal','true');p.setAttribute('aria-label',title);const h=document.createElement('h2');h.textContent=title;p.append(h);p.append(body);m.append(p);document.body.append(m);return p}
+function lifecycleModalClose(){document.querySelectorAll('.lifecycle-modal').forEach(x=>x.remove())}
+function lifecycleAdminAction(){const d=state?.channel_details;if(!d)return;const p=lcModal('channel-sheet','Channel actions',document.createElement('div'));const detail=document.createElement('p');detail.textContent=`${d.name} · ${d.kind} · ${d.visibility||'unknown'} · ${d.archived?'Archived':'Active'} · role: ${d.my_role||'unknown'}`;p.append(detail);if(d.description){const about=document.createElement('p');about.textContent=d.description;p.append(about)}const open=(text,action)=>{const b=lcButton(p,text,action);b.onclick=()=>{p.parentElement.remove();act(action)}};open('Manage members',{action:'members',channel:state.selected});if(lifecycleRole(d)){open('Edit channel',{action:'edit_channel'});open(d.archived?'Unarchive':'Archive',{action:d.archived?'unarchive':'archive',channel:state.selected})}const close=document.createElement('button');close.textContent='Close';close.onclick=()=>p.parentElement.remove();p.append(close);p.querySelector('button')?.focus()}
+function renderLifecycleHeader(){const bar=document.querySelector('.topbar'),d=state?.channel_details;if(!bar)return;if(!d){bar.querySelectorAll('[data-lifecycle]').forEach(x=>x.remove());lifecycleHeaderFingerprint='';lifecycleHeaderFocus=null;return}const fp=JSON.stringify([state.selected,d]);if(fp===lifecycleHeaderFingerprint&&bar.querySelector('[data-lifecycle]'))return;lifecycleHeaderFingerprint=fp;bar.querySelectorAll('[data-lifecycle]').forEach(x=>x.remove());const mark=(text,fn,wide=true)=>{const b=document.createElement('button');b.dataset.lifecycle='';b.textContent=text;b.className=wide?'desktop-only':'';b.onclick=fn;bar.insertBefore(b,bar.querySelector('[data-act="search"]'));};mark('Channel details',lifecycleAdminAction,false);mark('Members',()=>act({action:'members',channel:state.selected}),true);if(lifecycleRole(d)){mark('Edit channel',()=>act({action:'edit_channel'}),true);mark(d.archived?'Unarchive':'Archive',()=>act({action:d.archived?'unarchive':'archive',channel:state.selected}),true)}if(lifecycleHeaderFocus){const button=[...bar.querySelectorAll('[data-lifecycle]')].find(x=>x.textContent===lifecycleHeaderFocus);button?.focus({preventScroll:true});lifecycleHeaderFocus=null}}
+function lifecycleField(p,label,value,tag='input'){const l=document.createElement('label');l.textContent=label;const e=document.createElement(tag);e.value=value||'';l.append(e);p.append(l);return e}
+function renderEditLifecycle(){const f=state?.edit_channel;if(!f){document.querySelector('.edit-channel-modal')?.remove();return}if(document.querySelector('.edit-channel-modal')?.dataset.state===f.state)return;const p=lcModal('edit-channel-modal','Edit channel',document.createElement('div'));p.parentElement.dataset.state=f.state;const n=lifecycleField(p,'Name',f.name),d=lifecycleField(p,'Description',f.description,'textarea'),v=lifecycleField(p,'Visibility',f.visibility,'select');['open','private'].forEach(x=>{const o=document.createElement('option');o.value=x;o.textContent=x;o.selected=x===f.visibility;v.append(o)});if(f.failure){const e=document.createElement('p');e.className='error';e.textContent=f.failure;p.append(e)}const submit=lcButton(p,f.state==='creating'?'Saving…':'Save',{action:'edit_channel_submit',community:state.community?.id,name:n.value,description:d.value,visibility:v.value},f.state==='creating'||f.state==='unknown');submit.onclick=()=>act({action:'edit_channel_submit',community:state.community?.id,name:n.value,description:d.value,visibility:v.value});if(f.state==='unknown')lcButton(p,'Refresh', {action:'edit_channel_refresh'});lcButton(p,'Cancel',{action:'edit_channel_close'});n.focus()}
+function memberRow(p,m,admin){const row=document.createElement('div');row.className='member-row';const key=m.pubkey.slice(0,8)+'…';const text=document.createElement('span');text.textContent=`${m.label||key} · ${m.role||'unknown'} · ${key}`;row.append(text);if(admin&&!m.is_self&&!m.last_owner){const role=document.createElement('select');['owner','admin','member','guest','bot'].forEach(r=>{const o=document.createElement('option');o.value=r;o.textContent=r;o.selected=r===m.role;role.append(o)});const rb=lcButton(row,'Change role',{action:'members_role_open',pubkey:m.pubkey,role:role.value});rb.onclick=()=>act({action:'members_role_open',pubkey:m.pubkey,role:role.value});row.append(role);const rm=lcButton(row,'Remove',{action:'members_remove_open',pubkey:m.pubkey});rm.className='danger'}p.append(row)}
+function renderMembersLifecycle(){const m=state?.members;if(!m){document.querySelector('.members-modal')?.remove();lifecycleFingerprint='';return}if(m.community_id&&m.community_id!==state.community?.id||m.generation!=null&&m.generation!==state.generation)return;const fp=JSON.stringify(m);if(fp===lifecycleFingerprint)return;const oldQuery=document.querySelector('.members-modal [data-member-query]'),queryFocused=oldQuery&&document.activeElement===oldQuery,queryCaret=queryFocused?oldQuery.selectionStart:null;const previousExact=document.querySelector('.members-modal [data-exact-key]')?.value||'';lifecycleFingerprint=fp;const p=lcModal('members-modal','Manage members',document.createElement('div'));const admin=lifecycleRole({my_role:m.my_role});let q=null;if(m.loading){const x=document.createElement('p');x.textContent='Loading members…';p.append(x)}if(m.failed){const x=document.createElement('p');x.className='error';x.textContent='Member list failed: '+m.failed;p.append(x);lcButton(p,'Retry',{action:'members_refresh'})}(m.members||[]).forEach(x=>memberRow(p,x,admin));if(admin){lcButton(p,'Add members',{action:'members_add_open'});if(m.picker?.open){q=lifecycleField(p,'Search identities',m.picker.query);q.dataset.memberQuery='';q.oninput=()=>{clearTimeout(memberQueryTimer);memberQueryTimer=setTimeout(()=>act({action:'members_query',query:q.value}),250)};(m.picker.candidates||[]).forEach(c=>{const key=c.pubkey.slice(0,8)+'…';const b=lcButton(p,((m.picker.selected||[]).includes(c.pubkey)?'✓ ':'')+(c.label||key)+' · '+key,{action:'members_toggle',pubkey:c.pubkey});b.setAttribute('aria-label',`${c.label||key} ${c.pubkey}`)});const exact=lifecycleField(p,'Exact public key',previousExact);exact.dataset.exactKey='';const addExact=lcButton(p,'Add exact key',{action:'members_exact'});addExact.onclick=()=>act({action:'members_exact',pubkey:exact.value});const role=lifecycleField(p,'Role','','select');const prompt=document.createElement('option');prompt.value='';prompt.textContent='Select a role';prompt.selected=!m.picker.role_chosen;role.append(prompt);['owner','admin','member','guest','bot'].forEach(r=>{const o=document.createElement('option');o.value=r;o.textContent=r;o.selected=m.picker.role_chosen&&r===m.picker.role;role.append(o)});role.onchange=()=>{if(role.value)act({action:'members_role',role:role.value})};lcButton(p,'Confirm add',{action:'members_add_submit',community:state.community?.id},!(m.picker.selected||[]).length||!m.picker.role_chosen||m.picker.writing);(m.picker.results||[]).forEach(result=>{const line=document.createElement('p');line.textContent=`${result.pubkey.slice(0,8)}… · ${result.status}${result.error?' · '+result.error:''}`;p.append(line)})}}if(m.confirm){const c=document.createElement('p');c.className='notice';c.textContent=m.confirm.kind==='leave'?`Leave ${m.channel_name}? ${m.confirm.last_owner_warning?'You are the last owner; relay may refuse.':''}`:m.confirm.kind==='remove'?`Remove ${m.confirm.label} (${m.confirm.pubkey})?`:`Change ${m.confirm.label} (${m.confirm.pubkey}) to ${m.confirm.role}?`;p.append(c);lcButton(p,'Confirm',{action:'members_confirm',community:state.community?.id});lcButton(p,'Cancel',{action:'members_confirm_cancel'})}if(m.my_role)lcButton(p,'Leave channel',{action:'members_leave_open'});lcButton(p,'Close',{action:'members_close'});if(queryFocused&&q){q.focus({preventScroll:true});if(queryCaret!=null)try{q.setSelectionRange(queryCaret,queryCaret)}catch(_){} }else p.querySelector('button')?.focus()}
+function renderLifecycleExtras(){if(!state)return;renderLifecycleHeader();document.querySelector('.filters')&&!document.querySelector('[data-filter="Archived"]')&&(()=>{const b=document.createElement('button');b.dataset.filter='Archived';b.textContent='Archived';b.onclick=()=>act({action:'filter',filter:'Archived'});document.querySelector('.filters').append(b)})();const f=state.channels?.find(x=>x.id===state.selected);document.querySelectorAll('.channel').forEach(b=>{const c=state.channels.find(x=>x.id===b.dataset.channel);if(c?.archived&&!b.querySelector('.archived-label')){const a=document.createElement('span');a.className='count archived-label';a.textContent='archived';b.append(a)}});if(state.composer_blocked){const t=document.querySelector('#composer'),s=document.querySelector('[data-act="send"]');if(t){t.disabled=true;t.placeholder=state.composer_blocked}if(s)s.disabled=true}renderEditLifecycle();renderArchiveLifecycle();renderMembersLifecycle()}
+function renderArchiveLifecycle(){const a=state?.archive;if(!a){document.querySelector('.archive-modal')?.remove();archiveFingerprint='';return}const fp=JSON.stringify([a,state.community?.id]);if(fp===archiveFingerprint)return;archiveFingerprint=fp;const p=lcModal('archive-modal',a.unarchive?'Unarchive channel':'Archive channel',document.createElement('div'));const d=document.createElement('p');d.textContent=`${a.unarchive?'Restore':'Archive'} ${a.channel_name} in ${state.community?.name||'current community'}?`;p.append(d);if(a.failure){const e=document.createElement('p');e.className='error';e.textContent=a.failure;p.append(e)}lcButton(p,a.state==='creating'?'Working…':a.unarchive?'Unarchive':'Archive',{action:'archive_confirm',community:state.community?.id},a.state==='creating'||a.state==='unknown');if(a.state==='unknown')lcButton(p,'Refresh',{action:'archive_refresh'});lcButton(p,'Cancel',{action:'archive_close'});p.querySelector('button')?.focus()}
+document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;if(document.querySelector('.lifecycle-modal')){e.preventDefault();lifecycleModalClose();if(state?.edit_channel)act({action:'edit_channel_close'});else if(state?.members)act({action:'members_close'});else if(state?.archive)act({action:'archive_close'})}});
+const lifecycleStyle=document.createElement('style');lifecycleStyle.textContent='.lifecycle-modal{position:fixed;inset:0;z-index:45;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center}.lifecycle-panel{background:var(--panel);border:1px solid var(--line);padding:18px;max-height:90vh;overflow:auto;width:min(560px,calc(100% - 24px));display:flex;flex-direction:column;gap:10px}.lifecycle-panel label{display:flex;flex-direction:column;gap:4px}.member-row{display:flex;align-items:center;gap:8px;justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 0}.danger{color:var(--danger)}.archived-label{margin-left:auto}@media(max-width:899px){.lifecycle-panel{inset:0;width:100%;max-height:none;height:100%;border:0;border-radius:0}.desktop-only{display:none!important}}';document.head.append(lifecycleStyle);setInterval(renderLifecycleExtras,100);
 </script></body></html>"##;
 
 struct WebState {
@@ -166,6 +183,13 @@ struct ActionRequest {
     channel_type: Option<String>,
     visibility: Option<String>,
     description: Option<String>,
+    /// The identity a membership action targets, as a canonical hex pubkey.
+    /// The browser never shortens or resolves it: the session owns identity
+    /// normalization.
+    pubkey: Option<String>,
+    /// The role an add or a role change applies: owner, admin, member, guest
+    /// or bot, per the shared vocabulary.
+    role: Option<String>,
 }
 
 #[derive(Debug)]
@@ -660,6 +684,10 @@ async fn action(
         }
         let any_write_pending =
             guard.app.web_write_pending() || guard.views.values().any(App::web_write_pending);
+        let pending_summary = guard
+            .app
+            .pending_write_summary()
+            .or_else(|| guard.views.values().find_map(App::pending_write_summary));
         let app = guard
             .views
             .get_mut(session)
@@ -669,9 +697,14 @@ async fn action(
         match request.action.as_str() {
             "community" => {
                 if any_write_pending {
-                    return Err(
-                        "a pending or uncertain write blocks community switching".to_owned()
-                    );
+                    return Err(match pending_summary {
+                        Some(summary) => format!(
+                            "a pending or uncertain write blocks community switching: {summary}"
+                        ),
+                        None => {
+                            "a pending or uncertain write blocks community switching".to_owned()
+                        }
+                    });
                 }
                 let id = request
                     .community
@@ -725,6 +758,72 @@ async fn action(
                 apply_create_fields(app, &request)?;
                 app.create_channel_submit();
             }
+            "edit_channel" => app.open_edit_channel(),
+            "edit_channel_close" => {
+                app.close_edit_channel();
+            }
+            "edit_channel_refresh" => app.refresh_edit_channel(),
+            "edit_channel_submit" => {
+                ensure_community(app, &request)?;
+                apply_edit_fields(app, &request)?;
+                app.edit_channel_submit();
+            }
+            "archive" => {
+                let channel = parse_channel(request.channel.as_deref())?;
+                app.open_archive(channel);
+            }
+            "unarchive" => {
+                let channel = parse_channel(request.channel.as_deref())?;
+                app.open_unarchive(channel);
+            }
+            "archive_close" => app.close_archive(),
+            "archive_confirm" => {
+                ensure_community(app, &request)?;
+                app.confirm_archive();
+            }
+            "archive_refresh" => app.refresh_archive(),
+            "members" => {
+                let channel = parse_channel(request.channel.as_deref())?;
+                app.open_members(channel);
+            }
+            "members_close" => app.close_members(),
+            "members_refresh" => app.refresh_members(),
+            "members_add_open" => app.members_picker_open(),
+            "members_add_close" => app.members_picker_close(),
+            "members_query" => {
+                app.members_picker_query(request.query.as_deref().unwrap_or_default())
+            }
+            "members_toggle" => {
+                let pubkey = request.pubkey.as_deref().ok_or("pubkey is required")?;
+                app.members_picker_toggle(pubkey);
+            }
+            "members_exact" => {
+                let pubkey = request.pubkey.as_deref().ok_or("pubkey is required")?;
+                app.members_picker_exact(pubkey)?;
+            }
+            "members_role" => {
+                let role = parse_role(request.role.as_deref())?;
+                app.members_picker_role(role);
+            }
+            "members_add_submit" => {
+                ensure_community(app, &request)?;
+                app.members_picker_submit();
+            }
+            "members_role_open" => {
+                let pubkey = request.pubkey.as_deref().ok_or("pubkey is required")?;
+                let role = parse_role(request.role.as_deref())?;
+                app.members_role_open(pubkey, role);
+            }
+            "members_remove_open" => {
+                let pubkey = request.pubkey.as_deref().ok_or("pubkey is required")?;
+                app.members_remove_open(pubkey);
+            }
+            "members_leave_open" => app.members_leave_open(),
+            "members_confirm" => {
+                ensure_community(app, &request)?;
+                app.members_confirm();
+            }
+            "members_confirm_cancel" => app.members_confirm_cancel(),
             "select" => {
                 let id = parse_channel(request.channel.as_deref())?;
                 app.web_select_channel(id)?;
@@ -887,6 +986,39 @@ async fn action(
     send_commands(&sender, commands).await;
     Ok(reply)
 }
+fn ensure_community(app: &App, request: &ActionRequest) -> Result<(), String> {
+    if let Some(id) = request.community.as_deref()
+        && app.community_id.as_deref().unwrap_or_default() != id
+    {
+        return Err("the active community changed; reopen the form and submit again".to_owned());
+    }
+    Ok(())
+}
+
+fn parse_role(raw: Option<&str>) -> Result<MemberRole, String> {
+    raw.ok_or_else(|| "role is required".to_owned())?
+        .parse()
+        .map_err(|_| "unsupported role".to_owned())
+}
+
+fn apply_edit_fields(app: &mut App, request: &ActionRequest) -> Result<(), String> {
+    let Some(form) = app.edit_channel.as_mut() else {
+        return Err("no channel edit is open".to_owned());
+    };
+    if let Some(name) = request.name.as_deref() {
+        form.name = name.to_owned();
+    }
+    if let Some(description) = request.description.as_deref() {
+        form.description = description.to_owned();
+    }
+    if let Some(visibility) = request.visibility.as_deref() {
+        form.visibility = visibility
+            .parse::<buzz_core::channel::ChannelVisibility>()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// Apply one submit's fields onto the form the session owns. The browser
 /// reads the form back from the projection, so the values it sends are the
 /// values it showed, and the session's copy is what the preflight sees.
@@ -1085,12 +1217,82 @@ async fn snapshot(state: &Arc<Mutex<WebState>>, session: &str) -> Vec<u8> {
             "state": state_name,
         })
     });
+    let channel_details = app.channel_details().map(|details| {
+        json!({
+            "name": details.name, "description": details.description,
+            "visibility": details.visibility.map(|v| v.as_str()),
+            "kind": channel_kind(details.kind), "archived": details.archived,
+            "my_role": details.my_role.map(|r| r.as_str()),
+        })
+    });
+    let lifecycle_state = |state: &CreateState| match state {
+        CreateState::Editing => "editing",
+        CreateState::Creating => "creating",
+        CreateState::Failed(_) => "failed",
+        CreateState::Unknown(_) => "unknown",
+    };
+    let edit_channel = app.edit_channel.as_ref().map(|form| json!({
+        "channel": form.channel, "name": form.name, "description": form.description,
+        "visibility": form.visibility.as_str(), "state": lifecycle_state(&form.state),
+        "failure": match &form.state { CreateState::Failed(e) | CreateState::Unknown(e) => Some(e), _ => None },
+    }));
+    let archive = app.archive.as_ref().map(|form| json!({
+        "channel": form.channel, "channel_name": form.channel_name, "unarchive": form.unarchive,
+        "state": lifecycle_state(&form.state),
+        "failure": match &form.state { CreateState::Failed(e) | CreateState::Unknown(e) => Some(e), _ => None },
+    }));
+    let members = app.members.as_ref().map(|panel| {
+        let rows = panel
+            .members
+            .iter()
+            .map(|row| {
+                json!({
+                    "pubkey": row.pubkey, "label": row.label, "role": row.role.map(|r| r.as_str()),
+                    "agent": row.agent, "is_self": row.is_self, "last_owner": row.last_owner,
+                })
+            })
+            .collect::<Vec<_>>();
+        let candidates = panel
+            .picker
+            .candidates
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "pubkey": candidate.pubkey, "label": candidate.label, "agent": candidate.agent,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "channel": panel.channel, "channel_name": panel.channel_name, "loading": panel.loading,
+            "failed": panel.failed, "members": rows, "my_role": panel.my_role.map(|r| r.as_str()),
+            "generation": panel.generation, "complete": panel.complete,
+            "picker": {"open": panel.picker.open, "query": panel.picker.query,
+                "loading": panel.picker.loading, "failed": panel.picker.failed,
+                "candidates": candidates, "selected": panel.picker.selected,
+                "role": panel.picker.role.as_str(), "role_chosen": panel.picker.role_chosen,
+                "results": panel.picker.results.iter().map(|result| json!({
+                    "pubkey": result.pubkey, "status": format!("{:?}", result.status),
+                    "error": result.error,
+                })).collect::<Vec<_>>()},
+            "confirm": panel.confirm.as_ref().map(|confirm| match confirm {
+                crate::app::MemberConfirm::Remove { pubkey, label } =>
+                    json!({"kind":"remove","pubkey":pubkey,"label":label}),
+                crate::app::MemberConfirm::ChangeRole { pubkey, label, role } =>
+                    json!({"kind":"role","pubkey":pubkey,"label":label,"role":role.as_str()}),
+                crate::app::MemberConfirm::Leave { last_owner_warning } =>
+                    json!({"kind":"leave","last_owner_warning":last_owner_warning}),
+            }),
+        })
+    });
     let selected = app
         .channels
         .get(app.selected)
         .map(|entry| entry.id.to_string());
     let channels: Vec<Value> = app.channels.iter().map(|entry| json!({
-        "id": entry.id.to_string(), "name": app.label(entry), "kind": channel_kind(entry.kind), "matched": app.filter.matches(entry),
+        "id": entry.id.to_string(), "name": app.label(entry), "kind": channel_kind(entry.kind),
+        "description": entry.description, "visibility": entry.visibility.as_ref().map(|v| v.as_str()),
+        "my_role": entry.my_role.as_ref().map(|r| r.as_str()), "archived": entry.archived,
+        "matched": app.filter.matches(entry),
         "unread": app.unread_count(entry), "marker": marker(app.marker(entry)), "typing": app.is_typing(entry.id, now_secs()),
     })).collect();
     let rows = app
@@ -1220,6 +1422,20 @@ async fn snapshot(state: &Arc<Mutex<WebState>>, session: &str) -> Vec<u8> {
         json!(app.mode == Mode::Composer),
     );
     body.insert("write_pending".to_owned(), json!(app.web_write_pending()));
+    body.insert("composer_blocked".to_owned(), json!(app.composer_blocked()));
+    body.insert("channel_details".to_owned(), json!(channel_details));
+    body.insert("edit_channel".to_owned(), json!(edit_channel));
+    body.insert("archive".to_owned(), json!(archive));
+    body.insert("members".to_owned(), json!(members));
+    body.insert(
+        "role_chosen".to_owned(),
+        json!(
+            members
+                .as_ref()
+                .and_then(|m| m.get("picker"))
+                .and_then(|p| p.get("role_chosen"))
+        ),
+    );
     body.insert("mention_suggestions".to_owned(), json!(mention_suggestions));
     body.insert("mention_block".to_owned(), json!(mention_block));
     body.insert("create_channel".to_owned(), json!(create_channel));

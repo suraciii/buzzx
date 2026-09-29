@@ -445,6 +445,13 @@ fn channels_list_returns_one_object_per_channel() {
         "",
         12,
     ));
+    relay.seed(&event(
+        &relay_keys,
+        39000,
+        vec![d_tag(unnamed), Tag::parse(["t", "stream"]).unwrap()],
+        "",
+        13,
+    ));
 
     let (code, json, stderr) = run(&relay.url, &keys, &["channels", "list"], None);
     assert_eq!(code, 0, "stderr: {stderr}");
@@ -456,6 +463,27 @@ fn channels_list_returns_one_object_per_channel() {
             {"channel_id": named, "name": "buzzx-cli", "community": {"id": null, "name": "default", "relay_url": relay.url}},
         ])
     );
+}
+#[test]
+fn an_undescribed_channel_is_incomplete_not_a_successful_list() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    let source = keys();
+    relay.seed(&event(
+        &source,
+        39002,
+        vec![
+            d_tag(CHANNEL),
+            Tag::parse(["p", me.public_key().to_hex().as_str()]).unwrap(),
+        ],
+        "",
+        10,
+    ));
+    let (code, result, stderr) = run(&relay.url, &me, &["channels", "list"], None);
+    assert_eq!(code, 2, "{stderr}");
+    assert_eq!(result["status"], "incomplete");
+    assert_eq!(result["error"], "timeout_unknown");
+    assert_eq!(result["channels"][0]["channel_id"], CHANNEL);
 }
 
 #[test]
@@ -595,6 +623,7 @@ fn messages_thread_returns_the_root_first() {
 fn messages_send_confirms_with_the_relays_id_and_keeps_stdin_bytes() {
     let relay = FakeRelay::start();
     let keys = keys();
+    seed_send_channel(&relay, &keys);
     let content = "first line\n\nsecond line\n";
     let (code, json, stderr) = run(
         &relay.url,
@@ -627,6 +656,7 @@ fn messages_send_returns_the_canonical_id_the_relay_reports() {
     let relay = FakeRelay::start();
     relay.answer(WriteAnswer::Recanonicalized);
     let keys = keys();
+    seed_send_channel(&relay, &keys);
     let (code, json, stderr) = run(
         &relay.url,
         &keys,
@@ -652,9 +682,158 @@ fn messages_send_returns_the_canonical_id_the_relay_reports() {
 }
 
 #[test]
+fn archived_and_guest_channels_never_submit_a_message() {
+    for (role, archived, reason) in [
+        ("owner", true, "channel is archived"),
+        ("guest", false, "guests cannot send to this channel"),
+    ] {
+        let relay = FakeRelay::start();
+        let sender = keys();
+        let source = keys();
+        let pubkey = sender.public_key().to_hex();
+        relay.seed(&event(
+            &source,
+            39002,
+            vec![
+                d_tag(CHANNEL),
+                Tag::parse(["p", &pubkey, "", role]).unwrap(),
+            ],
+            "",
+            50,
+        ));
+        let mut metadata = vec![d_tag(CHANNEL), Tag::parse(["t", "stream"]).unwrap()];
+        if archived {
+            metadata.push(Tag::parse(["archived", "true"]).unwrap());
+        }
+        relay.seed(&event(&source, 39000, metadata, "", 51));
+        let (code, result, stderr) = run(
+            &relay.url,
+            &sender,
+            &[
+                "messages",
+                "send",
+                "--channel",
+                CHANNEL,
+                "--content",
+                "hello",
+            ],
+            None,
+        );
+        assert_eq!(code, 3, "{stderr}");
+        assert_eq!(result["status"], "not_sent");
+        assert_eq!(result["error"], "forbidden");
+        assert_eq!(result["message"], reason);
+        assert!(relay.writes().is_empty());
+    }
+}
+
+#[test]
+fn incomplete_membership_roles_do_not_authorize_owner_removal() {
+    for role in [None, Some("invalid-role")] {
+        let relay = FakeRelay::start();
+        let owner = keys();
+        let source = keys();
+        let pubkey = owner.public_key().to_hex();
+        let member_tag = match role {
+            Some(value) => Tag::parse(["p", pubkey.as_str(), "", value]).unwrap(),
+            None => Tag::parse(["p", pubkey.as_str()]).unwrap(),
+        };
+        relay.seed(&event(
+            &source,
+            39002,
+            vec![d_tag(CHANNEL), member_tag],
+            "",
+            50,
+        ));
+        relay.seed(&event(
+            &source,
+            39000,
+            vec![d_tag(CHANNEL), Tag::parse(["t", "stream"]).unwrap()],
+            "",
+            51,
+        ));
+
+        let (code, result, stderr) = run(
+            &relay.url,
+            &owner,
+            &["channels", "members", "--channel", CHANNEL],
+            None,
+        );
+        assert_eq!(code, 2, "incomplete roster must fail: {stderr}");
+        assert_eq!(result["complete"], false);
+        assert_eq!(result["status"], "incomplete");
+
+        let (code, result, stderr) = run(
+            &relay.url,
+            &owner,
+            &[
+                "channels",
+                "remove-member",
+                "--channel",
+                CHANNEL,
+                "--pubkey",
+                &pubkey,
+            ],
+            None,
+        );
+        assert_ne!(
+            code, 0,
+            "unknown owner role cannot authorize removal: {stderr}"
+        );
+        assert_eq!(result["status"], "refused");
+        assert!(relay.writes().is_empty());
+    }
+}
+
+#[test]
+
+fn a_dm_without_a_channel_role_remains_writable() {
+    let relay = FakeRelay::start();
+    let sender = keys();
+    let other = keys();
+    let source = keys();
+    let key = sender.public_key().to_hex();
+    relay.seed(&event(
+        &source,
+        39002,
+        vec![d_tag(CHANNEL), Tag::parse(["p", &key]).unwrap()],
+        "",
+        50,
+    ));
+    relay.seed(&event(
+        &source,
+        39000,
+        vec![
+            d_tag(CHANNEL),
+            Tag::parse(["t", "dm"]).unwrap(),
+            Tag::parse(["p", other.public_key().to_hex().as_str()]).unwrap(),
+        ],
+        "",
+        51,
+    ));
+    let (code, result, stderr) = run(
+        &relay.url,
+        &sender,
+        &[
+            "messages",
+            "send",
+            "--channel",
+            CHANNEL,
+            "--content",
+            "hello",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(result["status"], "sent_confirmed");
+    assert_eq!(relay.writes().len(), 1);
+}
+
+#[test]
 fn messages_reply_derives_the_channel_and_the_thread_from_the_target() {
     let relay = FakeRelay::start();
     let keys = keys();
+    seed_send_channel(&relay, &keys);
     let root = message(&keys, "root", 100);
     relay.seed(&root);
 
@@ -723,6 +902,7 @@ fn a_refused_write_is_not_sent() {
     let relay = FakeRelay::start();
     relay.answer(WriteAnswer::Refused);
     let keys = keys();
+    seed_send_channel(&relay, &keys);
     let (code, json, stderr) = run(
         &relay.url,
         &keys,
@@ -749,6 +929,7 @@ fn a_lost_answer_is_unconfirmed_and_never_retried() {
     let relay = FakeRelay::start();
     relay.answer(WriteAnswer::Lost);
     let keys = keys();
+    seed_send_channel(&relay, &keys);
     let (code, json, stderr) = run(
         &relay.url,
         &keys,
@@ -1000,6 +1181,7 @@ fn a_write_refused_without_naming_the_identity_exits_four() {
     let relay = FakeRelay::start();
     relay.answer(WriteAnswer::RefusedBadRequest);
     let keys = keys();
+    seed_send_channel(&relay, &keys);
     let (code, json, stderr) = run(
         &relay.url,
         &keys,
@@ -1025,6 +1207,7 @@ fn a_relay_failure_after_a_write_exits_by_its_category() {
     let relay = FakeRelay::start();
     relay.answer(WriteAnswer::ServerError);
     let keys = keys();
+    seed_send_channel(&relay, &keys);
     let (code, json, stderr) = run(
         &relay.url,
         &keys,
@@ -1054,6 +1237,7 @@ fn a_relay_failure_after_a_reply_keeps_the_reply_ids() {
     let keys = keys();
     let root = message(&keys, "root", 100);
     relay.seed(&root);
+    seed_send_channel(&relay, &keys);
     relay.answer(WriteAnswer::ServerError);
     let (code, json, stderr) = run(
         &relay.url,
@@ -1183,12 +1367,17 @@ fn a_startup_failure_prints_one_json_error() {
     }
 }
 
-/// Seed a channel roster: the kind 39002 event names each member with its
-/// role, and each member's kind 0 event carries the display name the mention
-/// preflight matches on.
-fn seed_roster(relay: &FakeRelay, channel: &str, members: &[(&Keys, &str, &str)]) {
+/// Seed the active relay's channel metadata and the sender's owner role.
+fn seed_send_channel(relay: &FakeRelay, sender: &Keys) {
+    seed_roster(relay, CHANNEL, sender, &[]);
+}
+
+/// Seed a channel roster: kind 39002 names each member and its role, kind
+/// 39000 describes the channel, and kind 0 resolves member display names.
+fn seed_roster(relay: &FakeRelay, channel: &str, owner: &Keys, members: &[(&Keys, &str, &str)]) {
     let relay_keys = Keys::generate();
     let mut tags = vec![d_tag(channel)];
+    tags.push(Tag::parse(["p", owner.public_key().to_hex().as_str(), "", "owner"]).unwrap());
     for (member, role, _) in members {
         tags.push(
             Tag::parse(["p", member.public_key().to_hex().as_str(), "", role])
@@ -1196,6 +1385,13 @@ fn seed_roster(relay: &FakeRelay, channel: &str, members: &[(&Keys, &str, &str)]
         );
     }
     relay.seed(&event(&relay_keys, 39002, tags, "", 50));
+    relay.seed(&event(
+        &relay_keys,
+        39000,
+        vec![d_tag(channel), Tag::parse(["t", "stream"]).unwrap()],
+        "",
+        52,
+    ));
     for (member, _, name) in members {
         relay.seed(&event(
             member,
@@ -1221,7 +1417,7 @@ fn a_cli_send_signs_the_member_a_visible_name_names() {
     let relay = FakeRelay::start();
     let me = keys();
     let member = keys();
-    seed_roster(&relay, CHANNEL, &[(&member, "member", "Buzzx Build")]);
+    seed_roster(&relay, CHANNEL, &me, &[(&member, "member", "Buzzx Build")]);
 
     let (code, json, stderr) = run(
         &relay.url,
@@ -1260,7 +1456,7 @@ fn an_unknown_name_blocks_a_cli_send_without_a_write() {
     let relay = FakeRelay::start();
     let me = keys();
     let member = keys();
-    seed_roster(&relay, CHANNEL, &[(&member, "member", "Buzzx Build")]);
+    seed_roster(&relay, CHANNEL, &me, &[(&member, "member", "Buzzx Build")]);
 
     let (code, json, stderr) = run(
         &relay.url,
@@ -1302,6 +1498,7 @@ fn an_ambiguous_name_blocks_with_exact_references() {
     seed_roster(
         &relay,
         CHANNEL,
+        &me,
         &[
             (&first, "member", "Buzzx Build"),
             (&second, "bot", "Buzzx Build"),
@@ -1345,7 +1542,12 @@ fn a_cli_reply_carries_the_recipients_with_the_thread_tags() {
     let member = keys();
     let root = message(&me, "root", 100);
     relay.seed(&root);
-    seed_roster(&relay, CHANNEL, &[(&member, "member", "Buzzx Product")]);
+    seed_roster(
+        &relay,
+        CHANNEL,
+        &me,
+        &[(&member, "member", "Buzzx Product")],
+    );
 
     let (code, json, stderr) = run(
         &relay.url,
@@ -1578,4 +1780,62 @@ fn channels_create_rejects_invalid_fields_before_the_relay() {
     }
     assert!(relay.writes().is_empty(), "nothing reached the relay");
     assert_eq!(relay.queries(), 0, "no channel event was even prepared");
+}
+
+#[test]
+fn member_commands_reject_noncanonical_pubkeys_before_writing() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    let too_long = format!("{}0", "ab".repeat(32));
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &[
+            "channels",
+            "add-member",
+            "--channel",
+            CHANNEL,
+            "--pubkey",
+            &too_long,
+        ],
+        None,
+    );
+    assert_eq!(code, 1, "invalid key is bad input: {stderr}");
+    assert_eq!(json["status"], "refused");
+    assert_eq!(json["error"], "invalid_input");
+    assert_eq!(json["channel_id"], CHANNEL);
+    assert!(relay.writes().is_empty());
+}
+
+#[test]
+fn channels_get_projects_type_and_untagged_visibility() {
+    let relay = FakeRelay::start();
+    let me = keys();
+    let source = keys();
+    relay.seed(&event(
+        &source,
+        39002,
+        vec![
+            d_tag(CHANNEL),
+            Tag::parse(["p", me.public_key().to_hex().as_str(), "", "member"]).unwrap(),
+        ],
+        "",
+        10,
+    ));
+    relay.seed(&event(
+        &source,
+        39000,
+        vec![d_tag(CHANNEL), Tag::parse(["t", "forum"]).unwrap()],
+        "",
+        11,
+    ));
+    let (code, json, stderr) = run(
+        &relay.url,
+        &me,
+        &["channels", "get", "--channel", CHANNEL],
+        None,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(json["type"], "forum");
+    assert_eq!(json["visibility"], "open");
 }
