@@ -3378,6 +3378,12 @@ impl App {
     }
 
     fn set_focus(&mut self, index: usize) {
+        // The channel remains a snapshot while Thread owns input. Background
+        // events may reshuffle its rows, but must not move its focus or call
+        // note_presented (which is the read-frontier transition).
+        if self.thread.open {
+            return;
+        }
         let len = self.selected_rows().len();
         self.focus = len.saturating_sub(1).min(index);
         // A move is a choice: the cursor is on a row the reader picked.
@@ -5217,13 +5223,21 @@ impl App {
         if self.journey.is_some() {
             return;
         }
-        let Some(channel) = self.selected_entry().map(|entry| entry.id) else {
+        let Some(channel) = self.action_channel() else {
             return;
+        };
+        let focused = self.action_row().map(|row| row.event_id.clone());
+        let focus = if self.context.open {
+            self.context.focus
+        } else if self.thread.open {
+            self.thread.focus
+        } else {
+            self.focus
         };
         self.journey = Some(SearchJourney {
             channel,
-            focused: self.focused_row().map(|row| row.event_id.clone()),
-            focus: self.focus,
+            focused,
+            focus,
             composer: self.composer.clone(),
             thread: self.thread.open.then(|| self.thread.clone()),
             thread_return_context: self.thread_return_context,
@@ -6277,6 +6291,9 @@ impl App {
         self.help = false;
         self.switcher = None;
         self.agents.open = false;
+        // A channel entry always starts a fresh origin. In particular, do not
+        // inherit the context return bit from a previously closed context.
+        self.thread_return_context = false;
         self.thread = ThreadView {
             open: true,
             channel,
@@ -8174,7 +8191,10 @@ impl App {
                 self.help = false;
                 return;
             }
-            Action::OpenSearch => self.open_search(true, now),
+            // Ctrl+F belongs to the channel composer/search path. A Thread
+            // composer is isolated: its only escape is back to Thread
+            // navigation, not a second surface over the modal.
+            Action::OpenSearch if !self.thread.open => self.open_search(true, now),
             Action::Quit => self.quit = true,
             Action::ComposerInput(c) => self.composer.input(c),
             Action::ComposerBackspace => self.composer.backspace(),
@@ -10689,6 +10709,19 @@ mod tests {
     }
 
     #[test]
+    fn thread_keeps_background_focus_fixed_until_return() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        let origin_focus = app.focus;
+        app.set_focus(usize::MAX);
+        assert_eq!(app.focus, origin_focus);
+        app.handle(Action::ThreadLeave, 41);
+        assert!(!app.thread.open);
+        assert_eq!(app.focus, origin_focus);
+    }
+
+    #[test]
     fn the_thread_holds_the_conversation_keys() {
         let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
         app.set_focus(0);
@@ -10708,6 +10741,18 @@ mod tests {
         assert!(app.switcher.is_none());
         assert!(!app.agents.open);
         assert!(app.thread.open);
+    }
+
+    #[test]
+    fn thread_composer_does_not_open_channel_search() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        app.mode = Mode::Composer;
+        app.handle(Action::OpenSearch, 41);
+        assert!(app.thread.open);
+        assert!(!app.search.open);
     }
 
     #[test]

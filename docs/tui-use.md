@@ -736,20 +736,16 @@ An empty timeline or an unconfirmed local send cannot open a thread. Keep the
 current view and explain why. Do not change the existing `Enter` reply shortcut
 in the channel timeline.
 
-The thread uses one full-screen timeline at every supported size. Show the
-channel label, `Thread`, and `Esc: back`; do not add a split pane or nested
-navigation stack. The root is the first row, followed by loaded replies in
-chronological order. Focus the message used to enter when it is available;
-otherwise focus the root and report that the selected reply was not loaded.
+At 80 columns and 12 rows or larger, Thread is a centered, page-level modal
+over a dimmed, read-only channel snapshot. At 112 columns and 16 rows its
+width is capped at 96 cells; at 80–111 columns it leaves two cells on each
+side. Below 80 columns it remains full-screen, including 40x10 and 24x6.
+The backdrop cannot receive keys, compose a second draft, or advance the
+channel read marker. The modal border names Thread and its source event; its
+header names the channel and reserves `Esc: back`. The root is the first row,
+followed by loaded replies in chronological order. Focus the entry event when
+available; otherwise focus the root and report that the selected reply was not loaded.
 The root scrolls normally; it is not pinned above every reply.
-
-```text diagram
-#general / Thread
-  Alice: Can we ship this?
-> Build: Checks passed.
-  Product: One acceptance case remains.
-Enter: reply   i: reply to root   Esc: back
-```
 
 Within this view, `j`/`k` and arrows move message focus at all widths.
 `g`/`G`, Home/End, PgUp/PgDn, help, and quit retain their timeline meaning.
@@ -864,7 +860,7 @@ Thread reading does not advance the channel read frontier: other discussions
 may be unseen. On return, the ordinary channel presentation rules decide when
 read progress advances. No new persistent read state is introduced.
 
-### Thread view layout
+### Thread view layout (modal on wide terminals)
 
 These are proposed frames with sample messages, not implementation screenshots.
 Blank lines count toward the height; trailing padding is omitted. Each line
@@ -885,25 +881,24 @@ state text work without color. Authors are labels, not notification syntax.
 
 Reading has no empty composer border. At 24x6 it leaves three message rows;
 composing leaves one context row. At larger sizes use the existing multi-line
-composer, provided all other regions still fit. At 79x12 use the same single
-column as 80x12 with width-dependent wrapping, never a sidebar. The target is
-an explicit label, never inferred from the currently visible timeline row.
+composer, provided all other regions still fit. At 79x12 Thread takes the
+whole width; at 80x12 the bordered modal uses 76 columns and stays readable.
+The target is an explicit label, never inferred from the currently visible
+timeline row.
 
 #### 80x12: reading
 
 ```text diagram
-Thread / #buzzx-tui                                             Esc: back
-  Alice  2m  [root]
-  Can we ship the mention fix?
-
-> Buzzx Build  1m
-  Checks passed. The installed version is ready.
-
-  Product  30s
-  I will verify the recipient readback.
-
-j/k: move  Enter: reply  i: root  ?: help
-Connected
+  + Thread ------------------------------------------------------------------+
+  |Thread / #buzzx-tui                                              Esc: back|
+  |  Alice  2m  [root]                                                        |
+  |  Can we ship the mention fix?                                            |
+  |> Buzzx Build  1m                                                         |
+  |  Checks passed. The installed version is ready.                        |
+  |                                                                          |
+  |j/k: move  Enter: reply  i: root  ?: help                                 |
+  |connected                                                                 |
+  + from: 123456789abc... --------------------------------------------------+
 ```
 
 #### 40x10: replying
