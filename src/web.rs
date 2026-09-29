@@ -812,7 +812,7 @@ async fn action(
                 }
                 app.composer
                     .set_text(request.content.as_deref().unwrap_or_default());
-                app.handle(Action::ComposerSend, now);
+                app.handle(Action::ComposerSendLiteral, now);
             }
             "search" => {
                 app.handle(Action::OpenSearch, now);
@@ -1405,6 +1405,7 @@ async fn response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::Keys;
 
     #[test]
     fn access_query_requires_the_exact_parameter() {
@@ -1479,9 +1480,60 @@ mod tests {
         }))
     }
 
-    /// The page names the community it read from the snapshot, and a run
-    /// started from a relay flag has no saved profile: the empty id must not
-    /// read as "the tab moved on" and refuse the submit.
+    #[tokio::test]
+    async fn action_route_sends_slash_search_as_literal_content() {
+        let mut app = App::new(&Keys::generate(), "http://relay.test");
+        let channel = Uuid::new_v4();
+        app.channels.push(App::stub_entry(channel, "general"));
+        let (commands, mut received) = mpsc::channel(8);
+        let state = Arc::new(Mutex::new(WebState {
+            app: app.clone(),
+            views: HashMap::from([("session".to_owned(), app.web_fork())]),
+            commands,
+            run_token: "token".to_owned(),
+            sessions: HashSet::from(["session".to_owned()]),
+            stopped: false,
+            startup_error: None,
+            communities: Vec::new(),
+            active_community_id: None,
+            transport_generation: 0,
+        }));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            serve_connection(stream, peer, server_state, &format!("http://{}", address)).await;
+        });
+        let body = br#"{"action":"send","content":"/search old decision"}"#;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /api/action HTTP/1.1\r\nHost: {}\r\nCookie: buzzx_session=session\r\nContent-Length: {}\r\n\r\n",
+                    address,
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        client.write_all(body).await.unwrap();
+        let mut response_body = Vec::new();
+        client.read_to_end(&mut response_body).await.unwrap();
+        server.await.unwrap();
+
+        assert!(String::from_utf8_lossy(&response_body).starts_with("HTTP/1.1 200"));
+        assert!(matches!(
+            received.recv().await,
+            Some(SessionCommand::Send { channel: sent_channel, content, .. })
+                if sent_channel == channel && content == "/search old decision"
+        ));
+        let guard = state.lock().await;
+        assert!(!guard.views["session"].search.open);
+    }
+
     #[tokio::test]
     async fn a_submit_without_a_saved_profile_is_not_a_community_change() {
         let state = web_state();
@@ -1505,7 +1557,6 @@ mod tests {
         assert_eq!(form.state, CreateState::Creating);
     }
 
-    /// A tab that composed under another profile is still refused.
     #[tokio::test]
     async fn a_submit_naming_another_profile_is_refused() {
         let state = web_state();

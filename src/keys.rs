@@ -124,6 +124,7 @@ pub enum Action {
     ComposerInput(char),
     ComposerBackspace,
     ComposerNewline,
+    SlashComplete,
     ComposerCursorUp,
     ComposerCursorDown,
     ComposerCursorLeft,
@@ -134,6 +135,8 @@ pub enum Action {
     /// composer on the second press.
     ComposerEscape,
     ComposerSend,
+    /// The Web send control publishes literal composer text, including slashes.
+    ComposerSendLiteral,
     /// A key the current mode does not define.
     Ignored,
 }
@@ -480,6 +483,7 @@ pub fn map_composer(key: KeyEvent, picker_open: bool) -> Action {
     match key.code {
         KeyCode::Enter if alt => Action::ComposerNewline,
         KeyCode::Enter => Action::ComposerSend,
+        KeyCode::Tab => Action::SlashComplete,
         KeyCode::Esc => Action::ComposerEscape,
         KeyCode::Backspace => Action::ComposerBackspace,
         KeyCode::Up => Action::ComposerCursorUp,
@@ -1108,6 +1112,13 @@ mod tests {
             Action::ComposerEnd
         );
     }
+    #[test]
+    fn composer_tab_routes_to_completion() {
+        assert_eq!(
+            map_composer(key(KeyCode::Tab, KeyModifiers::NONE), false),
+            Action::SlashComplete
+        );
+    }
 
     #[test]
     fn an_open_picker_owns_the_composers_navigation_keys() {
@@ -1124,8 +1135,6 @@ mod tests {
             open(KeyCode::BackTab, KeyModifiers::NONE),
             Action::PickerPrev
         );
-        // A terminal reports Shift+Tab as BackTab with SHIFT, not as a bare
-        // BackTab: the key that moves backwards must still reach the list.
         assert_eq!(
             open(KeyCode::BackTab, KeyModifiers::SHIFT),
             Action::PickerPrev
@@ -1134,20 +1143,12 @@ mod tests {
             open(KeyCode::Char('r'), KeyModifiers::CONTROL),
             Action::PickerRetry
         );
-        // Text keeps its keys, including the two a list would use as movement:
-        // a name may contain `j` or `k`.
-        assert_eq!(
-            open(KeyCode::Char('j'), KeyModifiers::NONE),
-            Action::ComposerInput('j')
-        );
-        assert_eq!(
-            open(KeyCode::Char('k'), KeyModifiers::NONE),
-            Action::ComposerInput('k')
-        );
-        assert_eq!(
-            open(KeyCode::Char('J'), KeyModifiers::NONE),
-            Action::ComposerInput('J')
-        );
+        for ch in ['j', 'k', 'J'] {
+            assert_eq!(
+                open(KeyCode::Char(ch), KeyModifiers::NONE),
+                Action::ComposerInput(ch)
+            );
+        }
         assert_eq!(
             open(KeyCode::Enter, KeyModifiers::ALT),
             Action::ComposerNewline
@@ -1174,9 +1175,6 @@ mod tests {
         assert_eq!(form(KeyCode::Char('项')), Action::ComposerInput('项'));
         assert_eq!(form(KeyCode::Enter), Action::ComposerSend);
         assert_eq!(form(KeyCode::Esc), Action::Dismiss);
-        // Ctrl+R asks for the roster answer that settles an unresolved
-        // creation, and works from the form or from the timeline the form
-        // left behind when it closed.
         assert_eq!(
             map_navigation(
                 key(KeyCode::Char('r'), KeyModifiers::CONTROL),
@@ -1197,7 +1195,6 @@ mod tests {
             ),
             Action::CreateChannelRefresh
         );
-        // Other overlays keep their own keys.
         assert_eq!(
             map_navigation(
                 key(KeyCode::Char('r'), KeyModifiers::CONTROL),
