@@ -662,11 +662,14 @@ mod tests {
         assert!(stable_only.reason.is_some());
         let with_prereleases = decide(&current, &releases, true);
         assert_eq!(with_prereleases.status, Status::UpdateAvailable);
+        let expected_command = if cfg!(windows) {
+            "powershell -ExecutionPolicy Bypass -c \"irm https://github.com/suraciii/buzzx/releases/download/v0.1.0-rc.2/buzzx-installer.ps1 | iex\""
+        } else {
+            "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/suraciii/buzzx/releases/download/v0.1.0-rc.2/buzzx-installer.sh | sh"
+        };
         assert_eq!(
             with_prereleases.update_command.as_deref(),
-            Some(
-                "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/suraciii/buzzx/releases/download/v0.1.0-rc.2/buzzx-installer.sh | sh"
-            )
+            Some(expected_command)
         );
         assert_eq!(
             with_prereleases.release_url.as_deref(),
