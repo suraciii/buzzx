@@ -33,9 +33,10 @@ beside it. The release adds the two installers (`buzzx-installer.sh`,
 `buzzx-installer.ps1`), a `sha256.sum` over everything, and the source
 tarball. The builds use the `dist` profile, which inherits `release`.
 
-The release build sets `BUZZX_INSTALL_KIND=prebuilt` so the About surface and
-`update check` preserve the provenance of an archive installation. Source and
-local development builds leave it unset and report `source`.
+The `github-build-setup` setting in `dist-workspace.toml` inserts
+`.github/dist-build-setup.yml` before `dist build`; that step sets
+`BUZZX_INSTALL_KIND=prebuilt` for release binaries. Source and local
+development builds leave it unset and report `source`.
 
 Adding a target is one line in `dist-workspace.toml` plus a release: an
 `aarch64-unknown-linux-gnu` artifact is a decision about which users to serve,
