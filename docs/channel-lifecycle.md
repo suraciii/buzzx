@@ -1,10 +1,10 @@
 # Channel lifecycle and membership management
 
-Status: implementation-ready product specification. This document extends
+Status: implemented, acceptance evidence recorded. This document extends
 the channel-creation contract in
 [`mentions-and-channel-creation.md`](mentions-and-channel-creation.md). It
-defines the smallest useful channel administration slice for TUI, WebUI and
-CLI; it does not claim that the slice is implemented.
+defines the channel administration slice for TUI, WebUI and CLI. Live evidence
+gaps remain documented under [Acceptance evidence](#acceptance-evidence-2026-09-29).
 
 ## Product outcome
 
@@ -18,11 +18,11 @@ presentation only and may be reused in another community. No member lookup,
 permission check, draft, cache, pending write or relay event may cross that
 pair or the active session `generation`.
 
-## Baseline and protocol evidence
+## Pre-implementation baseline and protocol evidence
 
-The current `buzzx` baseline can list channels and read channel membership,
-but it has no channel-management client methods or `channels` write commands.
-`ChannelInfo::listed()` already excludes archived channels, so archive is a
+Before this slice, `buzzx` could list channels and read channel membership,
+but had no channel-management client methods or `channels` write commands.
+`ChannelInfo::listed()` already excluded archived channels, so archive was a
 visibility and write-state gap rather than a new channel identity model. See
 [`../src/client.rs`](../src/client.rs), [`../src/content.rs`](../src/content.rs)
 and [`../src/cli.rs`](../src/cli.rs).
