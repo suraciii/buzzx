@@ -17,6 +17,7 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+github-build-setup = "../dist-build-setup.yml"
 
 # Every action the generated workflow uses is pinned to a commit, the same way
 # ci.yml pins its own. The version each commit names is the comment beside it.

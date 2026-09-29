@@ -15,6 +15,7 @@ use crate::config::{self, CommunityProfile, ConfigFile, Resolved};
 use crate::content;
 use crate::failure::{Category, Failure};
 use crate::mentions;
+use crate::{update, version};
 
 /// The default `messages get --limit`.
 const DEFAULT_LIMIT: u64 = 20;
@@ -37,6 +38,16 @@ pub enum ChannelsCommand {
         /// Optional description.
         #[arg(long)]
         description: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum UpdateCommand {
+    /// Check the canonical GitHub Releases metadata without installing.
+    Check {
+        /// Include prereleases when selecting an update target.
+        #[arg(long)]
+        prerelease: bool,
     },
 }
 
@@ -279,6 +290,31 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
                 Some(&target_hex),
                 &recipients,
             )
+        }
+    }
+}
+
+/// `buzzx update check`: one unauthenticated, read-only release metadata query.
+pub async fn run_update(action: UpdateCommand) -> i32 {
+    match action {
+        UpdateCommand::Check { prerelease } => {
+            let identity = update::BuildIdentity {
+                version: version::version().to_owned(),
+                channel: match version::channel() {
+                    version::Channel::Stable => update::Channel::Stable,
+                    version::Channel::Prerelease => update::Channel::Prerelease,
+                    version::Channel::Dev => update::Channel::Dev,
+                },
+                install_kind: match version::install_kind() {
+                    version::InstallKind::Source => update::InstallKind::Source,
+                    version::InstallKind::Prebuilt => update::InstallKind::Prebuilt,
+                },
+                source_commit: version::commit().map(str::to_owned),
+            };
+            let report = update::check(&update::http_client(), &identity, prerelease).await;
+            let unknown = report.status == update::Status::Unknown;
+            print(&serde_json::to_value(report).expect("update report is serializable"));
+            if unknown { config::EXIT_NETWORK } else { 0 }
         }
     }
 }

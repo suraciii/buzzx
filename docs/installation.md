@@ -94,15 +94,27 @@ nothing in the product depends on it.
 
 ## Build from source
 
-A Rust toolchain at the version CI pins (1.97.1) builds `buzzx` on all three
-platforms:
+Use a release tag when the source build must reproduce a published version:
 
 ```text literal
-cargo install --locked --git https://github.com/suraciii/buzzx
+git clone https://github.com/suraciii/buzzx.git
+cd buzzx
+git checkout v0.1.0
+cargo install --locked --path . --force
 ```
 
-The lockfile is part of the contract, so `--locked` is required rather than
-optional: a build that resolves newer dependencies is not the released build.
+For the unreleased development build, checkout a deliberate commit or `main`
+and use the same locked install command:
+
+```text literal
+git checkout <commit>
+cargo install --locked --path . --force
+```
+
+The installed binary reports its exact release or source commit identity.
+Select the next commit explicitly before reinstalling; do not replace a dirty
+checkout. See [versioning-and-updates.md](versioning-and-updates.md) for the
+version vocabulary and `buzzx update check`.
 
 ## First run
 

@@ -452,7 +452,9 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     if app.community_picker.is_some() {
         draw_community_picker(frame, app, area);
     }
-    if app.help {
+    if app.about {
+        draw_about(frame, app, area);
+    } else if app.help {
         draw_help(frame, app, area, mode);
     }
 }
@@ -2266,6 +2268,14 @@ fn help_text(app: &App, mode: LayoutMode) -> String {
             (false, _) => COMPACT_HELP.to_owned(),
         }
     };
+    text.insert_str(
+        0,
+        &format!(
+            "buzzx {}\nchannel: {}\n\n",
+            crate::version::version(),
+            crate::version::channel().as_str()
+        ),
+    );
     if app.thread.open {
         text.push_str(&format!("\nthread / {}\n", app.thread.root));
         if let Some(reason) = &app.thread.failed {
@@ -2383,7 +2393,7 @@ commands
   j k up down    move the cursor      enter run
   esc back       ? help               q quit
   the palette lists actions the timeline already has: switch
-  conversation, search messages, My agents, help, quit.
+  conversation, search messages, My agents, About, help, quit.
   it owns no state and duplicates no command.";
 
 const READER_WIDE_HELP: &str = "\
@@ -2491,6 +2501,9 @@ fn help_context(app: &App) -> String {
     if app.reader.open {
         return "Reader".to_owned();
     }
+    if app.about {
+        return "About".to_owned();
+    }
     if app.thread.open {
         return "Thread".to_owned();
     }
@@ -2520,6 +2533,45 @@ fn help_context(app: &App) -> String {
             }
         })
         .unwrap_or_else(|| "conversation".to_owned())
+}
+
+fn draw_about(frame: &mut Frame, app: &App, area: Rect) {
+    let source = match (
+        crate::version::branch(),
+        crate::version::commit(),
+        crate::version::tag(),
+    ) {
+        (Some(branch), Some(commit), _) => format!("{branch} @ {commit}"),
+        (None, Some(commit), Some(tag)) => format!("{tag} @ {commit}"),
+        (None, Some(commit), None) => format!("detached @ {commit}"),
+        _ => "unknown".to_owned(),
+    };
+    let cleanliness = if crate::version::dirty() {
+        "dirty"
+    } else {
+        "clean"
+    };
+    let text = format!(
+        "buzzx {}\n\
+         channel: {}\n\
+         source: {source} ({cleanliness})\n\
+         install: {}\n\
+         target: {}\n\
+         relay: {}\n\
+         config: {}\n",
+        crate::version::version(),
+        crate::version::channel().as_str(),
+        crate::version::install_kind().as_str(),
+        crate::version::target(),
+        app.relay_label,
+        crate::config::config_path().display(),
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("About")
+        .title_bottom(Line::raw("Esc close"));
+    frame.render_widget(Paragraph::new(text).block(block), area);
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect, mode: LayoutMode) {
@@ -3030,6 +3082,26 @@ mod tests {
         assert!(text.contains("connected"), "{text}");
         assert!(text.contains("line one"), "{text}");
         assert!(text.contains("line two"), "{text}");
+    }
+
+    #[test]
+    fn about_surface_shows_build_diagnostics() {
+        let mut app = chat_app(Vec::new());
+        app.handle(crate::keys::Action::TogglePalette, 0);
+        for _ in 0..crate::app::Command::ALL
+            .iter()
+            .position(|command| *command == crate::app::Command::About)
+            .expect("About in palette")
+        {
+            app.handle(crate::keys::Action::PaletteNext, 0);
+        }
+        app.handle(crate::keys::Action::PaletteConfirm, 0);
+        let text = frame_text(&app, 80, 12);
+        assert!(text.contains("About"), "{text}");
+        assert!(text.contains("channel:"), "{text}");
+        assert!(text.contains("install:"), "{text}");
+        assert!(text.contains("target:"), "{text}");
+        assert!(text.contains("relay:"), "{text}");
     }
 
     fn frame_text(app: &App, width: u16, height: u16) -> String {

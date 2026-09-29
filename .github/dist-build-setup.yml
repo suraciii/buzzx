@@ -1,0 +1,3 @@
+- name: Mark release builds as prebuilt
+  shell: bash
+  run: echo 'BUZZX_INSTALL_KIND=prebuilt' >> "$GITHUB_ENV"
