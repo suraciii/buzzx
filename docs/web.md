@@ -346,7 +346,9 @@ When resolution fails, keep the draft and target, name the unresolved fragment
 next to the composer, and expose complete selectable exact references for
 ambiguous names. Automatic invitation and hidden recipient inference remain
 out of scope. Channel creation follows the shared form and write states in
-[mentions-and-channel-creation.md](mentions-and-channel-creation.md).
+[mentions-and-channel-creation.md](mentions-and-channel-creation.md); archive,
+restore and member management follow
+[channel-lifecycle.md](channel-lifecycle.md).
 Editing keeps its existing notification semantics.
 
 On submit, show pending feedback and prevent a second submission of that

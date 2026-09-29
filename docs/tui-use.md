@@ -571,7 +571,10 @@ active turn observed` follows only a feed the relay has answered with `EOSE`.
 ## Mentions when sending
 
 [Mention suggestions and channel creation](mentions-and-channel-creation.md)
-is the product contract this follows.
+is the product contract this follows. Channel archive/restore and membership
+actions use the shared [channel lifecycle contract](channel-lifecycle.md);
+they are exposed from the `Ctrl+P` command palette and keep the active
+community visible.
 
 `@` at the start of a word opens a draft-local picker over the open
 conversation's members: exact names first, then prefix matches, with the Agent or
