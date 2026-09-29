@@ -473,6 +473,7 @@ pub fn map_composer(key: KeyEvent, picker_open: bool) -> Action {
             // may contain `j` or `k`, so those stay text.
             KeyCode::Up | KeyCode::BackTab => return Action::PickerPrev,
             KeyCode::Down | KeyCode::Tab => return Action::PickerNext,
+            KeyCode::Char('?') => return Action::ToggleHelp,
             _ => {}
         }
     }

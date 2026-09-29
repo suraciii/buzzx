@@ -1079,6 +1079,7 @@ impl Client {
             Ok(directory) => mentions::plan(content, &directory, bindings),
             Err(failure) => Err(mentions::Block::LookupFailed {
                 reason: failure.detail,
+                category: failure.category,
             }),
         }
     }

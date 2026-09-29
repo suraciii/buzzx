@@ -1451,6 +1451,14 @@ impl App {
         view.palette = None;
         view.community_picker = None;
         view.composer.clear();
+        view.mention_block = None;
+        view.mention_picker = None;
+        view.mention_roster = MentionRoster::default();
+        view.mention_bindings.clear();
+        view.create_channel = None;
+        view.create_unsettled = None;
+        view.create_refresh_pending = false;
+        view.pending_open = None;
         view.search = SearchView::default();
         view.context = ContextView::default();
         view.reader = ReaderView::default();
@@ -6322,6 +6330,14 @@ impl App {
                     self.close_create_channel();
                 }
                 Action::ComposerInput(' ') => self.create_channel_space(),
+                Action::ComposerInput('r')
+                    if self
+                        .create_unsettled
+                        .as_ref()
+                        .is_some_and(|open| matches!(open.state, CreateState::Unknown(_))) =>
+                {
+                    self.refresh_create_channel()
+                }
                 Action::ComposerInput(c) => self.create_channel_input(c),
                 Action::ComposerBackspace => self.create_channel_backspace(),
                 Action::ComposerCursorDown => self.create_channel_step(true),
@@ -6368,6 +6384,14 @@ impl App {
                 self.quit = true;
             }
             Action::CreateChannelRefresh => self.refresh_create_channel(),
+            Action::React
+                if self
+                    .create_unsettled
+                    .as_ref()
+                    .is_some_and(|open| matches!(open.state, CreateState::Unknown(_))) =>
+            {
+                self.refresh_create_channel()
+            }
             Action::ToggleHelp => {
                 self.help = !self.help;
                 if self.help {
@@ -6684,7 +6708,7 @@ impl App {
     }
     fn handle_composer(&mut self, action: Action, now: u64) {
         let before = self.composer.text();
-        if self.mention_picker.is_some() {
+        if self.mention_picker.is_some() && !self.help {
             match action {
                 Action::PickerNext => {
                     self.mention_move(1);
@@ -6706,10 +6730,27 @@ impl App {
                     self.mention_dismiss();
                     return;
                 }
+                Action::ToggleHelp => {
+                    self.help = true;
+                    self.help_scroll = 0;
+                    return;
+                }
                 _ => {}
             }
         }
         match action {
+            Action::HelpScroll(step) if self.help => {
+                self.help_scroll = self.help_scroll.saturating_add_signed(step as i16);
+                return;
+            }
+            Action::ToggleHelp if self.help => {
+                self.help = false;
+                return;
+            }
+            Action::Dismiss if self.help => {
+                self.help = false;
+                return;
+            }
             Action::OpenSearch => self.open_search(true, now),
             Action::Quit => self.quit = true,
             Action::ComposerInput(c) => self.composer.input(c),
@@ -6751,6 +6792,9 @@ impl App {
             return;
         }
         self.mention_bindings.clear();
+        self.mention_picker = None;
+        self.mention_roster = MentionRoster::default();
+        self.mention_block = None;
         self.save_draft();
         self.save_position();
         let label = self.label(&self.channels[index]);
@@ -10615,6 +10659,39 @@ mod tests {
         assert!(app.mention_block.is_none());
         assert!(!app.mention_loading(), "the old roster is gone");
         assert!(app.mention_items().is_empty());
+    }
+
+    #[test]
+    fn a_channel_switch_discards_the_previous_channel_picker() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2)];
+        app.stub_roster();
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@a");
+        let (channel, request) = roster_request(&mut app);
+        app.apply(candidates(channel, request, vec![candidate("aa", "Ap")]), 1);
+        assert_eq!(app.mention_items().len(), 1);
+        app.web_select_channel(app.channels[1].id).unwrap();
+        assert!(app.mention_picker.is_none());
+        assert!(app.mention_items().is_empty());
+        assert_ne!(app.composer_channel(), Some(channel));
+    }
+
+    #[test]
+    fn a_fork_does_not_inherit_the_previous_tabs_picker_or_creation() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.handle(Action::ComposeNew, 0);
+        typing(&mut app, "@a");
+        assert!(app.mention_picker.is_some());
+        app.open_create_channel();
+        let fork = app.web_fork();
+        assert!(fork.mention_picker.is_none());
+        assert!(fork.mention_block.is_none());
+        assert!(fork.mention_bindings.is_empty());
+        assert!(fork.create_channel.is_none());
+        assert!(!fork.create_write_pending());
     }
 
     #[test]

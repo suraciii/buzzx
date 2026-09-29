@@ -1401,10 +1401,11 @@ fn a_failed_member_read_blocks_a_cli_send() {
         None,
     );
     assert_eq!(
-        code, 1,
-        "an unreadable roster is not an empty one: {stderr}"
+        code, 2,
+        "an unreadable roster is a network failure: {stderr}"
     );
     assert_eq!(json["status"], json!("not_sent"));
+    assert_eq!(json["error"], json!("network"));
     assert_eq!(json["mention_block"]["kind"], json!("directory_failed"));
     assert!(
         relay.writes().is_empty(),

@@ -781,10 +781,14 @@ fn block_result(
     channel: Option<&str>,
     reply_to: Option<&str>,
 ) -> i32 {
+    let category = match block {
+        mentions::Block::LookupFailed { category, .. } => *category,
+        _ => Category::InvalidInput,
+    };
     let mut value = json!({
         "status": "not_sent",
         "event_id": Value::Null,
-        "error": Category::InvalidInput.as_str(),
+        "error": category.as_str(),
         "message": block.summary(),
         "mention_block": {
             "kind": block.kind(),
@@ -801,7 +805,7 @@ fn block_result(
     value["community"] = community_json(resolved);
     print(&value);
     eprintln!("buzzx: {}", block.summary());
-    exit_code(Category::InvalidInput)
+    exit_code(category)
 }
 
 /// `channels create`: one validated draft, one write, one JSON result.

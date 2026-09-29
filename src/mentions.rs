@@ -281,7 +281,10 @@ pub enum Block {
     OverCap { count: usize },
     /// The membership or profile read failed. An incomplete list is not an
     /// empty one, so the draft is not published against a guess.
-    LookupFailed { reason: String },
+    LookupFailed {
+        reason: String,
+        category: crate::failure::Category,
+    },
 }
 
 impl Block {
@@ -313,7 +316,7 @@ impl Block {
             Block::OverCap { count } => format!(
                 "the draft names {count} recipients; the relay accepts at most {MENTION_CAP}"
             ),
-            Block::LookupFailed { reason } => format!(
+            Block::LookupFailed { reason, .. } => format!(
                 "the mention check could not read this conversation: {reason}; nothing was sent"
             ),
         }
@@ -339,7 +342,7 @@ impl Block {
                 "{count} recipients: remove {} or more",
                 count - MENTION_CAP
             )],
-            Block::LookupFailed { reason } => vec![format!("lookup failed: {reason}")],
+            Block::LookupFailed { reason, .. } => vec![format!("lookup failed: {reason}")],
         }
     }
 }
@@ -871,6 +874,7 @@ mod tests {
     #[test]
     fn a_lookup_failure_is_a_block_with_its_reason() {
         let block = Block::LookupFailed {
+            category: crate::failure::Category::Network,
             reason: "relay unreachable".to_owned(),
         };
         assert!(block.summary().contains("relay unreachable"));
