@@ -118,8 +118,9 @@ rows and a `ReadTrack` containing its frontier, unread message candidates, and
 coverage state. It also holds the session-only sidebar open preference,
 sidebar cursor conversation, and `DeskFocus` (Sidebar or Timeline). `Filter`
 derives the `All`, `Unread`, and `For you` views; the sidebar and switcher
-share these sections, ordering and retained-cursor rules. Moving a sidebar
-cursor does not change the selected conversation, timeline event focus,
+share these sections, ordering and signals. The sidebar cursor stays visible
+or empty; only the switcher retains a nonmatching row. Moving a sidebar cursor
+does not change the selected conversation, timeline event focus,
 viewport or read marker. `●` and `@` rows carry unread candidate counts in
 the reserved signal cell; `?` means unknown coverage. The `Read` marker
 applies to a row retained after it stops matching.

@@ -56,7 +56,7 @@ operating a relay.
 2. Below Desk, the main surface uses the available width for the timeline, composer, and status. The conversation list remains available through the full-screen switcher.
 3. The composer sends, replies, reacts, edits, and deletes.
 
-Desk opens with the sidebar visible. `Ctrl+S` toggles it; when closed, the main surface expands without a ghost gutter. Sidebar navigation has its own cursor and focus: `h`/`l` switch between sidebar and timeline, `j`/`k` move the sidebar cursor, and `Enter` opens its conversation. Moving that cursor does not change the selected conversation, timeline focus, or read marker. `c` continues to open the full-screen conversation switcher, and both surfaces use the same sections, ordering, filter, and retained-cursor behavior.
+Desk opens with the sidebar visible. `Ctrl+S` toggles it; when closed, the main surface expands without a ghost gutter. Sidebar navigation has its own cursor and focus: `h`/`l` switch between sidebar and timeline, `j`/`k` move the sidebar cursor, and `Enter` opens its conversation. Moving that cursor does not change the selected conversation, timeline focus, or read marker. `c` continues to open the full-screen conversation switcher. Both share sections, ordering, filters and signals; the sidebar cursor stays visible or empty, while the switcher may retain a row after it stops matching.
 
 The channel list groups channels and direct conversations and carries a
 lightweight Inbox view. Unread is computed from a read marker (kind 30078)

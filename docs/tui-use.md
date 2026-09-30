@@ -385,13 +385,12 @@ does not exist yet.
 
 ## Status line
 
-The bottom state line shows the highest-priority actionable summary, plus the
-connection state when it needs attention and the current navigation mode when
-space permits. It does not repeat the destination, Inbox answer or a normal
-relay URL from the header. The connection state is one of `connecting`,
-`connected`, `reconnecting`, or `failed`; failure, uncertainty and
-reconnecting take precedence over ordinary connected text. Desk open and
-closed change the main rectangle, not this state contract.
+The bottom state line shows one highest-priority actionable summary, not a
+second mode label. Target and key hints show the active operation. Failure and
+uncertainty take precedence over connection state; reconnecting takes precedence
+over ordinary connected text. It does not repeat the destination, Inbox answer
+or normal relay URL. Connection states are `connecting`, `connected`,
+`reconnecting` and `failed`. Desk geometry does not change this state contract.
 
 ## What `buzzx tui` does not do
 This TUI does not render images, video, or audio. Attachments show as filename

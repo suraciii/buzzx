@@ -15,9 +15,10 @@ When closed, the main rectangle expands with no ghost gutter. Below Desk the
 main surface is full width and conversation discovery uses the full-screen
 switcher.
 
-The sidebar and switcher consume the same `Sections`, filter, ordering,
-signals, and retained-cursor data. A sidebar cursor is a navigation action
-focus; the current conversation is a place cue. Cursor movement never changes
+The sidebar and switcher consume the same `Sections`, filter, ordering and
+signals. The sidebar cursor stays visible or empty; the switcher may retain a
+nonmatching row. Sidebar cursor is action focus; current conversation is place.
+Cursor movement never changes
 the selected timeline, event focus, viewport, or read marker. Thread, Context,
 Reader, Search, Agents, Help and other overlays replace the channel surface
 and hide the sidebar; return restores open preference, pane focus, cursor,
