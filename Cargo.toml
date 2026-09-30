@@ -29,6 +29,9 @@ unicode-width = "0.2"
 unicode-segmentation = "1.13"
 dirs = "6"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 parking_lot = "0.12"
 

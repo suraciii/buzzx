@@ -77,3 +77,18 @@ checksums match. It does not run `buzzx`. The live-relay acceptance run stays
 a manual step, exactly as it does for CI: see
 [testing.md](testing.md) and the verification list in
 [AGENTS.md](../AGENTS.md).
+
+## Update ownership
+
+Release artifacts are the owner of prebuilt installation updates. The
+prebuilt `buzzx update --check` and `--plan` paths may inspect Release metadata
+and point to the installer; they never replace the running binary. A bare
+`buzzx update` is unsupported for a prebuilt install.
+
+Source updates are a separate product path. The managed updater follows only a
+clean `main` checkout on Linux and macOS and reinstalls from that checkout.
+Tagged source installs remain manual, and Windows source installs remain
+manual because the updater does not perform automatic replacement. The
+complete source-update state, JSON, exit-code, fetch, rollback, and
+verification contract lives in
+[`docs/versioning-and-updates.md`](../docs/versioning-and-updates.md).

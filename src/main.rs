@@ -92,11 +92,14 @@ enum Command {
         /// Channel UUID to watch.
         channel: String,
     },
-    /// Check the canonical GitHub Releases metadata without installing.
+    /// Update a managed source installation or check prebuilt Releases.
     Update {
-        #[command(subcommand)]
+        #[command(flatten)]
         action: cli::UpdateCommand,
     },
+    /// Report the immutable build identity for installation verification.
+    #[command(hide = true)]
+    BuildInfo,
     /// Log in: verify an identity against the relay and save it as the
     /// config file. Interactive when no key source is given.
     Login {
@@ -162,6 +165,18 @@ fn main() {
         cli.community.as_deref(),
     );
     let code: i32 = match cli.command {
+        Command::BuildInfo => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": version::version(),
+                    "commit": version::commit(),
+                    "install_kind": version::install_kind().as_str(),
+                    "dirty": version::dirty(),
+                })
+            );
+            0
+        }
         Command::Channels { action } => match resolve_identity(flags) {
             Ok(resolved) => match block_on(cli::run_channels(&resolved, action)) {
                 Ok(code) => code,

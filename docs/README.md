@@ -9,7 +9,8 @@ works with it.
   each platform, the checksums, the warnings an unsigned binary raises, and
   the first run.
 - [versioning-and-updates.md](versioning-and-updates.md) defines release and
-  development version strings, source/prebuilt installation, and update checks.
+  development version strings, source/prebuilt installation, and update
+  commands.
 - [tui.md](tui.md) is the TUI capability: its layout modes, its unified keys,
   and the criteria it must satisfy.
 - [tui-use.md](tui-use.md) is the TUI manual: the keys, the modes, and the
