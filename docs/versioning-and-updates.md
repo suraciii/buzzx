@@ -218,6 +218,12 @@ For example, a successful source apply has this shape:
 the resolved `origin/main`, and `previous_commit` is the commit used for
 rollback. They are not interchangeable.
 
+Source reports also include `behind`, `commands`, `remote_refs_refreshed`,
+and `rollback_succeeded`. These distinguish preview commands, fetched refs,
+and an attempted rollback from a verified rollback. Fetch is bounded to 30
+seconds; installed build-identity verification is bounded to 10 seconds.
+Timeout cleanup terminates the external command's process group on Unix.
+
 ## First-release checklist
 
 Before creating `v0.1.0`:

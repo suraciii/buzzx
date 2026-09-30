@@ -2,11 +2,15 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -137,7 +141,13 @@ fn install_root(exe: &Path, checkout: &Path) -> Option<PathBuf> {
         .iter()
         .any(|(package, record)| {
             package.starts_with("buzzx ")
-                && package.contains(" (path+")
+                && package
+                    .rsplit_once(" (path+")
+                    .and_then(|(_, source)| source.strip_suffix(')'))
+                    .and_then(|source| reqwest::Url::parse(source).ok())
+                    .and_then(|source| source.to_file_path().ok())
+                    .and_then(|source| fs::canonicalize(source).ok())
+                    .is_some_and(|source| source == checkout)
                 && record
                     .get("bins")
                     .and_then(serde_json::Value::as_array)
@@ -147,7 +157,10 @@ fn install_root(exe: &Path, checkout: &Path) -> Option<PathBuf> {
 }
 
 fn fetch(path: &Path, timeout: Duration) -> Result<(), ()> {
-    let mut child = git_command(path)
+    let mut command = git_command(path);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .args([
             "fetch",
             "--no-tags",
@@ -165,6 +178,11 @@ fn fetch(path: &Path, timeout: Duration) -> Result<(), ()> {
             Ok(Some(status)) => return if status.success() { Ok(()) } else { Err(()) },
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(50)),
             _ => {
+                #[cfg(unix)]
+                // Kill the transport/helper descendants too, before returning control.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(());
@@ -227,19 +245,54 @@ struct BuildInfo {
 }
 
 fn verify(exe: &Path, target: &str) -> bool {
-    let Ok(output) = Command::new(exe)
+    let mut command = Command::new(exe);
+    #[cfg(unix)]
+    command.process_group(0);
+    let Ok(mut child) = command
         .arg("build-info")
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     else {
         return false;
     };
-    output.status.success()
-        && serde_json::from_slice::<BuildInfo>(&output.stdout).is_ok_and(|info| {
-            info.commit.as_deref() == Some(short(target).as_str())
-                && info.install_kind == "source"
-                && !info.dirty
-        })
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(4097).read_to_end(&mut bytes);
+        let _ = sender.send(result.map(|_| bytes));
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => break None,
+        }
+    };
+    let metadata = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    #[cfg(unix)]
+    // Stop descendants that inherited the metadata pipe, even if the parent exited.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    status.is_some_and(|status| status.success())
+        && metadata
+            .ok()
+            .and_then(Result::ok)
+            .filter(|bytes| bytes.len() <= 4096)
+            .and_then(|bytes| serde_json::from_slice::<BuildInfo>(&bytes).ok())
+            .is_some_and(|info| {
+                info.commit.as_deref() == Some(short(target).as_str())
+                    && info.install_kind == "source"
+                    && !info.dirty
+            })
 }
 
 pub fn run(action: Action, prerelease: bool) -> Report {
@@ -311,7 +364,8 @@ pub fn run(action: Action, prerelease: bool) -> Report {
     }
     report.previous_commit = Some(short(&previous));
     // Recheck before moving HEAD: fetch may have taken long enough for a local edit.
-    match inspect(&path, &mut report) {
+    let mut refreshed = Report::new();
+    match inspect(&path, &mut refreshed) {
         Ok(current) if current == previous => {}
         _ => {
             return report.stop(

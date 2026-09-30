@@ -106,6 +106,10 @@ fn install_record_requires_path_package_and_matching_binary() {
     fs::create_dir_all(root.join("bin")).unwrap();
     let exe = root.join("bin/buzzx");
     fs::write(&exe, "binary").unwrap();
+    let package = format!(
+        "buzzx 0.1.0 (path+{})",
+        reqwest::Url::from_file_path(&repo.path).unwrap()
+    );
     let record = |package: &str, bins: &[&str]| {
         serde_json::json!({"installs": {package: {"bins":bins}}}).to_string()
     };
@@ -115,16 +119,14 @@ fn install_record_requires_path_package_and_matching_binary() {
     )
     .unwrap();
     assert_eq!(install_root(&exe, &repo.path), None);
-    fs::write(
-        root.join(".crates2.json"),
-        record("buzzx 0.1.0 (path+file:///source)", &["another"]),
-    )
-    .unwrap();
+    fs::write(root.join(".crates2.json"), record(&package, &["another"])).unwrap();
     assert_eq!(install_root(&exe, &repo.path), None);
     fs::write(
         root.join(".crates2.json"),
         record("buzzx 0.1.0 (path+file:///source)", &["buzzx"]),
     )
     .unwrap();
+    assert_eq!(install_root(&exe, &repo.path), None);
+    fs::write(root.join(".crates2.json"), record(&package, &["buzzx"])).unwrap();
     assert_eq!(install_root(&exe, &repo.path), Some(root));
 }

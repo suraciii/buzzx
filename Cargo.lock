@@ -345,6 +345,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "hex",
+ "libc",
  "nostr",
  "parking_lot",
  "rand 0.10.3",
