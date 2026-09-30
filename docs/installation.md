@@ -103,18 +103,40 @@ git checkout v0.1.0
 cargo install --locked --path . --force
 ```
 
-For the unreleased development build, checkout a deliberate commit or `main`
-and use the same locked install command:
+Tagged source installs remain manual. For an unreleased development install,
+checkout `main` and run the same locked install command:
 
 ```text literal
-git checkout <commit>
+git checkout main
 cargo install --locked --path . --force
 ```
 
-The installed binary reports its exact release or source commit identity.
-Select the next commit explicitly before reinstalling; do not replace a dirty
-checkout. See [versioning-and-updates.md](versioning-and-updates.md) for the
-version vocabulary and `buzzx update check`.
+The managed source updater follows only a clean `main` checkout on Linux and
+macOS. Run it from that checkout or any subdirectory:
+
+```text literal
+buzzx update --check
+buzzx update --plan
+buzzx update
+```
+
+The updater validates the installed Cargo root and rejects a checkout or
+`target/` executable. It does not auto-stash, overwrite local changes, restart
+a service, or change configuration. `--check` and `--plan` can fetch
+`origin/main` with a bounded operation, but only Git's remote-tracking
+reference changes; HEAD and the installed binary do not change. A successful
+apply fast-forwards, reinstalls, verifies the new commit, and requires a
+manual restart of `buzzx`.
+
+Windows source installs do not support automatic replacement. Close `buzzx`
+and perform the Git/Cargo reinstall manually. A tagged checkout, a dirty tree,
+another branch, or `--prerelease` is not a managed source update. Prebuilt
+installations use `buzzx update --check` or `buzzx update --plan` for release
+information; bare `buzzx update` is owned by the external installer.
+
+For the complete command, JSON status, exit-code, rollback, and path
+validation contract, see
+[versioning-and-updates.md](versioning-and-updates.md).
 
 ## First run
 

@@ -98,14 +98,17 @@ pub enum ChannelsCommand {
     },
 }
 
-#[derive(Subcommand)]
-pub enum UpdateCommand {
-    /// Check the canonical GitHub Releases metadata without installing.
-    Check {
-        /// Include prereleases when selecting an update target.
-        #[arg(long)]
-        prerelease: bool,
-    },
+#[derive(clap::Args)]
+pub struct UpdateCommand {
+    /// Check the target without moving HEAD or running Cargo.
+    #[arg(long, conflicts_with = "plan")]
+    check: bool,
+    /// Show the update plan without moving HEAD or running Cargo.
+    #[arg(long)]
+    plan: bool,
+    /// Include prereleases in prebuilt Release checks only.
+    #[arg(long)]
+    prerelease: bool,
 }
 
 /// The local community profiles: what a session connects to. `add` and
@@ -620,29 +623,49 @@ pub async fn run_messages(resolved: &Resolved, action: MessagesCommand) -> i32 {
     }
 }
 
-/// `buzzx update check`: one unauthenticated, read-only release metadata query.
-pub async fn run_update(action: UpdateCommand) -> i32 {
-    match action {
-        UpdateCommand::Check { prerelease } => {
-            let identity = update::BuildIdentity {
-                version: version::version().to_owned(),
-                channel: match version::channel() {
-                    version::Channel::Stable => update::Channel::Stable,
-                    version::Channel::Prerelease => update::Channel::Prerelease,
-                    version::Channel::Dev => update::Channel::Dev,
-                },
-                install_kind: match version::install_kind() {
-                    version::InstallKind::Source => update::InstallKind::Source,
-                    version::InstallKind::Prebuilt => update::InstallKind::Prebuilt,
-                },
-                source_commit: version::commit().map(str::to_owned),
-            };
-            let report = update::check(&update::http_client(), &identity, prerelease).await;
-            let unknown = report.status == update::Status::Unknown;
-            print(&serde_json::to_value(report).expect("update report is serializable"));
-            if unknown { config::EXIT_NETWORK } else { 0 }
-        }
+pub async fn run_update(options: UpdateCommand) -> i32 {
+    if version::install_kind() == version::InstallKind::Source {
+        let action = if options.check {
+            update::source::Action::Check
+        } else if options.plan {
+            update::source::Action::Plan
+        } else {
+            update::source::Action::Apply
+        };
+        let report = update::source::run(action, options.prerelease);
+        let code = report.exit_code();
+        print(&serde_json::to_value(report).expect("update report is serializable"));
+        return code;
     }
+    if !options.check && !options.plan {
+        print(&json!({
+            "status": "unsupported_install",
+            "install_kind": "prebuilt",
+            "source_path": null,
+            "branch": null,
+            "current_commit": version::commit(),
+            "target_commit": null,
+            "previous_commit": null,
+            "restart_required": false,
+            "error": "externally_managed",
+            "message": "Release installers manage this installation; run buzzx update --check for installation guidance"
+        }));
+        return config::EXIT_USAGE;
+    }
+    let identity = update::BuildIdentity {
+        version: version::version().to_owned(),
+        channel: match version::channel() {
+            version::Channel::Stable => update::Channel::Stable,
+            version::Channel::Prerelease => update::Channel::Prerelease,
+            version::Channel::Dev => update::Channel::Dev,
+        },
+        install_kind: update::InstallKind::Prebuilt,
+        source_commit: version::commit().map(str::to_owned),
+    };
+    let report = update::check(&update::http_client(), &identity, options.prerelease).await;
+    let unknown = report.status == update::Status::Unknown;
+    print(&serde_json::to_value(report).expect("update report is serializable"));
+    if unknown { config::EXIT_NETWORK } else { 0 }
 }
 
 /// `buzzx community`: manage the saved profiles. The one JSON-per-run

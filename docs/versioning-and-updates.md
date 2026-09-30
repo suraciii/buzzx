@@ -1,72 +1,55 @@
 # Versioning and updates
 
-This document is the product contract for the version shown by `buzzx` and for
-the two supported installation paths: a prebuilt release and a build from
-source. It is intentionally separate from the relay protocol. The relay is a
-service that `buzzx` connects to; it is not the binary distribution source.
+This document owns the version, installation, and update contract for `buzzx`.
+It covers both supported installation paths: a prebuilt release and a build from
+source. The relay is not a binary distribution source.
 
-## The release is not ready yet
+## Release status
 
-The repository currently has no published tag. `Cargo.toml` contains the
-planned package version (`0.1.0`), but a binary built from `main` is not a
-`0.1.0` release. Do not publish `v0.1.0` until the release acceptance in
-[`eng/release.md`](../eng/release.md) and the platform checks in the release
-runbook pass.
+The repository has no published tag yet. `Cargo.toml` contains the planned
+package version (`0.1.0`), but a binary built from `main` is not a `0.1.0`
+release. Do not publish `v0.1.0` until the acceptance in
+[`eng/release.md`](../eng/release.md) passes.
 
-When the product is ready for a first public candidate, use a prerelease tag
-such as `v0.1.0-rc.1`. Publish `v0.1.0` only after the candidate has passed
-the same install and live-relay checks that a user will depend on.
+The first public candidate uses a tag such as `v0.1.0-rc.1`. Publish
+`v0.1.0` only after the candidate has passed the same install and live-relay
+checks that users depend on.
 
 ## Version vocabulary
 
 There is one release version. `Cargo.toml`, the Git tag, the GitHub Release,
-the archive names, and the version reported by an exact release build must
-agree on the SemVer value.
+archive names, and an exact release build must agree on the SemVer value.
 
 | Build | Displayed version | Channel | Update meaning |
 |---|---|---|---|
 | Exact stable tag `v0.1.0` | `0.1.0` | `stable` | Compare with the latest stable release |
 | Exact prerelease tag `v0.1.0-rc.1` | `0.1.0-rc.1` | `prerelease` | Compare only when prereleases are requested |
-| Clean `main` commit | `0.0.0-main.gabcdef123456` | `dev` | Never claim it is a stable release |
-| Clean non-main commit | `0.0.0-dev.gabcdef123456` | `dev` | Never claim it is a stable release |
+| Clean `main` commit | `0.0.0-main.gabcdef123456` | `dev` | Follow `origin/main`, never stable |
+| Clean non-main commit | `0.0.0-dev.gabcdef123456` | `dev` | Not eligible for managed source updates |
 | Dirty source tree | The same value with `.dirty` appended | `dev` | Warn that the binary is not reproducible |
-| Source without Git metadata | `0.0.0-dev.unknown` | `dev` | Show the source-install instructions |
+| Source without Git metadata | `0.0.0-dev.unknown` | `dev` | Show source-install instructions |
 
 `gabcdef123456` is a fixed-length, 12-character short Git object id with a
-`g` prefix. The `main` and `dev` values are valid SemVer prerelease
-versions. They are runtime build identities, not versions that are edited into
-`Cargo.toml` on every commit.
-
-`v0.0.0-main.gabcdef123456` is therefore a valid **snapshot tag** if a
-maintainer deliberately publishes one, but it is not the normal workflow. Do
-not create a GitHub Release for every main commit: the current cargo-dist
-workflow treats numeric SemVer tags as release input, and a tag per commit
-would create noisy, misleading releases. If a binary snapshot is needed, use
-a CI artifact or a deliberately named prerelease, and mark it as `dev` so the
-stable updater ignores it.
-
-The build identity is injected by the build/release process. The source of
-truth for a stable version remains the package version and its matching tag;
-the Git hash only identifies an untagged development build. A version string
-must not contain a timestamp because that would make the same commit produce a
-different identity.
+`g` prefix. These are runtime build identities, not versions edited into
+`Cargo.toml` on every commit. A source build and a prebuilt binary are both
+valid clients; `install: source` is provenance, not a compatibility failure.
 
 ## What the user sees
 
-`buzzx --version` stays a one-line, script-friendly answer:
+`buzzx --version` remains a one-line, script-friendly answer:
 
 ```text literal
 buzzx 0.1.0
 ```
 
-For an untagged main build it is, for example:
+An untagged `main` build is, for example:
 
 ```text literal
 buzzx 0.0.0-main.gabcdef123456
 ```
 
-The TUI About surface carries the information needed for support without
-making the channel header noisy:
+The TUI About surface carries diagnostic provenance without making the channel
+header noisy:
 
 ```text literal
 buzzx 0.0.0-main.gabcdef123456
@@ -78,46 +61,21 @@ relay: buzz.surac.cloud
 config: ~/.config/buzzx/config.toml
 ```
 
-The `?` help surface shows the version and channel, and `Ctrl+P → About`
-opens the complete diagnostic view. The status bar remains reserved for
-connection, read, and write state. A source build and a prebuilt binary are
-both valid clients; `install: source` is provenance, not a compatibility
-failure.
-
 ## Installation paths
 
-Users choose one path and keep using its update procedure. The client does not
-silently change a source installation into a prebuilt installation.
+Choose one path and keep using its update procedure. `buzzx` never silently
+changes a source installation into a prebuilt installation.
 
-### Prebuilt release (recommended for regular users)
+### Prebuilt release
 
-The release workflow is the existing cargo-dist path:
+The release workflow builds Linux, macOS, and Windows artifacts. Installation
+and checksum instructions are in [`installation.md`](installation.md). The
+installer changes the binary and PATH only; it does not remove configuration,
+private keys, relay preferences, or read state.
 
-```text literal
-merge main → set the package version → run the full checks
-→ push vX.Y.Z → build Linux/macOS/Windows artifacts
-→ publish the GitHub Release, notes, and SHA-256 files
-```
+### Tagged source install (manual)
 
-Linux and macOS use the release `buzzx-installer.sh`; Windows uses
-`buzzx-installer.ps1`. Manual archive installation remains available. After
-installing, verify:
-
-```text literal
-buzzx --version
-buzzx login
-buzzx whoami
-```
-
-The installer changes the binary and PATH only. It does not remove the config,
-private key, relay preference, or read state. The unsigned-release warnings
-described in [`installation.md`](installation.md) remain visible to the
-user.
-
-### Stable source build (reproducible)
-
-Use a release tag when the source build is meant to reproduce a published
-version:
+Use a release tag when the source build must reproduce a published version:
 
 ```sh
 git clone https://github.com/suraciii/buzzx.git
@@ -126,94 +84,151 @@ git checkout v0.1.0
 cargo install --locked --path . --force
 ```
 
-The installed command reports `buzzx 0.1.0`, while About identifies the
-provenance as `source`. The pinned Rust toolchain and `Cargo.lock` are part
-of the reproducibility contract; `--locked` is required.
+Tagged source installs remain manual. To select another release, fetch tags,
+check out the desired tag, and run the same locked install command. Do not use
+managed `buzzx update` for a tagged checkout: the managed source path follows
+only clean `main`.
 
-To update a stable source installation, select the new tag and reinstall:
+### Main source install (managed updates)
 
-```sh
-git fetch --tags origin
-git checkout v0.1.1
-cargo install --locked --path . --force
-```
-
-Do not use an unreviewed `git pull` when the goal is to reproduce a release.
-
-### Main/source development build
-
-For the current unreleased product, build from a pinned commit or from
-`main`:
+The managed path follows `origin/main` from a clean `main` checkout. Install
+from that checkout with:
 
 ```sh
 git clone https://github.com/suraciii/buzzx.git
 cd buzzx
-git checkout <commit>
 cargo install --locked --path . --force
 ```
 
-The binary reports `0.0.0-main.g<short-sha>` for a clean `main` commit. To
-update it, choose the next commit deliberately and reinstall:
+The command must be run from the checkout or one of its subdirectories. The
+update implementation finds the repository by walking upward to a directory
+containing `.git`, `Cargo.toml`, and package name `buzzx`.
 
-```sh
-git fetch origin
-git checkout <new-commit>
+The installed Cargo root must be the root that owns the running executable:
+`current_exe` is `<cargo-root>/bin/buzzx` (or `buzzx.exe`), and its
+`<cargo-root>/.crates2.json` entry must record this checkout as the `buzzx`
+source install. A checkout or `target/` executable is rejected. This prevents
+an unrelated or in-tree development binary from changing the repository.
+
+## Update commands
+
+The command uses flags; there is no subcommand form:
+
+```text literal
+buzzx update              # apply a managed source update
+buzzx update --check      # inspect; no HEAD move and no Cargo build
+buzzx update --plan       # show the apply plan; no HEAD move and no Cargo build
+```
+
+`--check` and `--plan` are mutually exclusive. `--prerelease` is meaningful
+only for prebuilt release checks; a source update rejects it. Startup checks,
+background checks, downloads, automatic restarts, and service restarts are not
+performed.
+
+### Prebuilt binaries
+
+For a prebuilt binary, `buzzx update --check` and `buzzx update --plan` perform
+the stable Release check (or include prereleases when `--prerelease` is given)
+and provide the external installer path. They do not download or replace the
+binary. Bare `buzzx update` returns `unsupported_install`: the release owner is
+the external installer, not the source checkout.
+
+### Source binaries
+
+For an installed source binary, the source path takes precedence over a
+generic release-check result. The command resolves the checkout first and
+accepts only a clean `main` branch on Linux or macOS. It uses `origin/main` as
+the only target.
+
+`--check` and `--plan` may perform one bounded
+`git fetch --no-tags origin main`. Fetch can modify only Git's remote-tracking
+reference; it does not change HEAD, files, or the installed binary. The output
+identifies the current and target commits. `--plan` also shows the exact
+fast-forward and install commands and that a restart is required after apply.
+
+A bare `buzzx update` records the current commit, verifies that it is an
+ancestor of `origin/main`, and runs `git merge --ff-only origin/main`. If the
+commits are equal it returns `up_to_date` without running Cargo. Otherwise it
+runs:
+
+```text literal
 cargo install --locked --path . --force
 ```
 
-If the checkout is dirty, stop before replacing the binary and either commit,
-stash, or discard the local changes explicitly. The client must not overwrite
-work the user has not chosen to lose.
+Cargo output goes to stderr; stdout remains one JSON object. The newly
+installed executable is run with `build-info` and must report the target
+commit, `install_kind: source`, and a clean source identity. Only after that
+verification does the command report success. The current process is still
+the old binary, so a successful update always requires the user to restart
+`buzzx`.
 
-## Checking for updates
+The command never auto-stashes, merges, resets a dirty tree, or restarts a
+service. Dirty trees, detached HEAD, branches other than `main`, missing
+`origin/main`, and divergent history stop without moving HEAD. On Windows,
+a source install returns `blocked` with the manual command because automatic
+replacement is not supported there.
 
-`buzzx update check` is an explicit, read-only check against the canonical
-GitHub Releases metadata. It is not required for login, channel reads, or
-sending. Startup checks are off by default.
+On Cargo or post-install verification failure, the checkout is restored with
+`git reset --keep` to the recorded previous commit. This rollback changes the
+checkout only; it does not roll back a binary or configuration. The result is
+`failed`, never success, and includes a manual reinstall command when the
+installed binary may no longer match the checkout.
 
-For a prebuilt stable binary, the check can return `up_to_date` or
-`update_available`. For a source build it returns `source_build`, including
-the current commit, the latest stable release if one exists, and the command
-to update the checkout. It must never report a development build as “the
-latest stable version”. Offline, rate-limited, malformed, and unavailable
-metadata return `unknown` with a retryable reason.
+## JSON result and exit codes
 
-The machine-readable result contains at least:
+Every update path writes one JSON object to stdout. Cargo logs may go to
+stderr. Git diagnostics are suppressed from both JSON and stderr so remote
+credentials cannot leak. The stable status and exit-code contract is:
+
+| Status | Meaning | Exit code |
+|---|---|---:|
+| `up_to_date` | HEAD already equals `origin/main`; no install | 0 |
+| `update_available` | `--check` or `--plan` found a newer target | 0 |
+| `updated` | Fast-forward and new-binary verification succeeded | 0 |
+| `blocked` | Dirty, wrong branch, detached, diverged, missing checkout, or Windows | 1 |
+| `unsupported_install` | Prebuilt install; external installer owns updates | 1 |
+| `unknown` | Fetch or target resolution failed | 2 |
+| `failed` | Cargo install or new-binary verification failed | 4 |
+
+The report contains the running/current and target commits as distinct fields;
+unknown values are `null`. Source reports include `install_kind: source` and
+the resolved `source_path`; prebuilt reports use the build identity when it
+provides a commit. Errors use stable reasons and a safe message. Raw Git
+diagnostics, credentials, auth tags, relay credentials, and config values
+never appear in JSON or stderr.
+
+For example, a successful source apply has this shape:
 
 ```json
 {
-  "current_version": "0.0.0-main.gabcdef123456",
-  "latest_stable_version": "0.1.0",
-  "status": "source_build",
-  "channel": "dev",
+  "status": "updated",
   "install_kind": "source",
-  "source_commit": "abcdef123456",
-  "release_url": "https://github.com/suraciii/buzzx/releases/tag/v0.1.0",
-  "update_command": "git checkout v0.1.0 && cargo install --locked --path . --force"
+  "source_path": "/work/buzzx",
+  "branch": "main",
+  "current_commit": "abcdef123456",
+  "target_commit": "fedcba654321",
+  "previous_commit": "abcdef123456",
+  "restart_required": true,
+  "error": null,
+  "message": "updated from abcdef123456 to fedcba654321"
 }
 ```
 
-The TUI may show a non-blocking `update available` notice and an About/update
-panel. It does not execute a shell command, download a binary, replace the
-running executable, or restart the session. The current process remains on
-the version shown in About until the user installs and restarts it.
+`current_commit` is the checkout commit at action start, `target_commit` is
+the resolved `origin/main`, and `previous_commit` is the commit used for
+rollback. They are not interchangeable.
 
 ## First-release checklist
 
 Before creating `v0.1.0`:
 
-1. Decide the release scope and finish the full repository checks.
-2. Run the installed-binary acceptance on Linux and the real-machine checks
-   available for macOS and Windows.
-3. Set `Cargo.toml` to `0.1.0`, merge that change, and verify the tag will
-   match it exactly.
-4. Push `v0.1.0`; inspect the GitHub Release assets and every checksum.
-5. Install one artifact on each available platform and record `--version`,
+1. Finish the full repository checks and release acceptance.
+2. Install one artifact on each available platform and record `--version`,
    `whoami`, and the live TUI smoke result.
-6. Verify a source checkout of `v0.1.0` reports the same release version and
-   that a clean `main` checkout reports a `0.0.0-main.g<sha>` development
-   version.
+3. Set `Cargo.toml` to `0.1.0`, merge it, and verify the tag matches exactly.
+4. Push `v0.1.0`; inspect release assets and every checksum.
+5. Verify a source checkout of `v0.1.0` reports the release version and a clean
+   `main` checkout reports `0.0.0-main.g<sha>`.
 
-The public release is complete only when both installation paths are honest:
-the prebuilt path is easy to install, and the source path tells the user
-exactly which commit they are running and how to move to the next one.
+The release is complete only when both installation paths state exactly how a
+user installs and moves to the next version.

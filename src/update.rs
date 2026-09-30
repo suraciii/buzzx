@@ -1,19 +1,10 @@
-//! The explicit update check. The product contract is
-//! docs/versioning-and-updates.md: `buzzx update check` asks one read-only
-//! question of the canonical GitHub Releases metadata and reports what it
-//! found. It never downloads a binary, runs a shell command, replaces the
-//! running executable, or restarts the session.
-//!
-//! The check is split in two. `decide` is pure: given the build identity and
-//! a release list, it answers. `check` adds the network: one GET, no
-//! credentials, and every failure — offline, rate limited, unexpected status,
-//! malformed body — becomes `unknown` with a reason that says retrying may
-//! help. Nothing here retries anything, because nothing here writes anything.
+//! Prebuilt Release checks and the separate managed source update path.
 
 use std::cmp::Ordering;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+pub mod source;
 
 /// The repository whose releases are the canonical update source.
 const REPO: &str = "suraciii/buzzx";
@@ -29,7 +20,6 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 pub enum Status {
     UpToDate,
     UpdateAvailable,
-    SourceBuild,
     Unknown,
 }
 
@@ -49,7 +39,6 @@ pub enum Channel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallKind {
-    Source,
     Prebuilt,
 }
 
@@ -241,10 +230,9 @@ fn latest_release(releases: &[Release], include_prereleases: bool) -> Option<&Re
         .max_by_key(|release| parse_version(&release.tag_name))
 }
 
-/// Answer the check from the release list, with no I/O. This is the whole
-/// decision table: a source build reports what it runs and how to move the
-/// checkout; a prebuilt build compares its version with the selected
-/// release; anything unparseable is `unknown`.
+/// Answer the check from the release list, with no I/O. Prebuilt builds
+/// compare their version with the selected release; anything unparseable is
+/// `unknown`.
 pub fn decide(
     build: &BuildIdentity,
     releases: &[Release],
@@ -259,83 +247,63 @@ pub fn decide(
         .and_then(|release| release.html_url.clone())
         .filter(|url| !url.is_empty());
 
-    match build.install_kind {
-        InstallKind::Source => UpdateReport {
+    if build.channel == Channel::Prerelease && !include_prereleases {
+        return unknown(
+            build,
+            "prerelease builds require --prerelease to compare releases".to_string(),
+        );
+    }
+    let current = match parse_version(&build.version) {
+        Some(version) => version,
+        None => {
+            return unknown(
+                build,
+                format!(
+                    "current version {} is not a valid SemVer value",
+                    build.version
+                ),
+            );
+        }
+    };
+    let release = match target.or(stable) {
+        Some(release) => release,
+        None => {
+            return unknown(
+                build,
+                "no stable release is published for this repository yet".to_string(),
+            );
+        }
+    };
+    match parse_version(&release.tag_name) {
+        None => unknown(
+            build,
+            format!(
+                "latest release tag {} is not a valid SemVer value",
+                release.tag_name
+            ),
+        ),
+        Some(latest) if current >= latest => UpdateReport {
             current_version: build.version.clone(),
             latest_stable_version,
-            status: Status::SourceBuild,
+            status: Status::UpToDate,
             channel: build.channel,
             install_kind: build.install_kind,
             source_commit: build.source_commit.clone(),
             release_url,
-            update_command: target.map(|release| {
-                format!(
-                    "git checkout {} && cargo install --locked --path . --force",
-                    release.tag_name
-                )
-            }),
+            update_command: None,
             reason: None,
         },
-        InstallKind::Prebuilt => {
-            if build.channel == Channel::Prerelease && !include_prereleases {
-                return unknown(
-                    build,
-                    "prerelease builds require --prerelease to compare releases".to_string(),
-                );
-            }
-            let current = match parse_version(&build.version) {
-                Some(version) => version,
-                None => {
-                    return unknown(
-                        build,
-                        format!(
-                            "current version {} is not a valid SemVer value",
-                            build.version
-                        ),
-                    );
-                }
-            };
-            let release = match target.or(stable) {
-                Some(release) => release,
-                None => {
-                    return unknown(
-                        build,
-                        "no stable release is published for this repository yet".to_string(),
-                    );
-                }
-            };
-            match parse_version(&release.tag_name) {
-                None => unknown(
-                    build,
-                    format!(
-                        "latest release tag {} is not a valid SemVer value",
-                        release.tag_name
-                    ),
-                ),
-                Some(latest) if current >= latest => UpdateReport {
-                    current_version: build.version.clone(),
-                    latest_stable_version,
-                    status: Status::UpToDate,
-                    channel: build.channel,
-                    install_kind: build.install_kind,
-                    source_commit: build.source_commit.clone(),
-                    release_url,
-                    update_command: None,
-                    reason: None,
-                },
-                Some(_) => UpdateReport {
-                    current_version: build.version.clone(),
-                    latest_stable_version,
-                    status: Status::UpdateAvailable,
-                    channel: build.channel,
-                    install_kind: build.install_kind,
-                    source_commit: build.source_commit.clone(),
-                    release_url,
-                    update_command: Some(installer_command(&release.tag_name)),
-                    reason: None,
-                },
-            }
-        }
+        Some(_) => UpdateReport {
+            current_version: build.version.clone(),
+            latest_stable_version,
+            status: Status::UpdateAvailable,
+            channel: build.channel,
+            install_kind: build.install_kind,
+            source_commit: build.source_commit.clone(),
+            release_url,
+            update_command: Some(installer_command(&release.tag_name)),
+            reason: None,
+        },
     }
 }
 
@@ -450,15 +418,6 @@ mod tests {
             channel: Channel::Stable,
             install_kind: InstallKind::Prebuilt,
             source_commit: None,
-        }
-    }
-
-    fn source_build(version: &str, commit: &str) -> BuildIdentity {
-        BuildIdentity {
-            version: version.to_string(),
-            channel: Channel::Dev,
-            install_kind: InstallKind::Source,
-            source_commit: Some(commit.to_string()),
         }
     }
 
@@ -690,31 +649,6 @@ mod tests {
     }
 
     #[test]
-    fn source_build_reports_commit_and_checkout_command() {
-        let build = source_build("0.0.0-main.gabcdef123456", "abcdef123456");
-        let report = decide(&build, &[release("v0.1.0", false, false)], false);
-        assert_eq!(report.status, Status::SourceBuild);
-        assert_eq!(report.channel, Channel::Dev);
-        assert_eq!(report.install_kind, InstallKind::Source);
-        assert_eq!(report.source_commit.as_deref(), Some("abcdef123456"));
-        assert_eq!(report.latest_stable_version.as_deref(), Some("0.1.0"));
-        assert_eq!(
-            report.update_command.as_deref(),
-            Some("git checkout v0.1.0 && cargo install --locked --path . --force")
-        );
-    }
-
-    #[test]
-    fn source_build_without_releases_stays_a_source_build() {
-        let build = source_build("0.0.0-dev.unknown", "unknown");
-        let report = decide(&build, &[], false);
-        assert_eq!(report.status, Status::SourceBuild);
-        assert_eq!(report.latest_stable_version, None);
-        assert_eq!(report.update_command, None);
-        assert_eq!(report.release_url, None);
-    }
-
-    #[test]
     fn prebuilt_without_releases_is_unknown() {
         let report = decide(&stable_build("0.1.0"), &[], false);
         assert_eq!(report.status, Status::Unknown);
@@ -742,26 +676,6 @@ mod tests {
         assert!(non_success_reason(403).contains("rate limited"));
         assert!(non_success_reason(429).contains("rate limited"));
         assert!(non_success_reason(500).contains("500"));
-    }
-
-    #[test]
-    fn report_serializes_to_the_specified_shape() {
-        let build = source_build("0.0.0-main.gabcdef123456", "abcdef123456");
-        let report = decide(&build, &[release("v0.1.0", false, false)], false);
-        let value = serde_json::to_value(&report).expect("serializable");
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "current_version": "0.0.0-main.gabcdef123456",
-                "latest_stable_version": "0.1.0",
-                "status": "source_build",
-                "channel": "dev",
-                "install_kind": "source",
-                "source_commit": "abcdef123456",
-                "release_url": "https://github.com/suraciii/buzzx/releases/tag/v0.1.0",
-                "update_command": "git checkout v0.1.0 && cargo install --locked --path . --force"
-            })
-        );
     }
 
     #[test]
