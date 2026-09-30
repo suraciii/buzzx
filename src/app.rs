@@ -45,6 +45,11 @@ pub enum Mode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskFocus {
+    Sidebar,
+    Timeline,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
     Connecting,
     Connected,
@@ -1407,6 +1412,11 @@ pub struct App {
     community_last_channels: HashMap<String, Uuid>,
     pub channels: Vec<ChannelEntry>,
     pub selected: usize,
+    pub sidebar_open: bool,
+    pub sidebar_cursor: Option<Uuid>,
+    pub desk_focus: DeskFocus,
+    terminal_width: u16,
+    terminal_height: u16,
     /// The focused row of the selected channel. It is also the scroll
     /// position: the viewport keeps the focused row visible.
     pub focus: usize,
@@ -1431,8 +1441,7 @@ pub struct App {
     pub switcher_query: String,
     switcher_saved_query: String,
     pub switcher_editing: bool,
-    /// The switcher's state while it is open. Every layout opens it with `c`;
-    /// it is the only conversation list the client draws.
+    /// The full-screen switcher's state. Every layout opens it with `c`.
     pub switcher: Option<Switcher>,
     /// The command palette's cursor while it is open: an index into
     /// [`Command::ALL`]. Every layout opens it with `Ctrl+P`.
@@ -1553,6 +1562,11 @@ impl App {
             community_last_channels: HashMap::new(),
             channels: Vec::new(),
             selected: 0,
+            sidebar_open: true,
+            sidebar_cursor: None,
+            desk_focus: DeskFocus::Timeline,
+            terminal_width: 0,
+            terminal_height: 0,
             focus: 0,
             mode: Mode::Navigation,
             help: false,
@@ -1708,6 +1722,12 @@ impl App {
             entry.rows.retain(|row| !row.pending);
         }
         view.selected = view.selected.min(view.channels.len().saturating_sub(1));
+        // Browser tabs own navigation; never inherit the TUI's pane state or
+        // terminal dimensions.
+        view.sidebar_cursor = None;
+        view.desk_focus = DeskFocus::Timeline;
+        view.terminal_width = 0;
+        view.terminal_height = 0;
         view.focus = view.channels.get(view.selected).map_or(0, |entry| {
             view.focus.min(entry.rows.len().saturating_sub(1))
         });
@@ -4281,7 +4301,8 @@ impl App {
     /// and sitting at its latest message. Reading older history, previewing the
     /// switcher and a failed load all leave it where it was.
     pub fn note_presented(&mut self) {
-        if self.switcher.is_some()
+        if self.sidebar_active()
+            || self.switcher.is_some()
             || self.palette.is_some()
             || self.help
             || self.agents.open
@@ -4585,6 +4606,14 @@ impl App {
             views.insert(filter, order);
         }
         self.views = views;
+        if self
+            .sidebar_cursor
+            .map(|id| !self.view().contains(id))
+            .unwrap_or(true)
+        {
+            let cursor = self.view().all().next();
+            self.sidebar_cursor = cursor;
+        }
     }
 
     /// Number the conversations in list order and rebuild the views, the way
@@ -4697,19 +4726,63 @@ impl App {
             view.dms.sort_by_key(|id| self.switcher_rank(*id));
             return view;
         }
-        let Some(switcher) = &self.switcher else {
+        self.retain_cursor(view, self.switcher.as_ref().map(|s| s.cursor))
+    }
+
+    pub fn sidebar_view(&self) -> Sections {
+        self.view().clone()
+    }
+
+    pub fn set_terminal_size(&mut self, width: u16, height: u16) {
+        self.terminal_width = width;
+        self.terminal_height = height;
+    }
+
+    fn desk_available(&self) -> bool {
+        crate::layout::mode(self.terminal_width, self.terminal_height)
+            == crate::layout::LayoutMode::Desk
+            && self.surface() == keys::Surface::Channel
+            && self.overlay() == keys::Overlay::None
+    }
+
+    pub fn sidebar_visible(&self) -> bool {
+        self.sidebar_open && self.desk_available()
+    }
+
+    pub fn sidebar_active(&self) -> bool {
+        self.sidebar_visible()
+            && self.mode == Mode::Navigation
+            && self.desk_focus == DeskFocus::Sidebar
+    }
+
+    fn move_sidebar_cursor(&mut self, delta: isize) {
+        let view = self.sidebar_view();
+        let count = view.all().count();
+        if count == 0 {
+            return;
+        }
+        let at = self
+            .sidebar_cursor
+            .and_then(|cursor| view.all().position(|id| id == cursor))
+            .unwrap_or(0);
+        let next = at.saturating_add_signed(delta).min(count - 1);
+        self.sidebar_cursor = view.all().nth(next);
+    }
+
+    fn retain_cursor(&self, mut view: Sections, cursor: Option<Uuid>) -> Sections {
+        let Some(cursor) = cursor else {
             return view;
         };
-        if view.contains(switcher.cursor) {
+        if view.contains(cursor) {
             return view;
         }
-        let Some(entry) = self.channels.iter().find(|c| c.id == switcher.cursor) else {
+        let Some(entry) = self.entry(cursor) else {
             return view;
         };
         if entry.archived != (self.filter == Filter::Archived) {
             return view;
         }
-        let cursor_at = self.index_of(switcher.cursor).unwrap_or(usize::MAX);
+        let cursor_at = self.index_of(cursor).unwrap_or(usize::MAX);
         let section = if entry.is_dm() {
             &mut view.dms
         } else {
@@ -4719,7 +4792,7 @@ impl App {
             .iter()
             .position(|id| self.index_of(*id).unwrap_or(usize::MAX) > cursor_at)
             .unwrap_or(section.len());
-        section.insert(at, switcher.cursor);
+        section.insert(at, cursor);
         view
     }
 
@@ -7788,6 +7861,90 @@ impl App {
             self.handle_thread(action, now);
             return;
         }
+        if self.desk_available() {
+            match action {
+                Action::ToggleSidebar => {
+                    self.sidebar_open = !self.sidebar_open;
+                    self.desk_focus = if self.sidebar_open {
+                        DeskFocus::Sidebar
+                    } else {
+                        DeskFocus::Timeline
+                    };
+                    return;
+                }
+                Action::FocusSidebar if self.sidebar_open => {
+                    self.desk_focus = DeskFocus::Sidebar;
+                    return;
+                }
+                Action::FocusTimeline => {
+                    self.desk_focus = DeskFocus::Timeline;
+                    self.note_presented();
+                    return;
+                }
+                Action::NextRow if self.sidebar_active() => {
+                    self.move_sidebar_cursor(1);
+                    return;
+                }
+                Action::PrevRow if self.sidebar_active() => {
+                    self.move_sidebar_cursor(-1);
+                    return;
+                }
+                Action::Top if self.sidebar_active() => {
+                    self.sidebar_cursor = self.sidebar_view().all().next();
+                    return;
+                }
+                Action::Bottom if self.sidebar_active() => {
+                    self.sidebar_cursor = self.sidebar_view().all().last();
+                    return;
+                }
+                Action::PageUp | Action::ContextLoadOlder if self.sidebar_active() => {
+                    self.move_sidebar_cursor(-(PAGE_ROWS as isize));
+                    return;
+                }
+                Action::PageDown | Action::ContextLoadNewer if self.sidebar_active() => {
+                    self.move_sidebar_cursor(PAGE_ROWS as isize);
+                    return;
+                }
+                Action::ComposeReply if self.sidebar_active() => {
+                    let visible = self.sidebar_view();
+                    if let Some(id) = self.sidebar_cursor
+                        && visible.contains(id)
+                        && let Some(index) = self.index_of(id)
+                        && self.switch_channel(index)
+                    {
+                        self.desk_focus = DeskFocus::Timeline;
+                    }
+                    return;
+                }
+                Action::Dismiss if self.sidebar_active() => {
+                    self.desk_focus = DeskFocus::Timeline;
+                    return;
+                }
+                // Row actions belong to the timeline. While the sidebar has
+                Action::ComposeNew
+                | Action::React
+                | Action::EditRow
+                | Action::DeleteRow
+                | Action::OpenThread
+                | Action::OpenReader
+                    if self.sidebar_active() =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+            if self.sidebar_active()
+                && let Action::Channel(n) = action
+            {
+                if let Some(id) = self.shortcut_target(n)
+                    && let Some(index) = self.index_of(id)
+                    && self.switch_channel(index)
+                {
+                    self.desk_focus = DeskFocus::Timeline;
+                }
+                return;
+            }
+        }
         // The switcher's promise is `type to filter`, so while it is open the
         // query editor owns every printable key: a digit is name text, not a
         // session shortcut. Jumping from here would open a conversation the
@@ -7857,8 +8014,10 @@ impl App {
                 let target = self.shortcut_target(n).and_then(|id| self.index_of(id));
                 self.close_switcher();
                 self.palette = None;
-                if let Some(index) = target {
-                    self.switch_channel(index);
+                if let Some(index) = target
+                    && self.switch_channel(index)
+                {
+                    self.desk_focus = DeskFocus::Timeline;
                 }
             }
             Action::FilterNext => self.set_filter(self.filter.next()),
@@ -8230,9 +8389,12 @@ impl App {
         self.sync_mention_picker();
     }
 
-    fn switch_channel(&mut self, index: usize) {
-        if self.channels.is_empty() || index >= self.channels.len() || index == self.selected {
-            return;
+    fn switch_channel(&mut self, index: usize) -> bool {
+        if index >= self.channels.len() {
+            return false;
+        }
+        if index == self.selected {
+            return true;
         }
         self.mention_bindings.clear();
         self.mention_picker = None;
@@ -8242,6 +8404,8 @@ impl App {
         self.save_position();
         let label = self.label(&self.channels[index]);
         let id = self.channels[index].id;
+        self.sidebar_cursor = Some(id);
+        self.desk_focus = DeskFocus::Timeline;
         self.selected = index;
         self.channels[index].loading = true;
         self.adopt_draft();
@@ -8250,6 +8414,7 @@ impl App {
         self.restore_position();
         self.status = format!("opened {label}");
         self.outbox.push(SessionCommand::OpenChannel(id));
+        true
     }
 
     /// `f`/Tab: the next filter. The switcher's cursor moves to the first
@@ -15406,5 +15571,153 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, SessionCommand::AddMembers { .. }))
         );
+    }
+    #[test]
+    fn sidebar_cursor_moves_without_touching_timeline_or_read_frontier() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2)];
+        for (index, entry) in app.channels.iter_mut().enumerate() {
+            entry.rows = vec![row(&format!("{:064x}", index + 1), 20, "other")];
+            entry.read.frontier = 10;
+            entry.read.coverage = Coverage::Complete;
+            entry.read.marked = true;
+            entry.read.unread.insert(
+                entry.rows[0].event_id.clone(),
+                Candidate {
+                    at: 20,
+                    mention: true,
+                },
+            );
+        }
+        app.marker_read = true;
+        app.stub_roster();
+        app.set_terminal_size(112, 16);
+        app.desk_focus = DeskFocus::Sidebar;
+        let focused = app.focused_row().unwrap().event_id.clone();
+        app.take_outbox();
+        app.handle(Action::NextRow, 30);
+        app.note_presented();
+        assert_eq!(app.sidebar_cursor, Some(app.channels[1].id));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.focused_row().unwrap().event_id, focused);
+        assert!(
+            app.channels
+                .iter()
+                .all(|entry| entry.read.frontier == 10 && entry.read.unread.len() == 1)
+        );
+        assert!(app.take_outbox().is_empty());
+        app.handle(Action::FocusTimeline, 31);
+        assert_eq!(app.channels[0].read.frontier, 20);
+        assert_eq!(app.channels[1].read.frontier, 10);
+    }
+
+    #[test]
+    fn sidebar_enter_switches_and_preserves_saved_draft() {
+        let mut app = app();
+        app.channels = vec![channel(1), channel(2)];
+        app.stub_roster();
+        app.set_terminal_size(112, 16);
+        app.composer.set_text("keep this draft");
+        app.desk_focus = DeskFocus::Sidebar;
+        app.handle(Action::NextRow, 10);
+        let target = app.sidebar_cursor.expect("sidebar cursor");
+        app.handle(Action::ComposeReply, 10);
+        assert_eq!(app.selected, app.index_of(target).unwrap());
+        assert_eq!(app.desk_focus, DeskFocus::Timeline);
+        assert_eq!(app.channels[0].draft.text(), "keep this draft");
+        assert!(app.channels[0].read.unread.is_empty());
+    }
+
+    #[test]
+    fn sidebar_preference_survives_resize_fallback_and_overlays() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.set_terminal_size(112, 16);
+        assert!(app.sidebar_visible());
+        app.sidebar_open = false;
+        app.set_terminal_size(111, 16);
+        assert!(!app.sidebar_visible());
+        app.set_terminal_size(112, 16);
+        assert!(!app.sidebar_visible());
+        app.sidebar_open = true;
+        app.help = true;
+        assert!(!app.sidebar_visible());
+        app.help = false;
+        app.mode = Mode::Composer;
+        assert!(app.sidebar_visible());
+        app.handle(Action::ToggleSidebar, 10);
+        assert!(app.sidebar_open);
+    }
+    #[test]
+    fn sidebar_row_actions_cannot_target_the_timeline() {
+        let (mut app, _id, _root, _reply, _author) = channel_with_a_reply();
+        app.set_terminal_size(112, 16);
+        app.desk_focus = DeskFocus::Sidebar;
+        app.handle(Action::OpenThread, 10);
+        app.handle(Action::ComposeNew, 10);
+        app.handle(Action::React, 10);
+        app.handle(Action::EditRow, 10);
+        app.handle(Action::DeleteRow, 10);
+        app.handle(Action::Top, 10);
+        app.handle(Action::Bottom, 10);
+        app.handle(Action::PageUp, 10);
+        app.handle(Action::PageDown, 10);
+        app.handle(Action::ContextLoadOlder, 10);
+        app.handle(Action::ContextLoadNewer, 10);
+        assert_eq!(app.mode, Mode::Navigation);
+        assert!(!app.thread.open);
+        assert!(app.take_outbox().is_empty());
+    }
+
+    #[test]
+    fn toggling_sidebar_sets_effective_focus_by_visibility() {
+        let mut app = app();
+        app.channels = vec![channel(1)];
+        app.stub_roster();
+        app.set_terminal_size(112, 16);
+        app.desk_focus = DeskFocus::Sidebar;
+        app.handle(Action::ToggleSidebar, 10);
+        assert!(!app.sidebar_open);
+        assert_eq!(app.desk_focus, DeskFocus::Timeline);
+        assert!(!app.sidebar_active());
+        app.handle(Action::ToggleSidebar, 10);
+        assert!(app.sidebar_open);
+        assert_eq!(app.desk_focus, DeskFocus::Sidebar);
+        assert!(app.sidebar_active());
+    }
+
+    #[test]
+    fn sidebar_jumps_move_only_its_visible_cursor_and_empty_filters_cannot_open() {
+        let mut app = app();
+        app.channels = (1..=24).map(channel).collect();
+        app.channels[0].rows = vec![row("source", 20, "other")];
+        app.stub_roster();
+        app.set_terminal_size(120, 30);
+        app.desk_focus = DeskFocus::Sidebar;
+        for (action, index) in [
+            (Action::Bottom, 23),
+            (Action::PageUp, 13),
+            (Action::ContextLoadOlder, 3),
+            (Action::Top, 0),
+            (Action::PageDown, 10),
+            (Action::ContextLoadNewer, 20),
+        ] {
+            app.handle(action, 30);
+            assert_eq!(app.sidebar_cursor, Some(app.channels[index].id));
+            assert_eq!(app.selected, 0);
+            assert_eq!(app.focused_row().unwrap().event_id, "source");
+            assert!(app.take_outbox().is_empty());
+        }
+        app.set_filter(Filter::Unread);
+        assert_eq!(app.sidebar_cursor, None);
+        app.handle(Action::ComposeReply, 30);
+        assert_eq!(app.selected, 0);
+        assert!(app.take_outbox().is_empty());
+        app.channels[1].archived = true;
+        app.set_filter(Filter::Archived);
+        assert_eq!(app.sidebar_cursor, Some(app.channels[1].id));
+        app.set_filter(Filter::All);
+        assert_eq!(app.sidebar_cursor, Some(app.channels[0].id));
     }
 }

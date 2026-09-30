@@ -5,6 +5,25 @@ overlays apply to those rows, and how unread state is decided. It is the
 contract that `content.rs` and the row-manipulation parts of `app.rs`
 implement.
 
+## Channel shell
+
+The renderer presents one channel surface with responsive geometry. At
+`>=112x16`, Desk reserves 24 columns total for the conversation sidebar,
+including its divider; the remaining rectangle is the main timeline surface.
+Desk open and closed are geometry choices, not separate conversation data.
+When closed, the main rectangle expands with no ghost gutter. Below Desk the
+main surface is full width and conversation discovery uses the full-screen
+switcher.
+
+The sidebar and switcher consume the same `Sections`, filter, ordering and
+signals. The sidebar cursor stays visible or empty; the switcher may retain a
+nonmatching row. Sidebar cursor is action focus; current conversation is place.
+Cursor movement never changes
+the selected timeline, event focus, viewport, or read marker. Thread, Context,
+Reader, Search, Agents, Help and other overlays replace the channel surface
+and hide the sidebar; return restores open preference, pane focus, cursor,
+event focus, viewport, draft and target. Composer input isolates pane keys.
+
 ## Event kinds
 
 Kinds come from `buzz_core::kind`. The values below are the ones buzzx acts

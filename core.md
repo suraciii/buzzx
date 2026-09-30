@@ -50,20 +50,20 @@ display, `buzzx` is Buzz's client for people in a terminal. Same product,
 fourth surface. It does not replace any of them, and it is not a tool for
 operating a relay.
 
-`buzzx tui` opens a session with three regions:
+`buzzx tui` opens a channel workspace whose layout adapts to the terminal:
 
-1. A conversation navigation layer: the full-screen conversation switcher
-   (opened with `c`, listed by the `Ctrl+P` palette). It shows the channels and
-   direct conversations the identity belongs to.
-2. A timeline. It shows the messages of the selected conversation, and it
-   takes the full terminal width at every size: there is no permanent sidebar.
-3. A composer at the bottom. It sends, replies, reacts, edits, and deletes.
+1. In Desk mode (`>=112` columns and `>=16` rows), a 24-column conversation sidebar (including its divider) sits beside the main surface. The sidebar shows the channels, direct conversations, and Inbox signals available to the identity; the main surface shows the selected conversation's timeline and composer.
+2. Below Desk, the main surface uses the available width for the timeline, composer, and status. The conversation list remains available through the full-screen switcher.
+3. The composer sends, replies, reacts, edits, and deletes.
 
-The navigation layer groups channels and direct conversations and carries a
+Desk opens with the sidebar visible. `Ctrl+S` toggles it; when closed, the main surface expands without a ghost gutter. Sidebar navigation has its own cursor and focus: `h`/`l` switch between sidebar and timeline, `j`/`k` move the sidebar cursor, and `Enter` opens its conversation. Moving that cursor does not change the selected conversation, timeline focus, or read marker. `c` continues to open the full-screen conversation switcher. Both share sections, ordering, filters and signals; the sidebar cursor stays visible or empty, while the switcher may retain a row after it stops matching.
+
+The channel list groups channels and direct conversations and carries a
 lightweight Inbox view. Unread is computed from a read marker (kind 30078)
 plus events observed while a conversation is not selected. If either lookup
 is incomplete, the client shows an unknown/checking state rather than claiming
-that everything is read.
+that everything is read. Existing visibility rules, including the Archived
+filter behavior where available, remain part of the conversation list contract.
 
 The session is live. A message that arrives appears without a refresh. A
 message that the user sends appears at once.

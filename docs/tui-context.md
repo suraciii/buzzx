@@ -290,12 +290,12 @@ state. Preserve unrelated drafts without showing revoked content.
 
 ## Shared UI and minimum budgets
 
-Reuse [revision 5](tui-visual.md). All new views are single-column fullscreen,
+Search, Context and Reader remain single-column full-screen inspection views,
 with context at the top, content in the middle, and actions/state at the bottom.
-No additional persistent sidebar, split-thread panel or card language is added.
-The conversation list is an overlay in every layout: the timeline keeps the
-full terminal width, and `c` opens the same switcher at 80 columns and up as
-it does below.
+They hide the channel sidebar and retain its session preference and operation
+focus on return. The channel shell's responsive geometry and conversation
+navigation are specified in [TUI use](tui-use.md#layout); these views do not add
+another sidebar, split-thread panel or message-card language.
 
 At 24x6, search uses header, applied query/scope summary, two result/context
 rows, actions and state. A filter form replaces results while editing. Show

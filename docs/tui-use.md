@@ -22,67 +22,67 @@ The relay defaults to `http://localhost:3000`. See
 ## Layout
 
 The client picks its layout from the terminal's size and never infers a device
-type. The selected conversation, focused row, draft, and reply target survive
-a resize. Read progress is tracked per conversation and shared through the
-relay; the limits are described below.
+type. The selected conversation, focused row, draft, reply target, sidebar
+preference, sidebar cursor, filter, and pane focus survive a resize. Read
+progress is tracked per conversation and shared through the relay; the limits
+are described below.
 
 | Terminal | Layout | What it shows |
 | --- | --- | --- |
-| At least 80 columns and 12 rows | Wide | Full-width timeline, composer, and status line. |
-| At least 40 columns and 10 rows, but not wide | Narrow | The same timeline; `c` opens the full-screen conversation switcher. |
-| At least 24 columns and 6 rows, but neither above | Minimal | The same timeline with compact typing text and a one-line composer while composing. |
+| `>=112` columns × `>=16` rows | Desk | A 24-column sidebar including its divider, beside the main channel surface. It opens by default. |
+| `>=80` columns × `>=12` rows, but below Desk width or height | Wide | Full-width timeline, composer, and state; no permanent sidebar. |
+| 40–79 columns and `>=10` rows | Narrow | The same timeline; `c` opens the full-screen conversation switcher. |
+| 24–39 columns and `>=6` rows | Minimal | The same timeline with compact typing text and a one-line composer while composing. |
 | Below 24 columns or 6 rows | Too small | A size message. Resize the terminal; the session continues. |
 
-### Timeline first
+### Desk
 
-One column is the base surface at every size: the header names the open
-conversation and the Inbox answer, the timeline takes the rest of the width,
-and the composer, hint and status line sit at the bottom. Nothing is drawn
-beside the timeline, so a 80-column terminal reads a message across the whole
-80 columns instead of a 58-column remainder.
+Desk is one channel shell, not a second conversation model. Its 24-column
+sidebar (divider included) shows community, Inbox, `Channels` and `DMs` using
+existing sections, labels, ordering, signals and typing; its cursor converges
+to a visible conversation or empty state. Main owns conversation and transcript,
+composer, keys and state.
 
-```text diagram
-#general                                                            Inbox read
-> alice       2m
-  the migration is on main
+Desk opens with sidebar visible and Timeline focus. `Ctrl+S` closes an open
+sidebar and focuses Timeline, or opens a closed sidebar and focuses Sidebar.
+Closing removes the sidebar and expands main without a ghost gutter; reopening
+restores preference, cursor and filter. `h/l` switch panes; `j/k`, `g/G`,
+`Home/End`, `PgUp/PgDn` move the active pane; Sidebar `Enter` opens, `Esc` returns.
+Cursor movement does not change conversation, event focus, viewport or read marker.
 
-  bob         1m
-  @tyler can you look
-  +2 reactions
+`c` opens the same full-screen switcher from either pane; both share list,
+filter and ordering, including `Archived`, without
+separate unread semantics. `f` cycles `All`, `Unread`, `For you`, `Archived`;
+`1`–`9` retain direct-open behavior and return focus to Timeline.
 
-j/k move  c switch  Enter reply  ? help
-status: connected https://relay.example | sent | mode: nav | ?=help
-```
+### Main surface below Desk
 
-The header's Inbox segment is `Inbox read` when nothing is unread anywhere,
-`Inbox ● N` with the unread messages outside the open conversation,
-`Inbox @ N` when any of them mentions this identity, and `Inbox ?` when the
-answer is not known yet — a missing roster, an unread marker lookup that has
-not answered, or a catch-up that failed. Narrow and minimal add the connection
-state to the header; the wide header leaves it to the status line. Below 36
-columns the segment is dropped rather than clipping the conversation name.
+Below Desk, timeline uses the available width with conversation and Inbox in
+the header; composer, keys and state remain below. `c` opens the switcher.
+Its fixed signal cell precedes clipping: `● N` unread, `@ N` mention, `?`
+unknown, `Read` retained after filtering, and `…` typing. Existing visibility,
+including Archived where available, remains unchanged.
 
-### Wide
-
-The wide layout keeps the timeline's structure and spends its extra width on
-density: messages are separated by a rule, and the header's connection state
-moves to the status line. Its keys are the same ones every other layout uses.
+The header owns destination and Inbox attention; normal connection state is
+not repeated there when already in state. The state line shows the highest-
+priority actionable condition, omits a normal relay URL, and keeps explicit
+words/symbols legible without color.
 
 ### Narrow and minimal
 
-One column: the timeline, with the conversation, connection state and Inbox
-answer on the top line, and the composer and a status hint at the bottom. The
-full-screen conversation switcher is opened with `c`. In minimal mode the
-typing text is compact and the composer takes one line while it is being used.
+The one-column main surface puts conversation and Inbox on top, with composer
+and state below. Minimal mode compacts typing and uses a one-line composer.
+Bodies wrap available width; long words and URLs may break at character
+boundaries without changing the message.
 
-A message body wraps to the column's width. Long words and URLs break at
-character boundaries; the message itself is unchanged.
+### Overlays and composition
 
-### Too small
-
-Below 24 columns or 6 rows the client shows the size it needs and the size it
-has, and keeps running. Resizing the terminal brings the layout back with the
-selection, the draft, and the reply target intact.
+Thread, Context, Reader, Search, Agents, Help and other overlays replace the
+channel surface and hide the sidebar; save open preference, pane focus, cursor,
+event focus, viewport, draft and target, restoring them on return. Overlay
+keys do not reach the background; `Ctrl+S/h/l` do not move panes. Composition
+isolates these keys per the composer contract and preserves a non-empty draft
+target during navigation.
 
 The session always exposes one focused row in the timeline. Scrolling moves the
 focus with the viewport and keeps the focused row visible. Actions that target a
@@ -194,10 +194,11 @@ In navigation mode:
 ### Conversation switcher
 
 `c` opens the same full-screen switcher at every size; `c` or `Esc` closes it
-without opening anything. It is the only conversation list the client draws,
-and it never advances a read marker: previewing it and opening a conversation
-from it are different acts, and only the conversation that ends up on screen
-with its newest loaded message focused claims its read state.
+without opening anything. In Desk it is the expanded view of the sidebar's
+same conversation list, not a second query or ordering. Neither surface
+advances a read marker: previewing a row and opening a conversation from it
+are different acts, and only the conversation that ends up on screen with its
+newest loaded message focused claims its read state.
 
 ```text diagram
 Switch conversation  name: rel
@@ -384,9 +385,12 @@ does not exist yet.
 
 ## Status line
 
-The bottom line shows three things: the connection state, the relay's answer to
-the last write, and the mode. The connection state is one of `connecting`,
-`connected`, `reconnecting`, or `failed`.
+The bottom state line shows one highest-priority actionable summary, not a
+second mode label. Target and key hints show the active operation. Failure and
+uncertainty take precedence over connection state; reconnecting takes precedence
+over ordinary connected text. It does not repeat the destination, Inbox answer
+or normal relay URL. Connection states are `connecting`, `connected`,
+`reconnecting` and `failed`. Desk geometry does not change this state contract.
 
 ## What `buzzx tui` does not do
 This TUI does not render images, video, or audio. Attachments show as filename

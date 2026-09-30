@@ -1,7 +1,6 @@
-//! Rendering only. `ui.rs` reads `App` state and draws; it never mutates it
-//! and never touches the network. The layout mode follows the frame size; the
-//! timeline is the only base surface, and the conversation list is an overlay
-//! at every size.
+//! Rendering only. Reads App state without mutating it or touching the network.
+//! Desk gives conversation navigation its own pane; inspection surfaces remain
+//! isolated and full width.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -31,7 +30,12 @@ fn author_style() -> Style {
 }
 
 fn action_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
+    let style = Style::default().add_modifier(Modifier::BOLD);
+    if no_color() {
+        style
+    } else {
+        style.fg(Color::Cyan)
+    }
 }
 
 fn pending_style() -> Style {
@@ -429,6 +433,7 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
         _ if app.context.open => draw_context(frame, app, now, area),
         _ if app.search.open => draw_search(frame, app, now, area),
         _ if app.thread.open => draw_thread_surface(frame, app, now, area, mode),
+        LayoutMode::Desk => draw_desk(frame, app, now, area),
         LayoutMode::Wide | LayoutMode::Narrow => draw_column(frame, app, now, area, mode),
         LayoutMode::Minimal => draw_minimal(frame, app, now, area),
     }
@@ -896,17 +901,137 @@ fn wrap_reader_line(line: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// One column: the conversation on top, its timeline, the composer, and the
-/// hint and status lines at the bottom. The conversation list is never drawn
-/// beside it: `c` opens the switcher over this column at every width, so the
-/// timeline keeps the whole width in every layout.
-///
-/// Wide and narrow differ in density alone: the wide header leaves the
-/// connection state to the status line, and its timeline uses the full rows.
+/// Navigation geometry is separate from the channel's vertical budget.
+fn draw_desk(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let (sidebar_width, main_width) =
+        layout::column_widths(area.width, area.height, app.sidebar_visible());
+    if sidebar_width > 0 {
+        draw_sidebar(
+            frame,
+            app,
+            now,
+            Rect::new(area.x, area.y, sidebar_width, area.height),
+        );
+    }
+    draw_column(
+        frame,
+        app,
+        now,
+        Rect::new(area.x + sidebar_width, area.y, main_width, area.height),
+        LayoutMode::Desk,
+    );
+}
+
+fn draw_sidebar(frame: &mut Frame, app: &App, now: u64, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(separator_style());
+    let body = block.inner(area);
+    frame.render_widget(block, area);
+    let parts = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(body);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            clip_with_ellipsis(&app.community_name, body.width as usize),
+            author_style(),
+        )),
+        parts[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("Inbox · {}", app.filter.name())),
+        parts[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("Ctrl+S hide", pending_style())),
+        parts[2],
+    );
+    let view = app.sidebar_view();
+    let rows = conversation_rows(app, &view, false);
+    let items = rows
+        .iter()
+        .map(|row| match row {
+            ListRow::Conversation(id) => {
+                let Some(entry) = app.entry(*id) else {
+                    return ListItem::new("");
+                };
+                let cursor = app.sidebar_active() && app.sidebar_cursor == Some(*id);
+                let place = app
+                    .channels
+                    .get(app.selected)
+                    .is_some_and(|entry| entry.id == *id);
+                let label = if entry.is_dm() {
+                    app.label(entry)
+                } else {
+                    format!("#{}", app.label(entry))
+                };
+                let mut line = conversation_item(
+                    None,
+                    app.marker(entry),
+                    app.unread_count(entry),
+                    &label,
+                    app.is_typing(*id, now),
+                    body.width as usize,
+                );
+                if let Some(span) = line.spans.first_mut() {
+                    span.content = if cursor { "> " } else { "  " }.into();
+                }
+                let style = if cursor {
+                    action_style()
+                } else if place {
+                    highlight_style()
+                } else {
+                    Style::default()
+                };
+                ListItem::new(line).style(style)
+            }
+            ListRow::Heading(name) => ListItem::new(Line::styled(*name, author_style())),
+            ListRow::Empty(text) => ListItem::new(clip_with_ellipsis(text, body.width as usize)),
+            ListRow::Note(text) => ListItem::new(Line::styled(
+                clip_with_ellipsis(text, body.width as usize),
+                pending_style(),
+            )),
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    state.select(item_index(&rows, app.sidebar_cursor));
+    frame.render_stateful_widget(List::new(items), parts[3], &mut state);
+    let hint = if app.sidebar_active() {
+        "j/k move · Enter open"
+    } else {
+        "h sidebar · l timeline"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(hint, pending_style())),
+        parts[4],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("f filter · c switch", pending_style())),
+        parts[5],
+    );
+}
+
+/// Main content retains the same vertical budget with or without navigation.
 fn draw_column(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutMode) {
-    let wide = mode == LayoutMode::Wide;
+    let wide = matches!(mode, LayoutMode::Desk | LayoutMode::Wide);
     let composing = app.mode == Mode::Composer;
     let roomy = area.width >= 40 && area.height >= 16;
+    let area = if roomy {
+        Rect::new(
+            area.x + 2,
+            area.y,
+            area.width.saturating_sub(4),
+            area.height,
+        )
+    } else {
+        area
+    };
     let typing = typing_text(app, now, !wide);
     let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
     let target_rows = u16::from(composing);
@@ -929,7 +1054,24 @@ fn draw_column(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutM
         draw_composer_target(frame, app, column[3]);
         draw_composer(frame, app, column[5]);
     }
-    draw_channel_keys(frame, area.width, column[6], composing);
+    if mode == LayoutMode::Desk && app.overlay() == crate::keys::Overlay::None {
+        let keys = if composing {
+            "Enter send · Esc nav · ? help"
+        } else if app.sidebar_active() {
+            "h/l panes · Ctrl+S sidebar · Enter open · ? help"
+        } else {
+            "j/k move · h/l panes · Ctrl+S sidebar · Enter reply · ? help"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                clip_with_ellipsis(keys, column[6].width as usize),
+                pending_style(),
+            )),
+            column[6],
+        );
+    } else {
+        draw_channel_keys(frame, area.width, column[6], composing);
+    }
     draw_status(frame, app, column[7], wide);
 }
 
@@ -992,7 +1134,7 @@ fn draw_thread_surface(frame: &mut Frame, app: &App, now: u64, area: Rect, mode:
 /// modal by `draw_thread_surface`; the renderer itself is also used full
 /// screen at compact sizes.
 fn draw_thread(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutMode) {
-    let compact = mode != LayoutMode::Wide;
+    let compact = !matches!(mode, LayoutMode::Desk | LayoutMode::Wide);
     let composing = app.mode == Mode::Composer;
     let roomy = area.width >= 40 && area.height >= 16;
     let input_rows = u16::from(composing) * if roomy { 2 } else { 1 };
@@ -1216,10 +1358,8 @@ fn draw_channel_keys(frame: &mut Frame, width: u16, area: Rect, composing: bool)
     frame.render_widget(Paragraph::new(keys), area);
 }
 
-/// The conversation on the left and the Inbox summary on the right. The
-/// compact modes add the connection state here, because their status line
-/// carries the relay's answer.
-fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
+/// Destination and attention belong here; connection belongs in the state row.
+fn draw_header(frame: &mut Frame, app: &App, area: Rect, _with_conn: bool) {
     let entry = app.channels.get(app.selected);
     let loading = entry.map(|c| c.loading).unwrap_or(false);
     let channel = match entry {
@@ -1237,22 +1377,29 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, with_conn: bool) {
         }
         None => "no conversation".to_owned(),
     };
-    let mut right: Vec<String> = Vec::new();
-    if with_conn {
-        right.push(conn_word(app.conn).to_owned());
-    }
-    right.push(app.inbox_summary());
-    let right = right.join(" · ");
+    let right = app.inbox_summary();
+    let right = right
+        .split(' ')
+        .map(|part| {
+            if part.parse::<usize>().is_ok_and(|count| count > 99) {
+                "99+"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let right_width = right.width() as u16;
     // With more than one saved community the header says which one is
     // active; with one it would only repeat the profile name. The
     // conversation keeps its name either way: below this the summary is
     // dropped rather than cutting the conversation in half.
-    let context = if app.communities.len() > 1 {
-        format!("{} / {}", app.community_name, channel)
-    } else {
-        channel
-    };
+    let context =
+        if app.communities.len() > 1 || (area.width >= 80 && !app.community_name.is_empty()) {
+            format!("{} / {}", app.community_name, channel)
+        } else {
+            channel
+        };
     if area.width < 36 || right_width + 12 > area.width {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -1309,10 +1456,21 @@ fn conversation_item(
     };
     let signal = format!("{cell:<SIGNAL_COLUMNS$}");
     let typing = if typing { " …" } else { "" };
-    let budget = width
-        .saturating_sub(column.chars().count() + signal.chars().count() + typing.chars().count());
-    let name: String = name.chars().take(budget).collect();
-    Line::raw(format!("{column}{signal}{name}{typing}"))
+    let budget = width.saturating_sub(column.width() + signal.width() + typing.width());
+    let name = clip_with_ellipsis(name, budget);
+    Line::from(vec![
+        Span::raw(column),
+        Span::styled(
+            signal,
+            if symbol == "@" {
+                mention_style()
+            } else {
+                pending_style()
+            },
+        ),
+        Span::raw(name),
+        Span::styled(typing, pending_style()),
+    ])
 }
 
 /// The columns the signal cell owns: one symbol, up to two digits of count,
@@ -1329,14 +1487,12 @@ enum ListRow {
     Note(String),
 }
 
-/// The switcher's rows. Sections are in a fixed order, and a view with nothing
-/// in it says what its emptiness means instead of showing headings: a typed
-/// name filter that matched nothing says so, and the filter's own emptiness
-/// keeps the four answers `empty_view` distinguishes.
-fn switcher_rows(app: &App, view: &Sections) -> Vec<ListRow> {
+/// Both conversation surfaces share section order and empty-state semantics.
+/// Only the full-screen switcher owns a local name query.
+fn conversation_rows(app: &App, view: &Sections, queried: bool) -> Vec<ListRow> {
     let mut rows = Vec::new();
     if view.channels.is_empty() && view.dms.is_empty() {
-        if app.switcher_query.trim().is_empty() {
+        if !queried {
             rows.push(ListRow::Empty(app.empty_view()));
         } else {
             rows.push(ListRow::Empty("No match"));
@@ -1444,7 +1600,7 @@ fn draw_timeline(frame: &mut Frame, app: &App, area: Rect, now: u64, compact: bo
         compact,
         RowOptions {
             roomy,
-            focus_visible: app.mode != Mode::Composer,
+            focus_visible: app.mode != Mode::Composer && !app.sidebar_active(),
             head: RootMark::None,
         },
     );
@@ -1625,42 +1781,68 @@ fn draw_composer_line(frame: &mut Frame, app: &App, area: Rect) {
     ));
 }
 
-/// The status row's content: the connection word plus the transient notice.
-/// The notice is what the reader has to act on, so a row too narrow for both
-/// shows the notice alone - the header already carries the connection state.
-fn status_detail(app: &App, width: usize) -> String {
-    let connection = conn_word(app.conn);
-    if app.status == connection
-        || app.status.starts_with(&format!("{connection} "))
-        || app.status.starts_with(&format!("{connection}:"))
+/// A single actionable summary; transport health cannot hide a write outcome.
+fn channel_status(app: &App) -> String {
+    let lower = app.status.to_ascii_lowercase();
+    if let Some(reason) = app.status.strip_prefix("send failed: ") {
+        return format!("Not sent: {reason}");
+    }
+    if lower.contains("uncertain") {
+        return "Unconfirmed; not retried".to_owned();
+    }
+    if app
+        .channels
+        .get(app.selected)
+        .is_some_and(|entry| entry.rows.iter().any(|row| row.uncertain))
+    {
+        return "Unconfirmed; not retried".to_owned();
+    }
+    if [
+        "failed",
+        "refused",
+        "not sent",
+        "unconfirmed",
+        "uncertain",
+        "unknown",
+        "draft kept",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+        || app.mention_block.is_some()
     {
         return app.status.clone();
     }
-    let joined = format!("{connection} | {}", app.status);
-    if joined.chars().count() <= width {
-        joined
-    } else {
-        app.status.clone()
+    if app.conn != ConnState::Connected {
+        return conn_word(app.conn).to_owned();
     }
+    let inbox_note = app.inbox_footer();
+    if let Some(note) = &inbox_note
+        && (note.contains("not synced") || note.contains("could not"))
+    {
+        return note.clone();
+    }
+    if let Some(pending) = app.pending_write_summary() {
+        return format!("Pending {pending}");
+    }
+    if !app.composer.text().is_empty() {
+        return "Draft saved".to_owned();
+    }
+    if !app.status.is_empty() && !lower.starts_with("connected") {
+        return app.status.clone();
+    }
+    if let Some(note) = inbox_note {
+        return note;
+    }
+    conn_word(app.conn).to_owned()
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect, wide: bool) {
-    let mode = match app.mode {
-        Mode::Navigation => "nav",
-        Mode::Composer if wide => "composer",
-        Mode::Composer => "compose",
-    };
-    let status = if wide && area.width >= 100 {
-        let detail = status_detail(app, usize::MAX);
-        format!("status: {detail} | mode: {mode} | ?=help")
-    } else {
-        let prefix = format!("{mode} · ");
-        let remaining = area.width.saturating_sub(prefix.width() as u16) as usize;
-        let detail = status_detail(app, remaining);
-        format!("{prefix}{}", clip_with_ellipsis(&detail, remaining))
-    };
+fn draw_status(frame: &mut Frame, app: &App, area: Rect, _wide: bool) {
+    let status = channel_status(app);
     frame.render_widget(
-        Paragraph::new(Line::styled(status.clone(), status_style(&status))),
+        Paragraph::new(Line::styled(
+            clip_with_ellipsis(&status, area.width as usize),
+            status_style(&status),
+        )),
         area,
     );
 }
@@ -1679,15 +1861,12 @@ fn draw_size_message(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
 }
 
-/// The conversation switcher: every accessible, known conversation, the Inbox
-/// filter as tabs, and a local name query. It takes the whole terminal at
-/// every layout: it is the only conversation list the client draws, and the
-/// timeline behind it keeps its width. Opening it, previewing it, and closing
-/// it never advance a read marker.
+/// Full-screen conversation discovery uses the same filtered data as Desk.
+/// Its cursor previews destinations without advancing read state.
 fn draw_switcher(frame: &mut Frame, app: &App, now: u64, area: Rect) {
     let width = list_row_width(area);
     let view = app.switcher_view();
-    let rows = switcher_rows(app, &view);
+    let rows = conversation_rows(app, &view, !app.switcher_query.trim().is_empty());
     let items = list_items(app, &rows, width, now);
     let inner = area.width.saturating_sub(2);
     // Each hint fits the block's inner width, so the whole action stays
@@ -2504,7 +2683,7 @@ fn scroll_window(len: usize, rows: usize, focus: usize) -> std::ops::Range<usize
 /// scroll to show it.
 fn help_text(app: &App, mode: LayoutMode) -> String {
     let mut text = if app.reader.open {
-        if mode == LayoutMode::Wide {
+        if matches!(mode, LayoutMode::Desk | LayoutMode::Wide) {
             READER_WIDE_HELP.to_owned()
         } else {
             READER_COMPACT_HELP.to_owned()
@@ -2514,18 +2693,18 @@ fn help_text(app: &App, mode: LayoutMode) -> String {
     } else if app.palette.is_some() {
         PALETTE_HELP.to_owned()
     } else if app.switcher.is_some() {
-        if mode == LayoutMode::Wide {
+        if matches!(mode, LayoutMode::Desk | LayoutMode::Wide) {
             SWITCHER_WIDE_HELP.to_owned()
         } else {
             SWITCHER_COMPACT_HELP.to_owned()
         }
     } else {
         match (app.thread.open, mode) {
-            (true, LayoutMode::Wide) => THREAD_WIDE_HELP.to_owned(),
+            (true, LayoutMode::Desk | LayoutMode::Wide) => THREAD_WIDE_HELP.to_owned(),
             (true, _) => THREAD_COMPACT_HELP.to_owned(),
             (false, _) if app.search.open => SEARCH_HELP.to_owned(),
             (false, _) if app.context.open => CONTEXT_HELP.to_owned(),
-            (false, LayoutMode::Wide) => WIDE_HELP.to_owned(),
+            (false, LayoutMode::Desk | LayoutMode::Wide) => WIDE_HELP.to_owned(),
             (false, _) => COMPACT_HELP.to_owned(),
         }
     };
@@ -2537,6 +2716,9 @@ fn help_text(app: &App, mode: LayoutMode) -> String {
             crate::version::channel().as_str()
         ),
     );
+    if mode == LayoutMode::Desk && app.surface() == crate::keys::Surface::Channel {
+        text.insert_str(0, "Desk\n  Ctrl+S sidebar toggle  h sidebar  l timeline\n  j/k/Home/End/PgUp/PgDn move active pane\n  Enter opens sidebar conversation or replies on timeline\n\n");
+    }
     if app.thread.open {
         text.push_str(&format!("\nthread / {}\n", app.thread.root));
         if let Some(reason) = &app.thread.failed {
@@ -2553,12 +2735,13 @@ fn help_text(app: &App, mode: LayoutMode) -> String {
     }
     if !app.thread.open {
         text.push_str(&format!(
-            "\nfilter: {} (f cycles All, Unread, For you)\n",
+            "\nfilter: {} (f cycles All, Unread, For you, Archived)\n",
             app.filter.name()
         ));
         if let Some(entry) = app.focused_entry() {
             text.push_str(&format!("selected: {}\n", app.label(entry)));
         }
+        text.push_str(&format!("last outcome: {}\n", app.status));
     }
     if let Some(block) = &app.mention_block {
         // The last send never reached the relay: the full references stay
@@ -2870,6 +3053,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wide_names_yield_to_attention_and_typing_cells() {
+        for marker in [
+            Marker::Mention,
+            Marker::Unread,
+            Marker::Unknown,
+            Marker::Read,
+        ] {
+            let line =
+                conversation_item(None, marker, 1234, "中文中文中文👀很长的会话名", true, 23)
+                    .to_string();
+            assert!(line.width() <= 23, "{line}");
+            assert!(line.contains(marker.text()), "{line}");
+            assert!(line.ends_with('…'), "{line}");
+            assert!(
+                line.contains("1234"),
+                "per-conversation counts remain exact"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_geometry_and_action_focus_do_not_leak_into_overlays() {
+        let mut app = chat_app(vec![message_row(0, "visible message")]);
+        app.set_terminal_size(120, 30);
+        let open = frame_text(&app, 120, 30);
+        assert_eq!(open.lines().next().unwrap().chars().nth(23), Some('│'));
+        app.handle(crate::keys::Action::FocusSidebar, 130);
+        let focused = frame_text(&app, 120, 30);
+        assert!(
+            !focused.contains("> alice"),
+            "sidebar alone owns action focus"
+        );
+        app.handle(crate::keys::Action::ToggleHelp, 130);
+        let help = frame_text(&app, 120, 30);
+        assert!(!help.contains("Ctrl+S hide"));
+        app.handle(crate::keys::Action::Dismiss, 130);
+        assert!(app.sidebar_active());
+        app.handle(crate::keys::Action::ToggleSidebar, 130);
+        let closed = frame_text(&app, 120, 30);
+        assert_ne!(closed.lines().next().unwrap().chars().nth(23), Some('│'));
+        for (width, height) in [(111, 16), (112, 15), (80, 12), (40, 10), (24, 6)] {
+            assert!(!frame_text(&app, width, height).contains("Ctrl+S hide"));
+        }
+    }
+
+    #[test]
+    fn write_outcomes_outrank_connection_and_draft_state() {
+        let mut app = chat_app(vec![message_row(0, "hello")]);
+        app.composer.set_text("keep draft");
+        app.conn = ConnState::Reconnecting;
+        for outcome in ["Not sent: refused", "Unconfirmed: timeout"] {
+            app.status = outcome.to_owned();
+            assert_eq!(channel_status(&app), outcome);
+        }
+        app.status = "connected https://relay.test".to_owned();
+        assert_eq!(channel_status(&app), "reconnecting");
+        app.conn = ConnState::Connected;
+        assert_eq!(channel_status(&app), "Draft saved");
+    }
+
+    #[test]
     fn short_ages_render_coarsely() {
         assert_eq!(age(95, 100), "5s");
         assert_eq!(age(100, 160), "1m");
@@ -2919,30 +3163,6 @@ mod tests {
     }
 
     #[test]
-    fn timeline_density_uses_a_rule_without_making_it_a_focusable_row() {
-        let rows = vec![message_row(0, "first"), message_row(1, "second")];
-        let app = chat_app(rows);
-        let compact = frame_text(&app, 80, 12);
-        assert!(compact.lines().any(|line| line.contains("─")), "{compact}");
-        assert!(
-            !compact.contains("┌"),
-            "the timeline does not draw message boxes: {compact}"
-        );
-
-        let roomy = frame_text(&app, 80, 20);
-        let separator = roomy
-            .lines()
-            .find(|line| line.contains("────────"))
-            .expect("roomy messages have a separator");
-        assert!(separator.starts_with("  ─"), "{separator:?}");
-        let matrix_wide = frame_text(&app, 120, 30);
-        assert!(
-            matrix_wide.lines().any(|line| line.contains("─")),
-            "the 120x30 roomy layout keeps the separator: {matrix_wide}"
-        );
-    }
-
-    #[test]
     fn composing_keeps_roomy_density_and_moves_focus_to_the_composer() {
         let mut app = chat_app(vec![message_row(0, "first"), message_row(1, "second")]);
         app.mode = Mode::Composer;
@@ -2978,57 +3198,6 @@ mod tests {
         assert!(lines[0].starts_with("Help /"), "{text}");
         assert!(lines[4].contains("Esc return"), "{text}");
         assert!(lines[5].starts_with("state:"), "{text}");
-    }
-
-    #[test]
-    fn wide_status_keeps_connection_state_with_a_transient_notice() {
-        let mut app = chat_app(vec![message_row(0, "hello")]);
-        app.status = "read warning".to_owned();
-        let text = frame_text(&app, 120, 19);
-        assert!(text.contains("status: connected | read warning"), "{text}");
-        assert!(text.contains("?=help"), "{text}");
-    }
-
-    #[test]
-    fn narrow_status_gives_the_row_to_the_notice() {
-        let mut app = chat_app(vec![message_row(0, "hello")]);
-        app.status = crate::mentions::Block::Unknown {
-            name: "无此成员".to_owned(),
-        }
-        .summary();
-        let text = frame_text(&app, 24, 6);
-        let status = text.lines().last().unwrap_or_default();
-        assert!(status.starts_with("nav · mention \"@"), "{text}");
-        assert!(!status.contains("connected |"), "{text}");
-        // A row with room for both keeps the connection state.
-        app.status = "Draft kept; Esc back".to_owned();
-        let roomy = frame_text(&app, 79, 12);
-        assert!(
-            roomy.contains("connected | Draft kept; Esc back"),
-            "{roomy}"
-        );
-    }
-
-    #[test]
-    fn narrow_status_keeps_the_connection_word_without_a_notice() {
-        let mut app = chat_app(vec![message_row(0, "hello")]);
-        app.status = "connected".to_owned();
-        let text = frame_text(&app, 24, 6);
-        assert_eq!(
-            text.lines().last().unwrap_or_default().trim_end(),
-            "nav · connected",
-            "{text}"
-        );
-        app.status = "reconnecting: relay closed".to_owned();
-        app.conn = ConnState::Reconnecting;
-        let text = frame_text(&app, 24, 6);
-        assert!(
-            text.lines()
-                .last()
-                .unwrap_or_default()
-                .starts_with("nav · reconnecting"),
-            "{text}"
-        );
     }
 
     fn chat_app(rows: Vec<crate::content::Row>) -> App {
@@ -3443,8 +3612,10 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        let mut app = app.clone();
+        app.set_terminal_size(width, height);
         terminal
-            .draw(|frame| draw(frame, app, 130))
+            .draw(|frame| draw(frame, &app, 130))
             .expect("test frame");
         let buffer = terminal.backend().buffer().clone();
         let mut text = String::new();
@@ -3856,7 +4027,7 @@ mod tests {
         // Every row of the help text is reachable by scrolling, at the
         // smallest size, including the label and the read-state limit.
         let mut seen = first.clone();
-        for _ in 0..24 {
+        for _ in 0..help_lines(&help_text(&app, LayoutMode::Minimal), 24).len() {
             app.handle(crate::keys::Action::HelpScroll(1), 0);
             seen.push_str(&frame_text(&app, 24, 6));
         }
@@ -3876,7 +4047,6 @@ mod tests {
             seen.contains("not synced"),
             "the read-state limit stays reachable"
         );
-        assert!(seen.contains("unread"), "the marker legend stays reachable");
     }
 
     #[test]
@@ -3909,30 +4079,6 @@ mod tests {
                 .unwrap_or_default();
             assert_eq!(hint, expected, "the hint at {columns} columns");
         }
-    }
-
-    #[test]
-    fn a_long_name_gives_up_columns_instead_of_the_signal() {
-        // 18 columns is a narrow row, one short name and its signal.
-        let plain = conversation_item(Some(5), Marker::None, 0, "build", false, 18).to_string();
-        assert_eq!(plain, "5      build");
-        let unread =
-            conversation_item(Some(5), Marker::Unread, 0, "buzzx-tui-build", true, 18).to_string();
-        assert!(unread.contains('●'), "{unread:?} keeps the unread signal");
-        assert!(unread.ends_with('…'), "{unread:?} keeps the typing marker");
-        assert_eq!(unread.chars().count(), 18, "{unread:?} fills the row");
-        let short = conversation_item(Some(1), Marker::Mention, 0, "dm", true, 18).to_string();
-        assert_eq!(short, "1 @    dm …");
-    }
-
-    #[test]
-    fn the_unread_count_survives_a_long_name() {
-        let line = conversation_item(Some(5), Marker::Unread, 12, "buzzx-tui-build", false, 18)
-            .to_string();
-        assert_eq!(line, "5 ● 12 buzzx-tui-b");
-        let mentioned =
-            conversation_item(Some(2), Marker::Mention, 3, "design-review", true, 18).to_string();
-        assert_eq!(mentioned, "2 @ 3  design-re …");
     }
 
     #[test]

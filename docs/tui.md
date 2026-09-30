@@ -21,35 +21,46 @@ does not infer a device type.
 
 | Terminal size | Mode | Behavior |
 | --- | --- | --- |
-| 80 columns × 12 rows or larger | Wide | Full-width timeline, composer, and status line. |
-| 40–79 columns and 10 rows or larger | Narrow | The same one-column timeline. `c` opens the full-screen conversation switcher. Composer stays at the bottom. |
-| 24–39 columns and 6 rows or larger | Minimal | One-column timeline with compact rows and a one-line composer while composing. |
+| `>=112` columns × `>=16` rows | Desk | A 24-column conversation sidebar, including its divider, beside the main channel surface. The sidebar is open by default and `Ctrl+S` toggles it. |
+| `>=80` columns × `>=12` rows, but below Desk width or height | Wide | Full-width timeline, composer, and status line; no permanent sidebar. |
+| 40–79 columns and `>=10` rows | Narrow | The same one-column timeline. `c` opens the full-screen conversation switcher. Composer stays at the bottom. |
+| 24–39 columns and `>=6` rows | Minimal | One-column timeline with compact rows and a one-line composer while composing. |
 | Below 24 columns or 6 rows | Too small | Start the session and show a size message. Keep listening for resize; switch modes automatically when the terminal is large enough. |
 
-Narrow and minimal modes never introduce horizontal scrolling. Message bodies
-wrap to the available width. Long words and URLs may break at character
-boundaries; the underlying message remains unchanged.
+Desk's sidebar and main surface are two panes of one channel page. `h` and `l`
+move operation focus between them; `j/k`, `Home/End`, `g/G` and `PgUp/PgDn`
+move only the focused pane's cursor. `Enter` opens a sidebar conversation.
+The sidebar cursor is not timeline focus; moving it does not change selection,
+viewport, event focus, or read marker. `Esc` from the sidebar returns focus to
+the timeline. `Ctrl+S` closes the sidebar without changing channel state and
+reopens it with its session cursor and filter retained.
 
-The layout is timeline first at every size: the header names the open
-conversation and carries the Inbox answer, and the timeline under it keeps the
-terminal's full width. The conversation list is the switcher opened with `c`,
-which groups rows under `Channels` and `DMs` and uses `All`, `Unread`, and
-`For you` as its filter tabs. A row signal carries the unread message count
-when known (`● 3`, `@ 2`), `?` for unknown, `Read` for a switcher row retained
-after it stops matching, or no signal. Its signal cell is reserved before the
-label is clipped; typing adds `…` after the label. Read-state details and
-limits are in
+The sidebar uses the existing `Sections`, labels, signals, ordering and
+`All`/`Unread`/`For you` filter. The full-screen switcher opened with `c` is
+the same conversation data and filter behavior, not a second list. Existing
+visibility behavior, including the Archived filter where it is exposed,
+remains part of that shared list contract.
+
+Below Desk the layout is timeline first: the header names the open
+conversation and carries the Inbox answer, and the timeline keeps the
+available width. The conversation list is the switcher opened with `c`,
+which groups rows under `Channels` and `DMs`. A row signal carries the unread
+message count when known (`● 3`, `@ 2`), `?` for unknown, `Read` for a
+switcher row retained after it stops matching, or no signal. Its signal cell
+is reserved before the label is clipped; typing adds `…` after the label.
+Read-state details and limits are in
 [shared-core.md](../design/shared-core.md#inbox-and-read-state).
 
 ## Unified keys
 
-The action meaning depends on the layout and on whether the switcher, the
-command palette, or help is open. `j` and `k` move between timeline rows at
-every width. `c` opens the conversation switcher at every width, and `Ctrl+P`
-opens the command palette. `f` cycles `All`, `Unread`, and `For you` in
-navigation mode; `f` or Tab cycles them in the switcher. Help opens with `?`; while open,
-`j`/`k`, `PgUp`/`PgDn`, and `g`/`G` scroll it, and `Esc` or `?` closes it.
-Help displays the full selected conversation label.
+The action meaning depends on the layout and on whether the sidebar, switcher,
+command palette, or help is open. `j` and `k` move the focused pane's cursor:
+timeline rows in the timeline pane and conversations in the Desk sidebar. `c`
+opens the conversation switcher at every width, and `Ctrl+P` opens the command
+palette. `f` cycles the existing Inbox filters, including `Archived` where
+available, in navigation mode; `f` or Tab cycles them in the switcher. Help
+opens with `?`; while open, `j`/`k`, `PgUp`/`PgDn`, and `g`/`G` scroll it, and
+`Esc` or `?` closes it.
 
 | Action | Primary key | Alias |
 | --- | --- | --- |

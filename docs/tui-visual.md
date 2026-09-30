@@ -1,13 +1,11 @@
 # TUI visual language
 
-Status: revision 5, implemented in `src/ui.rs` on the implementation branch.
-Repository checks and fake-relay PTY evidence pass; real-relay write closure
-and physical light/dark terminal coverage remain outside this revision's evidence.
-This is the implementation baseline, including the approved weak message
-separators. It replaces revisions 1-4; previous images remain historical artifacts.
-The [review atlas](assets/tui-design-system.html) contains four boards and dark,
-light and NO_COLOR studies. Its controls are for reviewing the design, not new
-client controls. Sample messages and Agent states are invented fixtures.
+Status: revision 5, implementation baseline. This document defines the
+approved appearance and density rules; it is not runtime verification.
+The [review atlas](assets/tui-design-system.html) contains four boards and
+dark, light and NO_COLOR studies. Its controls are for reviewing the design,
+not new client controls. Sample messages and Agent states are invented
+fixtures.
 
 ![Conversation design study](assets/tui-system-language.png)
 
@@ -45,32 +43,30 @@ a task or thread has finished. The application remains a terminal chat client.
 Every view has four stable positions: context at the top, content in the
 remaining space, available keys near the bottom, and the highest-priority state
 on the last row. A composer occupies the bottom of content only while writing.
-Help and overlays replace the active surface; they do not introduce another
-permanent column. The current [keys and behavior](tui-use.md) remain authoritative.
+Help and overlays replace the active surface.
+
+In Desk, the channel page has one 24-column sidebar (divider included) and a
+main pane. The sidebar is navigation content: active community, Inbox filter,
+Channels, DMs and their signals. The main pane owns destination, transcript,
+composer, keys and state. Desk may be open or closed; closed means the main
+pane expands to the full frame with no ghost gutter. Desk is selected only at
+`>=112x16`. All other modes keep the main surface full width.
 
 | Surface | Context | Main content | Action destination |
 | --- | --- | --- | --- |
-| Channel or DM | Conversation name and Inbox answer | Continuous full-width timeline | New message or explicit reply/edit target |
+| Desk channel or DM | Sidebar: community and Inbox; main: conversation | Sidebar list plus continuous main timeline | New message or explicit reply/edit target |
+| Wide, Narrow or Minimal channel/DM | Conversation name and Inbox answer | Continuous timeline | New message or explicit reply/edit target |
 | Thread | Conversation / Thread | Root and replies in one timeline | Explicit root, reply or edit target |
 | Conversation switcher | Switch conversation / active filter | Channels and DMs with one selection | Selected conversation |
 | My agents | My agents | Names and observed states | Selected Agent's details |
 | Agent detail | My agents / name | State, evidence age, accessible contexts | Selected accessible channel |
 | Help | Help / current context | Full labels, reasons and available keys | Return to previous view |
 
-The timeline header keeps the conversation name on the left and the connection
-and Inbox answer on the right. With two or more saved community profiles it
-prefixes the active community as `community / conversation`, so switching
-relays is never a guess; with one profile the prefix would only repeat a name
-the config file already carries. The prefix yields before the conversation
-name does.
-
-The conversation switcher is the Inbox list at every width: it is an overlay
-over the timeline, never a permanent column, so the timeline keeps the whole
-terminal at 80 columns and up. Agent detail uses the same selection row for
-accessible contexts. Unavailable contexts remain plain, non-actionable text.
-These views do not gain search fields, tabs or management buttons, and the
-switcher's filter tabs are the one tab row the product has: they mirror
-`All`, `Unread` and `For you` rather than introducing a second filter set.
+The sidebar and conversation switcher use one list source, sections, ordering,
+signals and filter behavior, including existing Archived behavior. The
+sidebar cursor is an action focus; the selected conversation is a neutral
+place cue. Moving the cursor does not move timeline focus or read progress.
+Thread and every overlay hide the sidebar and replace the active surface.
 
 ## Visual grammar
 
@@ -113,13 +109,14 @@ messages; compact timelines use no extra separator row. Lists may have one
 intervening blank row in roomy mode, but do not inherit timeline separators.
 Existing newlines in message content are content and are not removed.
 
-The timeline starts at the left edge of the terminal: there is no sidebar
-column to inset it by. A message's focus gutter is two cells, and its body
-follows one cell later; the header, hint and status lines use the full width.
-An overlay draws a one-cell border and its own two-cell focus gutter. At
-widths below 40, reduce outer padding before reducing body width. At 24
-columns, padding can be zero. At 24x6, composition uses exactly the six rows
-illustrated in the density studies.
+In Desk open, the timeline begins after the 24-column sidebar and its
+divider; the sidebar width is already included in that budget. In Desk closed
+and below Desk, the main surface starts at the frame edge. A message's focus
+gutter is two cells, and its body follows one cell later; header, hint and
+status lines use the main surface width. An overlay draws a one-cell border
+and its own two-cell focus gutter. At widths below 40, reduce outer padding
+before reducing body width. At 24 columns, padding can be zero. At 24x6,
+composition uses exactly the six rows illustrated in the density studies.
 
 A compact composer uses one target row immediately followed by one input row.
 A roomy composer uses one target row, one blank row and two input rows. Keep
@@ -145,11 +142,11 @@ when a message is focused, mentioned, pending or uncertain.
 
 - **Roomy timeline:** replace the single gap between adjacent messages with
   one rule row. Start at the body left edge and end at the content right inset;
-  do not cross the focus gutter. The timeline holds the full terminal width,
-  so that inset is the terminal's own edge minus one cell. The rule follows the entire message,
-  including attachment and reaction lines, and precedes the next author. Do not
-  add another gap above or below it, or a rule before the first/after the last
-  message in the loaded sequence.
+  that inset is the main surface's right edge minus one cell; in Desk the
+  sidebar divider is outside that content inset. The rule follows the entire
+  message, including attachment and reaction lines, and precedes the next
+  author. Do not add another gap above or below it, or a rule before the
+  first/after the last message in the loaded sequence.
 - **Compact timeline:** allocate the author, age and semantic labels first.
   If at least six cells remain, leave two spaces and fill the remainder with
   the rule (at least four strokes). Otherwise omit it. Never clip a name,
@@ -197,11 +194,13 @@ channel typing as thread activity. Full errors must not replace the target or
 input; expose the short reason in the state row and full detail through help.
 
 At 24x6, composing is exactly: header, context, target, input, keys, state.
-At that size, reading has three content rows. At 80x12 and up the channel
-keeps the full width, as it does at 79x12 and below: the conversation list is
-an overlay at every size, so no width spends columns on a permanent sidebar. A
-thread and overlays remain full-screen at every width. Below the supported
-minimum, show the existing size message and preserve state for the next resize.
+At that size, reading has three content rows. At `>=112x16`, Desk allocates
+the 24-column sidebar (divider included) and the remaining main width; Desk
+closed gives all columns to the main surface. At smaller supported sizes the
+conversation list is an overlay and the main surface remains full width. The
+active thread or overlay surface uses its available frame and never shows the
+channel sidebar. Below the supported minimum, show the existing size message
+and preserve state for the next resize.
 
 ## Palette and terminal defaults
 
@@ -274,9 +273,10 @@ continuous interaction recording.
 
 The [existing layout modes](tui.md#layout-modes) own the breakpoints. Height pays
 for spacing; width determines whether the conversation list can sit beside the
-timeline. A full-screen thread stays one column at every width. Header, target,
-input, keys and state must fit before allocating optional blank rows. Do not
-shrink text or preserve a wide layout by squeezing each region.
+timeline. Thread and overlays use their available frame as the active surface
+and never show the channel sidebar. Header, target, input, keys and state must
+fit before allocating optional blank rows. Do not shrink text or preserve a
+wide layout by squeezing each region.
 
 ## Alternatives and reference basis
 
@@ -306,37 +306,33 @@ attention? Changing pages should not require relearning those cues. Removing
 color must leave each answer intact. The direction is approved for implementation;
 the mockups are not user-test or runtime evidence.
 
-Before implementation is accepted, compare real captures against these studies
-at 120x30, 80x12, 79x12, 40x10 and 24x6. Include long author names, ambiguous
-identities, CJK, combining characters, emoji and URLs. Check dark/light/default
-terminal palettes and NO_COLOR. Exercise loading, empty, stale, partial,
-refused, uncertain and deleted-target states without losing the draft or hiding
-its destination. In particular, verify selection and state contrast together.
-
-The following checks define done; every row needs evidence at the implemented
-source revision, with terminal dimensions and palette recorded:
+Use these studies as the review matrix before implementation is accepted:
+compare captures at 120x30, 112x16, 111x16, 80x12, 79x12, 40x10 and 24x6.
+Include long author names, ambiguous identities, CJK, combining characters,
+emoji, URLs, light/dark/default terminal palettes and `NO_COLOR`. Exercise
+Desk open/closed, sidebar cursor versus current place, overlay return, resize,
+loading, empty, stale, partial, refused, uncertain and deleted-target states
+without losing the draft or hiding its destination.
 
 | Check | Observable result |
 | --- | --- |
 | V1: Message boundary | Roomy separator replaces a gap after all message content; compact separator stays in the author line; short/long and same-author messages remain distinct |
 | V2: Row identity | Movement, scroll, PgUp/PgDn, reply, react, edit and delete still target the same event; separators cannot receive focus or affect unread |
-| V3: Focus transfer | Reading identifies the action row; composing emphasizes only its destination and cursor; cancelling/restoring retains the correct target |
-| V4: Density | Channel and thread work at 120x30, 80x12, 79x12, 40x10 and 24x6; a 15/16-row resize switches rule placement without losing content or focus |
+| V3: Focus transfer | Reading identifies the action row; composing emphasizes only its destination and cursor; sidebar place and cursor remain distinct |
+| V4: Desk geometry | 24 columns including divider fit beside the main pane at `112x16`; closing removes the sidebar and expands the main pane; fallback at `111x16` has no sidebar |
 | V5: Text pressure | Long names, state labels, CJK, combining marks, emoji and URLs do not collide with a rule, cursor or footer; decoration yields first |
 | V6: Write/read state | Pending, refused, uncertain, partial, unknown, reconnect and deleted-target states keep their meanings and draft behavior; uncertainty offers no automatic resend |
-| V7: Shared surfaces | Inbox, Agent list/detail and help use the same selection and text hierarchy; long Agent status wraps and remains readable |
-| V8: Portable rendering | Light/dark defaults, ANSI and NO_COLOR preserve focus, target and state; no hardcoded dark fill makes text unreadable |
+| V7: Shared surfaces | Sidebar, switcher, Agent list/detail and help use the same selection and text hierarchy; long Agent status wraps and remains readable |
+| V8: Portable rendering | Light/dark defaults, ANSI and `NO_COLOR` preserve focus, target and state; no hardcoded dark fill makes text unreadable |
 
-The atlas checks geometry and appearance of static fixtures only. The current
-implementation has repository-check and fake-relay PTY evidence. Runtime
-wrapping, cursor movement, terminal palette behavior, real-relay write
-outcomes, and the complete live write workflow remain unverified here. A spec
-or browser image is not that evidence.
+These are design acceptance checks, not reported runtime results. A capture,
+test, or binary must not be described as evidence until it has actually been
+run and recorded separately.
 
 ## Implementation handoff
 
 Start from the shared text, focus and separator rules, then apply them to the
-channel and full-screen thread together. Apply the composer budgets and state
+channel and active thread together. Apply the composer budgets and state
 presentation next, then reuse the list treatment in Inbox, Agents and help.
 Each stage must leave the existing conversation loop usable. This order is a
 way to deliver the one visual spec, not permission to omit the other surfaces.
@@ -347,7 +343,7 @@ the current message focus and target identities. Adding decoration must not
 turn a rendered-line index into a message identity. Keep appearance knowledge
 shared; do not grow separate per-page palettes or density policies.
 
-This handoff authorized implementation of the approved appearance. Revision 5
-is implemented in the current branch; remaining acceptance gaps must stay
-explicit in the delivery record. Delivery identifies the final revision and
-usable binary alongside the V1-V8 evidence.
+This handoff authorizes implementation of the approved appearance. Record the
+final revision and any V1–V8 results separately when those checks are run; this
+design document does not assert that runtime or binary verification has
+occurred.
