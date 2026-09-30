@@ -7,7 +7,9 @@ impl Repo {
     fn new() -> Self {
         let path = env::temp_dir().join(format!("buzzx-update-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
-        let repo = Self { path };
+        let repo = Self {
+            path: fs::canonicalize(path).unwrap(),
+        };
         repo.command(&["init", "-b", "main"]);
         repo.command(&["config", "user.name", "Update Test"]);
         repo.command(&["config", "user.email", "update@example.invalid"]);
@@ -106,6 +108,7 @@ fn install_record_requires_path_package_and_matching_binary() {
     fs::create_dir_all(root.join("bin")).unwrap();
     let exe = root.join("bin/buzzx");
     fs::write(&exe, "binary").unwrap();
+    let root = fs::canonicalize(root).unwrap();
     let package = format!(
         "buzzx 0.1.0 (path+{})",
         reqwest::Url::from_file_path(&repo.path).unwrap()
