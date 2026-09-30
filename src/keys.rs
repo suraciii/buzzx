@@ -18,6 +18,11 @@ pub enum Action {
     PrevRow,
     /// Jump to the channel with this 1-based index.
     Channel(usize),
+    /// Toggle the persistent Desk sidebar.
+    ToggleSidebar,
+    /// Move operation focus between the Desk panes.
+    FocusSidebar,
+    FocusTimeline,
     /// `c`: open the conversation switcher, or close it when it is open.
     ToggleSwitcher,
     SwitcherNext,
@@ -218,9 +223,11 @@ pub fn map_navigation(
         let timeline_only = surface == Surface::Channel
             && layout != LayoutMode::TooSmall
             && matches!(overlay, Overlay::None | Overlay::Palette);
+        let desk_sidebar =
+            layout == LayoutMode::Desk && surface == Surface::Channel && overlay == Overlay::None;
         return match key.code {
+            KeyCode::Char('s') if desk_sidebar => Action::ToggleSidebar,
             KeyCode::Char('c') => Action::Quit,
-            // The create form's own refresh: an unresolved creation is settled
             // by the roster answer the user asks for here.
             KeyCode::Char('r') if overlay == Overlay::CreateChannel => Action::CreateChannelRefresh,
             KeyCode::Char('r')
@@ -500,6 +507,8 @@ pub fn map_navigation(
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('/') => Action::OpenSearch,
+        KeyCode::Char('h') => Action::FocusSidebar,
+        KeyCode::Char('l') => Action::FocusTimeline,
         KeyCode::Char('c') => Action::ToggleSwitcher,
         KeyCode::Char('C') => Action::ToggleCommunityPicker,
         KeyCode::Char('v') => Action::OpenReader,
@@ -1299,6 +1308,44 @@ mod tests {
                 Surface::Channel,
                 SearchMode::Results,
             ),
+            Action::Ignored
+        );
+    }
+    #[test]
+    fn desk_pane_keys_are_isolated_from_overlays_and_composer() {
+        let desk = |code, modifiers| {
+            map_navigation(
+                key(code, modifiers),
+                LayoutMode::Desk,
+                Overlay::None,
+                Surface::Channel,
+                SearchMode::Results,
+            )
+        };
+        assert_eq!(
+            desk(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            Action::ToggleSidebar
+        );
+        assert_eq!(
+            desk(KeyCode::Char('h'), KeyModifiers::NONE),
+            Action::FocusSidebar
+        );
+        assert_eq!(
+            desk(KeyCode::Char('l'), KeyModifiers::NONE),
+            Action::FocusTimeline
+        );
+        assert_eq!(
+            map_navigation(
+                key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                LayoutMode::Desk,
+                Overlay::Help,
+                Surface::Channel,
+                SearchMode::Results,
+            ),
+            Action::Ignored
+        );
+        assert_eq!(
+            map_composer(key(KeyCode::Char('s'), KeyModifiers::CONTROL), false),
             Action::Ignored
         );
     }

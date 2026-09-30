@@ -24,7 +24,8 @@ That core is `client.rs`, and this map records where it sits.
    |                   +-----> content.rs  event accessors (pure)
    |                   +-----> failure.rs  the failure categories
    |
-   +-----> app.rs        state machine: channels, rows, composer, key handling
+   +-----> app.rs        state machine: channels, rows, sidebar, pane focus,
+   |                       composer, key handling
    |         |
    |         +-----> ui.rs      ratatui widgets (render only)
    |         +-----> layout.rs  terminal size -> layout mode (pure)
@@ -68,10 +69,10 @@ against a fake relay in `tests/cli.rs` and against the live relay by hand.
 | `main.rs` | Raw mode, alternate screen, the loop that polls input and drains events | Hold relay state or decide behavior |
 | `config.rs` | Identity, relay URL, and auth-tag resolution; the config file | Open a connection or sign |
 | `platform.rs` | File protection as the running platform provides it: the create mode for a secret file, the restriction calls, and the verdict on a path another user may be able to read | Read the file, or choose an exit code |
-| `app.rs` | Conversations, rows, composer, filters, unread tracking, read frontiers, selection, and quit | Sign, send, parse frames, or draw |
-| `ui.rs` | Layout and rendering of the Inbox, timeline, picker, and help | Mutate `app.rs` state or call the network |
-| `keys.rs` | `KeyEvent` to `Action` | Read terminal state |
-| `layout.rs` | The layout mode a terminal size selects | Hold state, draw, or read `App` |
+| `app.rs` | Conversations, rows, sidebar cursor/open preference, pane focus, composer, filters, unread tracking, read frontiers, selection, and quit | Sign, send, parse frames, or draw |
+| `ui.rs` | Layout and rendering of the Desk sidebar, main timeline, Inbox, picker, and help | Mutate `app.rs` state or call the network |
+| `keys.rs` | `KeyEvent` to `Action`, including Desk pane routing and overlay/composer isolation | Read terminal state |
+| `layout.rs` | The layout mode a terminal size selects, including Desk open/closed geometry | Hold state, draw, or read `App` |
 | `content.rs` | `Event` to `Row`, thread refs, reaction merging, and event kind lists | Fetch or send |
 | `login.rs` | The login flow: key input from flag, file, stdin, environment, or wizard; one-shot relay verification; the atomic config write | Hold session state, render the TUI, or stay in the process after the config is written |
 | `cli.rs` | The one-shot commands: argument validation, the JSON projection, stdin content, exit codes | Hold state between calls, or decide the relay protocol |
@@ -114,11 +115,14 @@ once. If the relay is slow, the interface still responds to keys.
 ## State
 `app.rs` holds one `ChannelEntry` per listed conversation, with its timeline
 rows and a `ReadTrack` containing its frontier, unread message candidates, and
-coverage state. `Filter` derives the `All`, `Unread`, and `For you` views; the
-picker retains its cursor conversation if a filter change would hide it. The
-wide UI groups rows into `Channels` and `DMs`. `●` and `@` rows carry unread
-candidate counts in the reserved signal cell; `?` means unknown coverage. The
-`Read` marker applies to a picker row retained after it stops matching.
+coverage state. It also holds the session-only sidebar open preference,
+sidebar cursor conversation, and `DeskFocus` (Sidebar or Timeline). `Filter`
+derives the `All`, `Unread`, and `For you` views; the sidebar and switcher
+share these sections, ordering and retained-cursor rules. Moving a sidebar
+cursor does not change the selected conversation, timeline event focus,
+viewport or read marker. `●` and `@` rows carry unread candidate counts in
+the reserved signal cell; `?` means unknown coverage. The `Read` marker
+applies to a row retained after it stops matching.
 
 The read-state event and its limits are described in
 [shared-core.md#inbox-and-read-state](shared-core.md#inbox-and-read-state).

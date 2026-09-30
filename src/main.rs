@@ -446,7 +446,10 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
             // 2. Draw, then read back the frame size: the keys map against
             //    the layout the user is looking at, resize included.
             let frame = terminal
-                .draw(|frame| ui::draw(frame, &app, now))
+                .draw(|frame| {
+                    app.set_terminal_size(frame.area().width, frame.area().height);
+                    ui::draw(frame, &app, now);
+                })
                 .map_err(|e| e.to_string())?;
             // The reader reserves four rows outside its body.
             app.set_reader_page_rows(frame.area.height.saturating_sub(4).max(2) as usize);
