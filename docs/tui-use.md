@@ -728,9 +728,9 @@ copying their richer editor and non-member invitation flows.
 
 ## Focused thread reading
 
-Status: implemented. This slice lets a person follow one conversation inside a
-busy channel, reply, and return to the same channel row. It applies to stream
-channels and existing DMs. Forum navigation remains deferred.
+Status: implemented in the TUI; synchronized Web capability remains deferred.
+This slice lets a person follow one conversation inside a busy channel, reply,
+and return to the same channel row. Forum navigation remains deferred.
 
 ### Enter, read, return
 
@@ -746,20 +746,22 @@ width is capped at 96 cells; at 80–111 columns it leaves two cells on each
 side. Below 80 columns it remains full-screen, including 40x10 and 24x6.
 The backdrop cannot receive keys, compose a second draft, or advance the
 channel read marker. The modal border names Thread and its source event; its
-header names the channel and reserves `Esc: back`. The root is the first row,
-followed by loaded replies in chronological order. Focus the entry event when
-available; otherwise focus the root and report that the selected reply was not loaded.
+header names the channel and reserves `Esc: back`. The root is first, followed
+by loaded replies in chronological order. Focus the exact entry; walk older
+pages when partial, and report unavailable at a proven boundary instead of
+silently focusing the root.
 The root scrolls normally; it is not pinned above every reply.
-
 Within this view, `j`/`k` and arrows move message focus at all widths.
 `g`/`G`, Home/End, PgUp/PgDn, help, and quit retain their timeline meaning.
-`t` does not open another level. Conversation shortcuts, switcher, Inbox filters,
-and Agents navigation are unavailable until returning; they must not silently
-switch the destination. `Esc` in navigation returns to the saved channel,
-filter, focus, and viewport. If the saved row was deleted, select its nearest
-surviving neighbor. Incoming messages must not pull focus away from older rows.
-Resize, including below 24x6 and back, preserves this context.
-
+`l` or Right drills into the focused reply's direct children. The outer root
+stays visible; each branch row shows a nested summary, and Left or Esc returns
+one branch level before leaving. Partial reads walk older pages for an exact
+target. `F` toggles a local follow marker, retaining the newest 500 roots per
+identity; it is not published as a relay event. Conversation shortcuts,
+switcher, Inbox filters, and Agents navigation are unavailable until returning
+and must not silently switch the destination.
+Incoming messages must not pull focus away from older rows. Resize, including
+below 24x6 and back, preserves this context.
 ### Tail follow and detached reading
 
 The thread follows its tail exactly while its focused row is the newest one:
@@ -835,10 +837,9 @@ reply query reaches its limit, show `Partial thread: reply limit reached`.
 Determine saturation from the raw reply query before deduplication or filtering.
 The initial cap is not a total reply count or an archive boundary. Continue
 through [incremental history](tui-context.md#c4-read-earlier-and-later-history)
-and use that contract's saturation and error behavior. Thread-only search,
-follow/unfollow, thread unread badges, and reply-count queries remain deferred.
-If the deployment cannot provide the initial bounded read, report that
-as an implementation blocker rather than silently using channel cache only.
+and use that contract's saturation and error behavior. Thread-only search and
+reply-count queries remain deferred. Branch summaries count loaded descendants
+only; they never claim a relay-wide total.
 
 Display only messages from the selected conversation belonging to this root.
 Validate both conversation and thread membership before displaying a returned
@@ -858,11 +859,12 @@ Before initial load succeeds, disable every content-targeted action. While
 disconnected, composing and reading remain possible but publication is disabled
 with a connection reason; do not queue writes for reconnect. Lost membership
 blocks writes and exposes the access error; draft text remains available.
-Typing remains channel-scoped and must not be labeled as thread activity.
+Typing without `e` remains channel-scoped; an `e`-scoped indicator is shown only
+for the current branch head and expires with the normal TTL.
 
-Thread reading does not advance the channel read frontier: other discussions
-may be unseen. On return, the ordinary channel presentation rules decide when
-read progress advances. No new persistent read state is introduced.
+Thread reading does not advance the channel frontier. Displayed rows are
+published as `msg:<event-id>` contexts in the existing read-state payload, so
+other discussions remain unread; contexts merge monotonically on reconnect.
 
 ### Thread view layout (modal on wide terminals)
 
@@ -973,9 +975,9 @@ clears, reveal the still-active lower-priority state.
 | Deleted root | Root deleted placeholder | Replies remain; disable root-targeted actions |
 
 Short status labels fit 24 columns; detailed reasons go to help rather than
-taking the input row. Suppress channel-scoped typing inside the thread view:
-it cannot identify who is replying to this thread. The channel view keeps its
-existing typing behavior.
+taking the input row. Suppress channel-scoped typing inside the thread view,
+but show an `e`-scoped indicator for the current branch head. The channel view
+keeps its existing channel-wide typing behavior.
 
 ### Acceptance required before delivery
 

@@ -18,6 +18,7 @@ mod platform;
 mod read_state;
 mod session;
 mod sub;
+mod thread;
 mod ui;
 mod update;
 mod version;
@@ -451,6 +452,7 @@ fn run_tui_session(resolved: Resolved) -> Result<i32, String> {
                     ui::draw(frame, &app, now);
                 })
                 .map_err(|e| e.to_string())?;
+            app.note_thread_presented();
             // The reader reserves four rows outside its body.
             app.set_reader_page_rows(frame.area.height.saturating_sub(4).max(2) as usize);
             let layout = layout::mode(frame.area.width, frame.area.height);

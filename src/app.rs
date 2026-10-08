@@ -2,7 +2,7 @@
 //! lifecycle. No I/O happens here. Time arrives as an argument; commands
 //! leave through the outbox for the session.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use nostr::Keys;
 use uuid::Uuid;
@@ -963,10 +963,21 @@ enum PendingOp {
 /// One identity composing in one channel. `since` is the event time of the
 /// last indicator, so a message can be compared against the claim it ends;
 /// `expires_at` is this machine's clock, because believing a claim is local.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TypingEntry {
     since: u64,
     expires_at: u64,
+    head: Option<String>,
+}
+fn typing_key(pubkey: &str, head: Option<&str>) -> String {
+    match head {
+        Some(head) => format!("{pubkey}\0{head}"),
+        None => pubkey.to_owned(),
+    }
+}
+
+fn typing_pubkey(key: &str) -> &str {
+    key.split_once('\0').map_or(key, |(pubkey, _)| pubkey)
 }
 
 /// What one Agent's row says. The four states stay separate on purpose: only
@@ -1014,6 +1025,15 @@ pub struct AgentView {
 }
 
 /// The focused thread view: one conversation's root and its bounded replies.
+/// Branch drill-down keeps the outer root visible and narrows the direct
+/// children by parent identity; the stack restores the exact event on return.
+#[derive(Debug, Clone)]
+struct ThreadBranchFrame {
+    head: String,
+    focus: String,
+}
+
+/// The focused thread view: one conversation's root and its bounded replies.
 /// The state outlives the view, so returning to the same thread is instant.
 ///
 /// Nothing here is persistent read state: reading a thread leaves the
@@ -1032,9 +1052,14 @@ pub struct ThreadView {
     request: u64,
     /// The event the user entered from, focused once the read lands.
     pub entered: String,
+    /// Whether the entered event still needs a target-aware history walk.
+    target_pending: bool,
     /// The root first, then the loaded replies, oldest first.
     pub rows: Vec<Row>,
     pub focus: usize,
+    /// Current drill-down head. The outer root remains the thread identity.
+    branch_head: String,
+    branch_stack: Vec<ThreadBranchFrame>,
     /// Matching live replies this client saw since the view last sat on the
     /// newest row. A count of what was observed, never a claim about the
     /// thread's total replies.
@@ -1085,13 +1110,12 @@ impl ThreadView {
         self.rows.get(self.focus)
     }
 
-    /// The view sits on the newest row: a live reply keeps the tail in view,
-    /// and any other position caches it and counts it instead. Following is a
-    /// position, not a mode, so it is derived from the focus rather than kept
-    /// in step by hand: every page merge and every row that leaves the view
-    /// moves the focus and the follow together.
+    /// The view sits on the newest visible row: a live reply keeps the current
+    /// branch tail in view, and any other position caches it and counts it.
     pub fn following(&self) -> bool {
-        !self.rows.is_empty() && self.focus + 1 == self.rows.len()
+        self.visible_indices()
+            .last()
+            .is_some_and(|index| *index == self.focus)
     }
 
     /// Whether a read has answered for this thread at least once.
@@ -1107,6 +1131,38 @@ impl ThreadView {
     /// Whether a write this view started is still awaiting its result.
     pub fn send_pending(&self) -> bool {
         self.rows.iter().any(|row| row.pending) || !self.pending_writes.is_empty()
+    }
+    /// Rows shown by the branch surface: outer root, current head context,
+    /// and direct children of the head.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        crate::thread::visible_indices(&self.rows, &self.root, &self.branch_head)
+    }
+
+    pub fn visible_rows(&self) -> Vec<Row> {
+        self.visible_indices()
+            .into_iter()
+            .filter_map(|index| self.rows.get(index).cloned())
+            .collect()
+    }
+
+    pub fn visible_focus(&self) -> usize {
+        let indices = self.visible_indices();
+        indices
+            .iter()
+            .position(|index| *index == self.focus)
+            .unwrap_or(0)
+    }
+
+    pub fn branch_head(&self) -> &str {
+        &self.branch_head
+    }
+
+    pub fn branch_depth(&self) -> usize {
+        self.branch_stack.len()
+    }
+
+    pub fn branch_summary(&self, child_id: &str) -> Option<crate::thread::BranchSummary> {
+        crate::thread::summary(&self.rows, child_id)
     }
 }
 
@@ -1522,6 +1578,11 @@ pub struct App {
     pub thread: ThreadView,
     thread_request: u64,
     thread_return_context: bool,
+    /// Local follow markers. They are separate from relay read state: following
+    /// is a device preference, not a claim about a message.
+    followed_threads: VecDeque<String>,
+    /// Per-message local thread read frontiers, merged from relay `msg:` keys.
+    thread_read: HashMap<String, u64>,
     /// Body rows available to the reader's page controls in the last frame.
     reader_page_rows: usize,
     journey: Option<SearchJourney>,
@@ -1620,6 +1681,8 @@ impl App {
             thread: ThreadView::default(),
             thread_request: 0,
             thread_return_context: false,
+            followed_threads: VecDeque::new(),
+            thread_read: HashMap::new(),
             reader_page_rows: PAGE_ROWS,
             journey: None,
             context_draft: false,
@@ -3111,6 +3174,37 @@ impl App {
         }
     }
 
+    /// Apply one channel-wide or thread-scoped typing claim.
+    fn apply_typing(
+        &mut self,
+        channel: Uuid,
+        pubkey: String,
+        at: u64,
+        head: Option<String>,
+        now: u64,
+    ) {
+        if pubkey == self.me {
+            return;
+        }
+        let key = typing_key(&pubkey, head.as_deref());
+        let fresh = self
+            .typing
+            .entry(channel)
+            .or_default()
+            .insert(
+                key,
+                TypingEntry {
+                    since: at,
+                    expires_at: now.saturating_add(content::TYPING_TTL_SECS),
+                    head,
+                },
+            )
+            .is_none();
+        if fresh && !self.profiles.contains_key(&pubkey) {
+            self.outbox.push(SessionCommand::LoadProfiles(vec![pubkey]));
+        }
+    }
+
     /// Open a confirmed channel once the roster knows it. The roster is the
     /// only source of a channel row, so a confirmation that arrives first
     /// waits for the refresh instead of inventing a row.
@@ -3184,7 +3278,22 @@ impl App {
         let mut names: Vec<String> = entries
             .iter()
             .filter(|(_, entry)| entry.expires_at > now)
-            .map(|(pubkey, _)| author_name(&self.profiles, &self.me, pubkey))
+            .map(|(pubkey, _)| author_name(&self.profiles, &self.me, typing_pubkey(pubkey)))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+    /// Thread-only typing. A channel-wide indicator has no `e` tag and is not
+    /// repeated inside every open thread.
+    pub fn thread_typing_names(&self, channel: Uuid, head: &str, now: u64) -> Vec<String> {
+        let Some(entries) = self.typing.get(&channel) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter(|(_, entry)| entry.expires_at > now && entry.head.as_deref() == Some(head))
+            .map(|(pubkey, _)| author_name(&self.profiles, &self.me, typing_pubkey(pubkey)))
             .collect();
         names.sort();
         names.dedup();
@@ -3329,10 +3438,11 @@ impl App {
     /// to 30 seconds of history on a new subscription, and an author who sent
     /// something before starting to compose is still composing.
     fn end_typing(&mut self, channel: Uuid, pubkey: &str, at: u64) {
-        if let Some(entries) = self.typing.get_mut(&channel)
-            && entries.get(pubkey).is_some_and(|entry| at >= entry.since)
-        {
-            entries.remove(pubkey);
+        if let Some(entries) = self.typing.get_mut(&channel) {
+            entries.retain(|key, entry| typing_pubkey(key) != pubkey || at < entry.since);
+            if entries.is_empty() {
+                self.typing.remove(&channel);
+            }
         }
     }
 
@@ -3541,6 +3651,7 @@ impl App {
                 self.marker_read = false;
                 self.read_failed = None;
                 self.catch_up_pending.clear();
+                self.thread_read.clear();
                 self.search = SearchView::default();
                 self.context = ContextView::default();
                 self.reader = ReaderView::default();
@@ -3820,31 +3931,13 @@ impl App {
                 channel,
                 pubkey,
                 at,
-            } => {
-                // The identity's own typing is never shown: it already knows.
-                // Another client of the same identity (the desktop app) is a
-                // member too, and its indicators land here as well.
-                if pubkey != self.me {
-                    // A name beats a shortened key, so an author first seen
-                    // typing gets resolved like one first seen posting. Only a
-                    // new entry asks: a refresh of a live one asks nothing.
-                    let fresh = self
-                        .typing
-                        .entry(channel)
-                        .or_default()
-                        .insert(
-                            pubkey.clone(),
-                            TypingEntry {
-                                since: at,
-                                expires_at: now.saturating_add(content::TYPING_TTL_SECS),
-                            },
-                        )
-                        .is_none();
-                    if fresh && !self.profiles.contains_key(&pubkey) {
-                        self.outbox.push(SessionCommand::LoadProfiles(vec![pubkey]));
-                    }
-                }
-            }
+            } => self.apply_typing(channel, pubkey, at, None, now),
+            ChatEvent::TypingScoped {
+                channel,
+                pubkey,
+                head,
+                at,
+            } => self.apply_typing(channel, pubkey, at, Some(head), now),
             ChatEvent::TypingClosed { channel, reason } => {
                 self.typing.remove(&channel);
                 // A channel that is gone has already said why it is quiet;
@@ -4061,6 +4154,14 @@ impl App {
     /// answer leaves every conversation unknown rather than read.
     fn apply_read_state(&mut self, contexts: &HashMap<String, u64>, complete: bool) {
         self.marker_read = true;
+        for (context, at) in contexts {
+            if let Some(event_id) = context.strip_prefix("msg:") {
+                self.thread_read
+                    .entry(event_id.to_owned())
+                    .and_modify(|known| *known = (*known).max(*at))
+                    .or_insert(*at);
+            }
+        }
         self.marker_complete = complete;
         for entry in &mut self.channels {
             let waiting = self.catch_up_pending.contains(&entry.id);
@@ -4389,12 +4490,17 @@ impl App {
     /// Ask the session to publish what this terminal has read. A frontier that
     /// is only a local seed is not a read claim, and stays out of it.
     fn request_publish(&mut self) {
-        let contexts: HashMap<String, u64> = self
+        let mut contexts: HashMap<String, u64> = self
             .channels
             .iter()
             .filter(|entry| entry.read.marked && entry.read.frontier > 0)
             .map(|entry| (entry.id.to_string(), entry.read.frontier))
             .collect();
+        contexts.extend(
+            self.thread_read
+                .iter()
+                .map(|(event_id, at)| (format!("msg:{event_id}"), *at)),
+        );
         if !contexts.is_empty() {
             self.outbox.push(SessionCommand::ReadProgress { contexts });
         }
@@ -5176,6 +5282,13 @@ impl App {
         self.thread.newer_complete = true;
 
         self.thread.failed = None;
+        let target_was_pending = self.thread.target_pending;
+        let target_found = self
+            .thread
+            .rows
+            .iter()
+            .any(|row| row.event_id == self.thread.entered);
+        self.thread.target_pending = !target_found;
         let preferred = if was_loaded {
             previous_focus
         } else {
@@ -5190,11 +5303,19 @@ impl App {
                     .iter()
                     .position(|row| row.event_id == self.thread.root)
                     .unwrap_or(0);
-                if !was_loaded && self.thread.entered != self.thread.root {
-                    self.thread.notice =
-                        Some("the selected reply was not in the thread read".to_owned());
-                }
             }
+        }
+        if target_was_pending && target_found {
+            self.thread.notice = None;
+            if !was_loaded {
+                self.restore_thread_target_branch();
+            }
+        } else if target_was_pending && !target_found {
+            self.thread.notice = Some(if partial {
+                "selected reply not in this page; loading older history".to_owned()
+            } else {
+                "selected reply is unavailable in this thread".to_owned()
+            });
         }
         if was_loaded && was_following {
             // A re-read keeps the reader's own position rule: a view that was
@@ -5205,11 +5326,34 @@ impl App {
             // loaded one, which is where the focus above already put it.
             self.thread.observed_new = 0;
         }
+        let needs_target_page = target_was_pending && !target_found && partial;
         let buffered = std::mem::take(&mut self.thread.buffered_overlays);
         for event in buffered {
             self.apply_overlay(event);
         }
         self.request_profiles();
+        if needs_target_page && self.request_thread_page(HistoryDirection::Older) {
+            self.thread.notice = Some("loading older history for selected reply".to_owned());
+        }
+    }
+
+    /// Ask for the open thread again over the current connection. Every read
+    /// of this view goes through here, so retry and reconnect share the same
+    /// token and stale answers cannot replace the current read.
+    fn reread_thread(&mut self) {
+        if !self.thread.open {
+            return;
+        }
+        self.thread_request = self.thread_request.wrapping_add(1);
+        self.thread.request = self.thread_request;
+        self.thread.loading = true;
+        self.thread.notice = None;
+        self.thread.failed = None;
+        self.outbox.push(SessionCommand::OpenThread {
+            channel: self.thread.channel,
+            root: self.thread.root.clone(),
+            request: self.thread.request,
+        });
     }
 
     /// A thread read failed: the root is missing or inaccessible, or the query
@@ -5228,25 +5372,6 @@ impl App {
         self.thread.failed = Some(reason);
     }
 
-    /// Ask for the open thread again over the current connection. Every read
-    /// of this view goes through here, so a retry and a reconnect re-read are
-    /// the same operation.
-    fn reread_thread(&mut self) {
-        if !self.thread.open {
-            return;
-        }
-        self.thread_request = self.thread_request.wrapping_add(1);
-        self.thread.request = self.thread_request;
-        self.thread.loading = true;
-        self.thread.notice = None;
-        self.thread.failed = None;
-        self.outbox.push(SessionCommand::OpenThread {
-            channel: self.thread.channel,
-            root: self.thread.root.clone(),
-            request: self.thread.request,
-        });
-    }
-
     /// Merge one matching live reply into the open thread. It takes its place
     /// in time order after the root, and focus follows the message it was on
     /// rather than the row index, so an incoming message never pulls focus.
@@ -5254,6 +5379,13 @@ impl App {
         if self.thread.rows.iter().any(|r| r.event_id == row.event_id) {
             return;
         }
+        let focused_id = self
+            .thread
+            .focused()
+            .map(|focused| focused.event_id.clone());
+        let new_visible = row.event_id == self.thread.root
+            || row.event_id == self.thread.branch_head
+            || row.parent_id.as_deref() == Some(self.thread.branch_head.as_str());
         self.thread.live_ids.insert(row.event_id.clone());
         let at = if self.thread.rows.is_empty() {
             0
@@ -5274,13 +5406,28 @@ impl App {
         // including one this identity sent from another client.
         let counted = !row.pending;
         self.thread.rows.insert(at, row);
-        if was_following {
-            // At the tail: keep the newest row visible.
+        if was_following && new_visible {
+            // At the visible branch tail: keep the newest visible row in view.
             self.thread.focus = self.thread.rows.len() - 1;
         } else if newest && counted {
-            // Detached: the row is cached unseen and counted, and the viewport
-            // stays where the reader left it.
+            // Detached, or following a branch while another branch receives a
+            // reply: cache the row and keep the focused event anchored.
+            if let Some(id) = focused_id {
+                self.thread.focus = self
+                    .thread
+                    .rows
+                    .iter()
+                    .position(|candidate| candidate.event_id == id)
+                    .unwrap_or(self.thread.focus);
+            }
             self.thread.observed_new += 1;
+        } else if let Some(id) = focused_id {
+            self.thread.focus = self
+                .thread
+                .rows
+                .iter()
+                .position(|candidate| candidate.event_id == id)
+                .unwrap_or(self.thread.focus);
         }
     }
 
@@ -5290,6 +5437,83 @@ impl App {
             return;
         }
         self.thread.focus = index.min(self.thread.rows.len() - 1);
+    }
+
+    fn thread_enter_branch(&mut self) {
+        let Some(row) = self.thread.focused().cloned() else {
+            return;
+        };
+        if row.event_id == self.thread.root {
+            self.note("focus a reply to open its nested branch");
+            return;
+        }
+        if crate::thread::direct_child_indices(&self.thread.rows, &row.event_id).is_empty() {
+            self.note("no nested replies on the focused message");
+            return;
+        }
+        let focus = row.event_id;
+        let head = self.thread.branch_head.clone();
+        self.thread
+            .branch_stack
+            .push(ThreadBranchFrame { head, focus });
+        self.thread.branch_head = self
+            .thread
+            .focused()
+            .map(|row| row.event_id.clone())
+            .unwrap_or_default();
+        self.thread.notice = None;
+    }
+
+    fn thread_leave_branch(&mut self) -> bool {
+        let Some(frame) = self.thread.branch_stack.pop() else {
+            return false;
+        };
+        self.thread.branch_head = frame.head;
+        if let Some(index) = self
+            .thread
+            .rows
+            .iter()
+            .position(|row| row.event_id == frame.focus)
+        {
+            self.thread.focus = index;
+        }
+        self.thread.notice = None;
+        true
+    }
+
+    fn restore_thread_target_branch(&mut self) {
+        if self.thread.entered == self.thread.root {
+            return;
+        }
+        let Some(path) = crate::thread::ancestor_path(
+            &self.thread.rows,
+            &self.thread.root,
+            &self.thread.entered,
+        ) else {
+            // The target can be present at the page edge while an older
+            // ancestor is not. Keep the exact target visible as branch
+            // context instead of silently collapsing back to the root.
+            self.thread.branch_head = self.thread.entered.clone();
+            self.thread.notice =
+                Some("ancestor replies unavailable; showing selected reply".to_owned());
+            return;
+        };
+        for ancestor in path {
+            let head = self.thread.branch_head.clone();
+            self.thread.branch_stack.push(ThreadBranchFrame {
+                head,
+                focus: ancestor.clone(),
+            });
+            self.thread.branch_head = ancestor;
+        }
+    }
+
+    /// Move focus in the currently visible branch window.
+    fn thread_focus_visible(&mut self, index: usize) {
+        let visible = self.thread.visible_indices();
+        if let Some(row_index) = visible.get(index.min(visible.len().saturating_sub(1))) {
+            self.thread.focus = *row_index;
+        }
     }
 
     fn begin_search_journey(&mut self, from_composer: bool) {
@@ -5737,6 +5961,8 @@ impl App {
             return;
         }
         let root = row.root_id.clone().unwrap_or_else(|| row.event_id.clone());
+        let entered = row.event_id;
+        let target_pending = entered != root;
         self.thread_request = self.thread_request.wrapping_add(1);
         self.thread_return_context = true;
         self.context.open = false;
@@ -5745,9 +5971,12 @@ impl App {
             channel: self.context.channel,
             root: root.clone(),
             request: self.thread_request,
-            entered: row.event_id,
+            entered,
+            target_pending,
             rows: Vec::new(),
             focus: 0,
+            branch_head: root.clone(),
+            branch_stack: Vec::new(),
             observed_new: 0,
             loading: true,
             failed: None,
@@ -6367,14 +6596,18 @@ impl App {
         // A channel entry always starts a fresh origin. In particular, do not
         // inherit the context return bit from a previously closed context.
         self.thread_return_context = false;
+        let target_pending = saved_row != root;
         self.thread = ThreadView {
             open: true,
             channel,
             root: root.clone(),
             request,
             entered: saved_row.clone(),
+            target_pending,
             rows: Vec::new(),
             focus: 0,
+            branch_head: root.clone(),
+            branch_stack: Vec::new(),
             observed_new: 0,
             loading: true,
             failed: None,
@@ -6417,6 +6650,9 @@ impl App {
             self.note("Wait for send result");
             return;
         }
+        if self.thread_leave_branch() {
+            return;
+        }
         if self.thread_return_context {
             self.thread_return_context = false;
             self.thread.open = false;
@@ -6443,6 +6679,7 @@ impl App {
                 .unwrap_or_else(|| index.min(entry.rows.len().saturating_sub(1)));
             self.focus = at;
         }
+
         // From here the ordinary channel presentation rules decide when read
         // progress advances.
         if return_context {
@@ -6450,6 +6687,81 @@ impl App {
         }
         self.set_focus(self.focus);
     }
+    fn toggle_thread_follow(&mut self) {
+        if !self.thread.open || self.thread.root.is_empty() {
+            return;
+        }
+        let root = self.thread.root.clone();
+        if let Some(at) = self.followed_threads.iter().position(|id| id == &root) {
+            self.followed_threads.remove(at);
+            self.note("thread unfollowed locally");
+        } else {
+            self.followed_threads.push_back(root);
+            while self.followed_threads.len() > 500 {
+                self.followed_threads.pop_front();
+            }
+            self.note("thread followed locally");
+        }
+    }
+
+    pub fn thread_followed(&self) -> bool {
+        self.followed_threads
+            .iter()
+            .any(|id| id == &self.thread.root)
+    }
+    /// Mark only rows actually present in the current branch viewport as read.
+    /// The channel frontier remains untouched; each event is published under
+    /// its own `msg:` context so another discussion cannot be cleared.
+    pub fn note_thread_presented(&mut self) {
+        if !self.thread.open
+            || self.thread.loading
+            || self.reader.open
+            || self.context.open
+            || self.search.open
+            || self.about
+            || self.overlay() != keys::Overlay::None
+            || self.terminal_width < 24
+            || self.terminal_height < 6
+        {
+            return;
+        }
+        let mut changed = false;
+        for index in self.thread.visible_indices() {
+            let Some(row) = self.thread.rows.get(index) else {
+                continue;
+            };
+            if row.pending || row.uncertain || !is_event_id(&row.event_id) {
+                continue;
+            }
+            let entry = self.thread_read.entry(row.event_id.clone()).or_default();
+            if *entry < row.created_at {
+                *entry = row.created_at;
+                changed = true;
+            }
+        }
+        if changed {
+            self.request_publish();
+        }
+    }
+
+    pub fn thread_unread_count(&self) -> usize {
+        self.thread
+            .visible_indices()
+            .into_iter()
+            .filter_map(|index| self.thread.rows.get(index))
+            .filter(|row| !row.pending && !row.uncertain && is_event_id(&row.event_id))
+            .filter(|row| {
+                self.thread_read
+                    .get(&row.event_id)
+                    .is_none_or(|frontier| row.created_at > *frontier)
+            })
+            .count()
+    }
+
+    pub fn thread_has_read_state(&self) -> bool {
+        !self.thread_read.is_empty()
+    }
+
     fn request_thread_page(&mut self, direction: HistoryDirection) -> bool {
         if !self.thread.open
             || self.thread.loading
@@ -6483,22 +6795,31 @@ impl App {
     }
 
     fn thread_step(&mut self, step: isize) {
-        if self.thread.rows.is_empty() {
+        let visible = self.thread.visible_indices();
+        if visible.is_empty() {
             return;
         }
-        if step > 0 && self.thread.focus + 1 >= self.thread.rows.len() {
-            if !self.request_thread_page(HistoryDirection::Newer) {
-                self.thread_focus(usize::MAX);
+        let position = visible
+            .iter()
+            .position(|index| *index == self.thread.focus)
+            .unwrap_or(0);
+        if step > 0 && position + 1 >= visible.len() {
+            if self.thread.branch_head() == self.thread.root
+                && !self.request_thread_page(HistoryDirection::Newer)
+            {
+                self.thread_focus_visible(usize::MAX);
             }
             return;
         }
-        if step < 0 && self.thread.focus <= 1 {
-            if !self.request_thread_page(HistoryDirection::Older) {
-                self.thread_focus(0);
+        if step < 0 && position <= 1 {
+            if self.thread.branch_head() == self.thread.root
+                && !self.request_thread_page(HistoryDirection::Older)
+            {
+                self.thread_focus_visible(0);
             }
             return;
         }
-        self.thread_focus((self.thread.focus as isize + step).max(0) as usize);
+        self.thread_focus_visible((position as isize + step).max(0) as usize);
     }
 
     /// `t` inside a thread: retry a read that failed. It never retries a
@@ -6605,10 +6926,14 @@ impl App {
                     self.help = false;
                 }
             }
-            Action::Top => self.thread_focus(0),
+            Action::Top => self.thread_focus_visible(0),
             Action::Bottom => {
-                if !self.request_newest_window(HistorySurface::Thread) && !self.thread.loading {
-                    self.thread_focus(usize::MAX);
+                let requested = self.thread.branch_head() == self.thread.root
+                    && self.request_newest_window(HistorySurface::Thread);
+                if (!requested && !self.thread.loading)
+                    || self.thread.branch_head() != self.thread.root
+                {
+                    self.thread_focus_visible(usize::MAX);
                 }
             }
             Action::NextRow => self.thread_step(1),
@@ -6620,6 +6945,8 @@ impl App {
                 self.request_thread_page(HistoryDirection::Newer);
             }
             Action::ThreadLeave => self.leave_thread(),
+            Action::ThreadOpenBranch => self.thread_enter_branch(),
+            Action::ThreadToggleFollow => self.toggle_thread_follow(),
             Action::OpenReader => self.open_reader(),
             Action::ThreadRetry => self.retry_thread(),
             Action::ThreadReplyRoot => self.thread_compose(true),
@@ -7126,6 +7453,20 @@ impl App {
                     self.thread.focus = focus_id
                         .and_then(|id| self.thread.rows.iter().position(|row| row.event_id == id))
                         .unwrap_or(self.thread.focus);
+                    if self.thread.target_pending
+                        && let Some(at) = self
+                            .thread
+                            .rows
+                            .iter()
+                            .position(|row| row.event_id == self.thread.entered)
+                    {
+                        self.thread.target_pending = false;
+                        self.thread.focus = at;
+                        self.thread.branch_stack.clear();
+                        self.thread.branch_head = self.thread.root.clone();
+                        self.restore_thread_target_branch();
+                        self.thread.notice = None;
+                    }
                     if was_following && direction == HistoryDirection::Newer {
                         // A following view asked for rows below the tail, so
                         // the newest row is still the row it wants. A detached
@@ -7141,7 +7482,17 @@ impl App {
                     self.thread.loading = false;
                     self.thread.partial =
                         !(self.thread.older_complete && self.thread.newer_complete);
-                    if no_progress && saturated {
+                    if self.thread.target_pending
+                        && direction == HistoryDirection::Older
+                        && saturated
+                        && self.request_thread_page(HistoryDirection::Older)
+                    {
+                        self.thread.notice =
+                            Some("loading older history for selected reply".to_owned());
+                    } else if self.thread.target_pending && !saturated {
+                        self.thread.notice =
+                            Some("selected reply is unavailable in this thread".to_owned());
+                    } else if no_progress && saturated {
                         self.note("History limit reached");
                     }
                 }
@@ -7207,12 +7558,7 @@ impl App {
         let me = self.me.clone();
         let profiles = self.profiles.clone();
         let author_key = event.pubkey.to_hex();
-        if let Some(typing) = self.typing.get_mut(&channel) {
-            typing.retain(|pubkey, entry| pubkey != &author_key || entry.since > at);
-            if typing.is_empty() {
-                self.typing.remove(&channel);
-            }
-        }
+        self.end_typing(channel, &author_key, at);
         let author = author_name(&profiles, &me, &author_key);
         let selected = self.selected_entry().map(|e| e.id) == Some(channel);
         if !selected {
@@ -9115,7 +9461,21 @@ impl App {
         if let Some(pending) = thread_pending {
             // A user's own reply returns the view to the tail: sending is an
             // explicit move to the newest message, even from mid-thread.
+            let parent = pending.parent_id.clone();
             self.push_thread_row(pending);
+            if let Some(parent) = parent {
+                if parent == self.thread.root {
+                    self.thread.branch_stack.clear();
+                    self.thread.branch_head = self.thread.root.clone();
+                } else if parent != self.thread.branch_head {
+                    let head = self.thread.branch_head.clone();
+                    self.thread.branch_stack.push(ThreadBranchFrame {
+                        head,
+                        focus: parent.clone(),
+                    });
+                    self.thread.branch_head = parent;
+                }
+            }
             self.thread_focus(usize::MAX);
             self.thread.observed_new = 0;
         }
@@ -15719,5 +16079,121 @@ mod tests {
         assert_eq!(app.sidebar_cursor, Some(app.channels[1].id));
         app.set_filter(Filter::All);
         assert_eq!(app.sidebar_cursor, Some(app.channels[0].id));
+    }
+    #[test]
+    fn nested_branch_drilldown_restores_identity_focus_and_follow_state() {
+        let (mut app, _channel, root, reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        let mut rows = app.channels[0].rows.clone();
+        let reply_id = reply.clone();
+        let mut nested = rows[1].clone();
+        nested.event_id = "nested".to_owned();
+        nested.parent_id = Some(reply);
+        nested.root_id = Some(root.clone());
+        nested.created_at = 30;
+        rows.push(nested);
+        app.thread.rows = rows;
+        app.thread.root = root;
+        app.thread.branch_head = app.thread.root.clone();
+        app.thread.focus = 1;
+        app.thread.loaded = true;
+        app.thread.loading = false;
+
+        app.handle(Action::ThreadOpenBranch, 40);
+        assert_eq!(app.thread.branch_head(), reply_id);
+        assert_eq!(app.thread.branch_depth(), 1);
+        app.handle(Action::ThreadLeave, 40);
+        assert!(app.thread.open);
+        assert_eq!(app.thread.branch_head(), app.thread.root);
+        assert_eq!(app.thread.focused().unwrap().event_id, reply_id);
+        app.handle(Action::ThreadToggleFollow, 40);
+        assert!(app.thread_followed());
+        app.handle(Action::ThreadToggleFollow, 40);
+        assert!(!app.thread_followed());
+    }
+
+    #[test]
+    fn thread_read_claims_use_message_contexts_and_scoped_typing() {
+        let (mut app, channel, root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        app.thread.rows = app.channels[0].rows.clone();
+        app.thread.root = root;
+        app.thread.branch_head = app.thread.root.clone();
+        app.thread.loaded = true;
+        app.thread.loading = false;
+        app.set_terminal_size(80, 12);
+        app.note_thread_presented();
+        let commands = app.take_outbox();
+        let contexts = commands
+            .into_iter()
+            .find_map(|command| match command {
+                SessionCommand::ReadProgress { contexts } => Some(contexts),
+                _ => None,
+            })
+            .expect("thread presentation publishes read progress");
+        assert!(contexts.keys().any(|key| key.starts_with("msg:")));
+        assert!(!contexts.contains_key(&channel.to_string()));
+
+        app.apply(
+            ChatEvent::TypingScoped {
+                channel,
+                pubkey: "agent-a".to_owned(),
+                head: app.thread.root.clone(),
+                at: 40,
+            },
+            40,
+        );
+        assert_eq!(
+            app.thread_typing_names(channel, &app.thread.root, 40).len(),
+            1
+        );
+        assert!(app.thread_typing_names(channel, "other", 40).is_empty());
+    }
+
+    #[test]
+    fn scoped_typing_uses_author_identity_and_ends_on_message() {
+        let (mut app, channel, root, _reply, author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        app.apply(
+            ChatEvent::TypingScoped {
+                channel,
+                pubkey: author.public_key().to_hex(),
+                head: root.clone(),
+                at: 40,
+            },
+            40,
+        );
+        assert_eq!(app.thread_typing_names(channel, &root, 40).len(), 1);
+        assert_eq!(app.typing_names(channel, 40).len(), 1);
+
+        let message = message_event(&author, channel, "done", 41);
+        app.apply(
+            ChatEvent::Timeline {
+                channel,
+                event: message,
+            },
+            41,
+        );
+        assert!(app.thread_typing_names(channel, &root, 41).is_empty());
+        assert!(app.typing_names(channel, 41).is_empty());
+    }
+
+    #[test]
+    fn followed_threads_keep_the_newest_five_hundred_roots() {
+        let (mut app, _channel, root, _reply, _author) = channel_with_a_reply();
+        app.set_focus(0);
+        app.handle(Action::OpenThread, 40);
+        app.take_outbox();
+        app.followed_threads = (0..500).map(|index| format!("old-{index}")).collect();
+        app.handle(Action::ThreadToggleFollow, 40);
+        assert_eq!(app.followed_threads.len(), 500);
+        assert!(!app.followed_threads.iter().any(|id| id == "old-0"));
+        assert!(app.followed_threads.iter().any(|id| id == &root));
     }
 }

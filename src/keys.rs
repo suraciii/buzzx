@@ -121,8 +121,12 @@ pub enum Action {
     ReaderReply,
     /// Esc or `v` returns to the reader's origin.
     ReaderClose,
-    /// Esc inside a thread: return to the channel it was opened from.
+    /// Esc inside a thread returns one branch level, then the channel.
     ThreadLeave,
+    /// `l`/Right drills into the focused reply's direct children.
+    ThreadOpenBranch,
+    /// `F` toggles the local follow marker for this thread.
+    ThreadToggleFollow,
     /// Enter inside a thread: compose a reply to the focused row.
     ThreadReplyFocused,
     /// `i` or Tab inside a thread: compose a reply to the root.
@@ -491,6 +495,9 @@ pub fn map_navigation(
             KeyCode::Char('r') => Action::React,
             KeyCode::Char('e') => Action::EditRow,
             KeyCode::Char('d') => Action::DeleteRow,
+            KeyCode::Char('l') | KeyCode::Right => Action::ThreadOpenBranch,
+            KeyCode::Left => Action::ThreadLeave,
+            KeyCode::Char('F') => Action::ThreadToggleFollow,
             KeyCode::Char('?') => Action::ToggleHelp,
             KeyCode::Esc => Action::ThreadLeave,
             KeyCode::Char('q') => Action::Quit,
