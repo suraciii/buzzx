@@ -232,6 +232,14 @@ pub enum ChatEvent {
         pubkey: String,
         at: u64,
     },
+    /// A typing indicator scoped to one thread head (`e` tag). Kept separate
+    /// from the channel-wide event so existing callers remain source-compatible.
+    TypingScoped {
+        channel: Uuid,
+        pubkey: String,
+        head: String,
+        at: u64,
+    },
     /// The relay closed the typing feed of one channel. The channel itself may
     /// still be open; only its indicators stopped.
     TypingClosed {

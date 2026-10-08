@@ -124,14 +124,29 @@ fn inbox_filter(channel: &Uuid, since: u64) -> serde_json::Value {
 
 /// The channel a typing indicator names. An indicator without a usable `h`
 /// tag cannot be placed on screen, so the pump drops it.
-fn typing_channel(event: &nostr::Event) -> Option<Uuid> {
-    event.tags.iter().find_map(|tag| {
+/// The channel and optional thread head a typing indicator names.
+fn typing_scope(event: &nostr::Event) -> Option<(Uuid, Option<String>)> {
+    let channel = event.tags.iter().find_map(|tag| {
         let parts = tag.as_slice();
         (parts.first().map(String::as_str) == Some("h"))
             .then(|| parts.get(1))
             .flatten()
             .and_then(|id| Uuid::parse_str(id).ok())
-    })
+    })?;
+    let head = event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.first().map(String::as_str) == Some("e"))
+            .then(|| parts.get(1))
+            .flatten()
+            .filter(|id| !id.is_empty())
+            .cloned()
+    });
+    Some((channel, head))
+}
+
+#[cfg(test)]
+fn typing_channel(event: &nostr::Event) -> Option<Uuid> {
+    typing_scope(event).map(|(channel, _)| channel)
 }
 
 /// The observer feed's subscription id. One per connection: it is scoped to the
@@ -571,14 +586,21 @@ async fn handle_message(
                 let _ = events.send(ChatEvent::Overlay(*event)).await;
             }
             Some(SubKind::Typing(_)) => {
-                if let Some(channel) = typing_channel(&event) {
-                    let _ = events
-                        .send(ChatEvent::Typing {
+                if let Some((channel, head)) = typing_scope(&event) {
+                    let message = match head {
+                        Some(head) => ChatEvent::TypingScoped {
+                            channel,
+                            pubkey: event.pubkey.to_hex(),
+                            head,
+                            at: event.created_at.as_secs(),
+                        },
+                        None => ChatEvent::Typing {
                             channel,
                             pubkey: event.pubkey.to_hex(),
                             at: event.created_at.as_secs(),
-                        })
-                        .await;
+                        },
+                    };
+                    let _ = events.send(message).await;
                 }
             }
             Some(SubKind::Observer)
@@ -772,6 +794,13 @@ mod tests {
         let channel = Uuid::new_v4();
         let event = indicator(vec![vec!["h", &channel.to_string()]]);
         assert_eq!(typing_channel(&event), Some(channel));
+
+        let head = "abcdef";
+        let scoped = indicator(vec![vec!["h", &channel.to_string()], vec!["e", head]]);
+        assert_eq!(
+            typing_scope(&scoped),
+            Some((channel, Some(head.to_owned())))
+        );
 
         // No `h`, an `h` with no value, and an `h` that is not a channel are
         // all indicators without a channel: there is nowhere to show them.

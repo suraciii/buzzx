@@ -1157,7 +1157,7 @@ fn draw_thread(frame: &mut Frame, app: &App, now: u64, area: Rect, mode: LayoutM
         draw_composer(frame, app, column[4]);
     }
     draw_thread_keys(frame, app, column[5], compact);
-    draw_thread_status(frame, app, column[6], compact);
+    draw_thread_status(frame, app, column[6], compact, now);
 }
 
 /// `Thread / #channel` and the way back. The back hint is reserved before the
@@ -1172,10 +1172,28 @@ fn draw_thread_header(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
         Some(entry) => format!("#{}", app.label(entry)),
         None => app.thread.channel.to_string(),
     };
-    let head = if compact {
-        format!("Thread {label}")
+    let branch = if app.thread.branch_depth() > 0 {
+        format!(" · branch {}", app.thread.branch_depth())
     } else {
-        format!("Thread / {label}")
+        String::new()
+    };
+    let follow = if app.thread_followed() {
+        " · following"
+    } else {
+        ""
+    };
+    let unread = if !app.thread_has_read_state() {
+        String::new()
+    } else {
+        match app.thread_unread_count() {
+            0 => String::new(),
+            count => format!(" · unread {count}"),
+        }
+    };
+    let head = if compact {
+        format!("Thread {label}{branch}{follow}{unread}")
+    } else {
+        format!("Thread / {label}{branch}{follow}{unread}")
     };
     let back = if compact { "Esc:back" } else { "Esc: back" };
     let room = (area.width as usize).saturating_sub(back.len() + 1);
@@ -1202,10 +1220,27 @@ fn draw_thread_timeline(
         // would be a false result while the read is still out.
         return;
     }
-    // The head label belongs to the root row itself: a live reply that
-    // arrived before the root did is not the head of this thread.
-    let is_root =
-        app.thread.rows.first().map(|row| row.event_id.as_str()) == Some(app.thread.root.as_str());
+    let mut rows = app.thread.visible_rows();
+    for row in &mut rows {
+        if row.event_id == app.thread.root {
+            continue;
+        }
+        if let Some(summary) = app.thread.branch_summary(&row.event_id) {
+            let people = if summary.participants.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", summary.participants.join(", "))
+            };
+            row.body.push_str(&format!(
+                "\n↳ {} repl{} · last {}{}",
+                summary.replies,
+                if summary.replies == 1 { "y" } else { "ies" },
+                age(summary.last_at, now),
+                people
+            ));
+        }
+    }
+    let is_root = rows.first().map(|row| row.event_id.as_str()) == Some(app.thread.root.as_str());
     let head = match (is_root, app.thread.root_deleted) {
         (false, _) => RootMark::None,
         (true, true) => RootMark::Deleted,
@@ -1213,8 +1248,8 @@ fn draw_thread_timeline(
     };
     draw_rows(
         frame,
-        &app.thread.rows,
-        app.thread.focus,
+        &rows,
+        app.thread.visible_focus(),
         area,
         now,
         compact,
@@ -1253,15 +1288,15 @@ fn draw_thread_keys(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
 
 /// The thread's status. One transient message at a time, in the order the
 /// reader needs it: a write outcome, then the read state, then coverage.
-fn draw_thread_status(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
-    let status = thread_status(app, compact);
+fn draw_thread_status(frame: &mut Frame, app: &App, area: Rect, compact: bool, now: u64) {
+    let status = thread_status(app, compact, now);
     frame.render_widget(
         Paragraph::new(Line::styled(status.clone(), status_style(&status))),
         area,
     );
 }
 
-fn thread_status(app: &App, compact: bool) -> String {
+fn thread_status(app: &App, compact: bool, now: u64) -> String {
     if let Some(notice) = &app.thread.notice {
         return notice.clone();
     }
@@ -1270,6 +1305,10 @@ fn thread_status(app: &App, compact: bool) -> String {
     }
     if app.thread.loading && app.thread.rows.is_empty() {
         return "Loading thread...".to_owned();
+    }
+    let typing = app.thread_typing_names(app.thread.channel, app.thread.branch_head(), now);
+    if !typing.is_empty() {
+        return format!("{} typing...", typing.join(", "));
     }
     if app.thread.root_deleted {
         return if compact {
@@ -3424,7 +3463,8 @@ mod tests {
     #[test]
     fn a_wide_body_wraps_inside_the_thread_frame() {
         let (mut app, _keys) = thread_app(false);
-        let root_row = message_row(0, "the root");
+        let mut root_row = message_row(0, "the root");
+        root_row.event_id = app.thread.root.clone();
         let mut wide = message_row(1, "链接 https://example.test/非常长的路径?q=1 🚀 结束");
         wide.root_id = Some(root_row.event_id.clone());
         wide.parent_id = Some(root_row.event_id.clone());
